@@ -11,6 +11,10 @@ Requires=ard-server.service
 Type=simple
 User=ard
 Group=ard
+# Anything the service creates is owner-only by default. Without this, files
+# inherit the process umask, which on many systems is 0022 and leaves the audit
+# log world-readable.
+UMask=0077
 EnvironmentFile=/etc/ard/ard-proxy.env
 ExecStart=/opt/ard/bin/ard-proxy -control ${ARD_CONTROL_SOCKET}
 Restart=always

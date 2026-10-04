@@ -80,3 +80,47 @@ operator port reachable. This turns that into a visible failure.
 - `pkill -f <pattern>` over SSH will match and kill the shell running it, because
   sshd executes the command as `bash -c "<command>"` and the pattern is present in
   that command line. Kill by PID.
+## ARD gateway services
+
+Deployed with a single command: `scripts/deploy.sh`. It cross-compiles, uploads,
+installs the PKI, configuration, firewall rules and systemd units, starts
+everything, and then verifies the result rather than reporting success on faith.
+Re-running it is safe: the PKI and the device allowlist are preserved, never
+regenerated.
+
+| Service | Purpose |
+|---|---|
+| `ard-server` | accepts device and operator connections, holds device sessions |
+| `ard-proxy` | presents each device on a loopback port to the stock `adb` |
+| `ard-firewall-verify` | asserts at boot that the firewall is really enforcing |
+
+Loopback ports are assigned from the order of `ARD_DEVICES` in
+`/etc/ard/ard-server.env`, so **treat that list as append-only**: reordering it
+changes every operator's saved `adb` serial.
+
+### PKI permissions on the gateway
+
+The gateway runs as `ard` and holds certificates plus its own `server.key`. It
+must never hold a CA private key or a device private key, because either would let
+a single compromised process mint identities. `tlsx.LoadVerifier` reads `ca.crt`
+and never opens `ca.key`, so this is enforced by the type system rather than by
+remembering not to use the key. The deploy verifies the gateway user genuinely
+cannot read those files.
+
+Current posture, measured on the host:
+
+    systemd-analyze security ard-server.service   ->  1.3 OK
+    gateway can read devices/ca.key               ->  no
+    gateway can read a device private key         ->  no
+    gateway can replace its own binaries          ->  no
+
+### Two deploy bugs that the verifier caught
+
+Worth remembering, because both produced a "successful" deploy of something broken:
+
+- The firewall file shipped from the repository lacked the gateway ports, so a
+  deploy replaced a working ruleset with one that blocked them. The deploy now
+  checks that the ports are present *and* that no raw ADB port is exposed.
+- Verification used `grep -c` to assert the absence of something, which exits 1 on
+  zero matches. Under `set -e` with `pipefail` that aborted a correct deploy. A
+  check must never be able to fake its own verdict.

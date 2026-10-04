@@ -15,6 +15,10 @@ ConditionPathExists=/etc/ard/ard-server.env
 Type=simple
 User=ard
 Group=ard
+# Anything the service creates is owner-only by default. Without this, files
+# inherit the process umask, which on many systems is 0022 and leaves the audit
+# log world-readable.
+UMask=0077
 # Configuration is external so dev, staging and prod differ by file, never by
 # code. Values come from an environment file rather than a bespoke config parser,
 # because systemd already provides the parsing, the escaping and the override
