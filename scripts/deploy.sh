@@ -65,7 +65,7 @@ ssh_() { ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"; }
 step "cross-compiling"
 DIST="$ROOT/dist/$TARGET_OS"
 mkdir -p "$DIST"
-BINARIES=(ard-server ard-proxy ard-agent ard-ca)
+BINARIES=(ard-server ard-proxy ard-agent ard-ca ard-connect)
 for b in "${BINARIES[@]}"; do
   [[ -d "cmd/$b" ]] || continue
   CGO_ENABLED=0 GOOS="${TARGET_OS%/*}" GOARCH="${TARGET_OS#*/}" \
@@ -106,7 +106,7 @@ set -euo pipefail
 S=/root/ard-staging
 FIRST_DEVICE="${1:-}"
 ROTATE_DEVICE="${2:-}"
-BINARIES=(ard-server ard-proxy ard-agent ard-ca)
+BINARIES=(ard-server ard-proxy ard-agent ard-ca ard-connect)
 
 echo "  -- installing binaries into /opt/ard/bin"
 install -d -o root -g ard -m 0750 /opt/ard/bin /opt/ard/docs
@@ -176,11 +176,38 @@ else
 fi
 install -m 0640 -o root -g ard "$S/ard-proxy.env" /etc/ard/ard-proxy.env
 
-# Build the server env from the template, substituting the device list.
+# Build the server env by merging the shipped template with whatever the host already
+# has.
+#
+# This used to take the existing file as the base whenever one was present, which meant
+# the template was only ever read on a first install. Every setting added in a later
+# version therefore silently never arrived on an existing deployment. The symptom is
+# nasty: systemd expands an undefined variable to an empty string and passes that to a
+# flag which requires a value, so the service fails with INVALIDARGUMENT and the whole
+# gateway goes down for want of a line in a config file.
+#
+# The merge rules, and why each one:
+#   - the template supplies structure, comments and any key the host has never seen,
+#     which is how a new setting reaches an existing host;
+#   - the host wins for keys it already has, because an operator who edited a value
+#     meant it and a redeploy should not revert it;
+#   - ARD_DEVICES is handled separately below, since it has its own append-only rule.
+ENV_NEW=/etc/ard/ard-server.env.new
+grep -v '^ARD_DEVICES=' "$S/ard-server.env" > "$ENV_NEW"
+
 if [[ -f /etc/ard/ard-server.env ]]; then
-  grep -v '^ARD_DEVICES=' /etc/ard/ard-server.env > /etc/ard/ard-server.env.new
-else
-  grep -v '^ARD_DEVICES=' "$S/ard-server.env" > /etc/ard/ard-server.env.new
+  while IFS= read -r line; do
+    case "$line" in
+      ARD_*=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    if grep -q "^${key}=" "$ENV_NEW"; then
+      grep -v "^${key}=" "$ENV_NEW" > "$ENV_NEW.tmp" || true
+      mv "$ENV_NEW.tmp" "$ENV_NEW"
+    fi
+    printf '%s\n' "$line" >> "$ENV_NEW"
+  done < <(grep -E '^ARD_[A-Z0-9_]+=' /etc/ard/ard-server.env || true)
 fi
 # The device allowlist is preserved across deploys and only ever appended to.
 #
@@ -202,9 +229,9 @@ if [[ -z "$existing" ]]; then
   existing="CHANGE-ME-device-uuid"
   echo "     WARNING: no devices enrolled; pass --first-device <uuid>"
 fi
-printf 'ARD_DEVICES=%s\n' "$existing" >> /etc/ard/ard-server.env.new
-install -m 0640 -o root -g ard /etc/ard/ard-server.env.new /etc/ard/ard-server.env
-rm -f /etc/ard/ard-server.env.new
+printf 'ARD_DEVICES=%s\n' "$existing" >> "$ENV_NEW"
+install -m 0640 -o root -g ard "$ENV_NEW" /etc/ard/ard-server.env
+rm -f "$ENV_NEW"
 
 # Grants must reference a real device.
 if [[ -n "$ENROLL" ]]; then
@@ -270,16 +297,69 @@ verify() {
   fi
 }
 
-verify "ard-server running"        "systemctl is-active ard-server" "active"
-verify "ard-proxy running"         "systemctl is-active ard-proxy" "active"
+# verify_eventually is verify with a bounded wait.
+#
+# Needed for anything that depends on a service having finished starting. Without it a
+# deploy reports failure for a unit that is merely mid-restart, which is worse than
+# useless: it tells the operator the gateway is broken when it is about to be fine. It
+# was seen doing exactly that, failing "ard-server running" while the unit was still
+# being restarted and then coming up healthy seconds later.
+#
+# The wait is bounded so a genuinely broken service still fails, just later.
+verify_eventually() {
+  local desc="$1" cmd="$2" want="$3" tries="${4:-30}"
+  local got="" i
+  for ((i = 0; i < tries; i++)); do
+    got="$(ssh_ "$cmd" 2>/dev/null | tr -d '\r' | tail -1 || true)"
+    if [[ "$got" == *"$want"* ]]; then
+      check "$desc" "$GREEN ok$OFF"
+      return 0
+    fi
+    sleep 2
+  done
+  check "$desc" "$RED got '${got:-<empty>}'$OFF"
+  fail_count=$((fail_count+1))
+  return 1
+}
+
+# The listeners depend on the unit being up, so they wait. The static checks -- firewall,
+# PKI permissions, audit log -- do not, and re-running them on every attempt would only
+# make a failure slower to report.
+verify_eventually "ard-server running"     "systemctl is-active ard-server" "active"
+verify_eventually "ard-proxy running"      "systemctl is-active ard-proxy"  "active"
 verify "firewall enforcing drop"   "nft list chain inet ard input | grep -o 'policy [a-z]*'" "policy drop"
 verify "gateway ports in firewall" "nft list chain inet ard input | grep -c 'dport @ard_ports'" "1"
 verify "no raw adb port exposed"   "nft list ruleset | grep -cE '5555|dport @adb'" "0"
-verify "device listener bound"     "ss -tln | grep -c ':7000'" "1"
-verify "operator listener bound"   "ss -tln | grep -c ':7100'" "1"
-verify "enrol listener bound"      "ss -tln | grep -c ':7200'" "1"
-verify "control socket present"    "test -S /run/ard/control.sock && echo present" "present"
+verify_eventually "device listener bound"   "ss -tln | grep -c ':7000'" "1"
+verify_eventually "operator listener bound" "ss -tln | grep -c ':7100'" "1"
+verify_eventually "enrol listener bound"    "ss -tln | grep -c ':7200'" "1"
+verify_eventually "control socket present"  "test -S /run/ard/control.sock && echo present" "present"
 verify "no CA key readable by ard" "sudo -u ard test -r /etc/ard/pki/devices/ca.key 2>/dev/null && echo LEAKED || echo clean" "clean"
+
+# A policy whose roles name no members admits nobody, and every operator is refused with
+# "has no role" -- which reads as a deliberate lockdown rather than as the configuration
+# mistake it is. Deploying over such a file used to succeed silently.
+# A policy whose roles name no members admits nobody, and every operator is refused with
+# "has no role" -- which reads as a deliberate lockdown rather than as the configuration
+# mistake it is.
+#
+# This asks the gateway rather than grepping the YAML. An earlier attempt counted
+# quoted list items, which matched the entries under "grants" as well as under "members"
+# and therefore reported success on a policy that admits nobody at all.
+MEMBERS="$(ssh_ "journalctl -u ard-server --since '-10min' --no-pager | grep -oE 'operator policy: .*' | tail -1" || true)"
+ADMITTED="$(sed -n 's/.*operator policy: [0-9]* roles, \([0-9]*\) admitted.*/\1/p' <<<"$MEMBERS")"
+if [[ "${ADMITTED:-0}" -gt 0 ]]; then
+  check "operators can authenticate" "$GREEN ok$OFF"
+  echo "     $MEMBERS"
+else
+  check "operators can authenticate" "$RED no operator is admitted$OFF"
+  echo
+  echo "     WARNING: $MEMBERS"
+  echo "     /etc/ard/operators.yaml lists no members, so every operator is refused."
+  echo "     Roles must name the certificate common names that hold them, e.g."
+  echo "       roles:\n  - name: maintainer\n     members: [\"alice\"]"
+  echo "     deploy/operators.yaml has the full shape, kept as .sample on the gateway."
+fi
 verify "audit log writable"        "test -w /var/log/ard && echo writable" "writable"
 
 if [[ $fail_count -ne 0 ]]; then
@@ -300,17 +380,18 @@ $GREEN gateway deployed$OFF
   adb serial  127.0.0.1:15000 for the first device, 15001 for the second, and so on
 
 $YELLOW next$OFF
-  1. Install the agent on the device (Termux on Android, no root needed):
-       apk add go git   # or install the prebuilt binary
-       ard-agent -gateway ${ARD_PROD_HOST}:7000 \\
-                 -server-name $(ssh_ hostname) \\
-                 -device <uuid> \\
-                 -ca server-ca.crt -cert device.crt -key device.key
-  2. Enrol it:  scripts/deploy.sh --rotate-device <uuid>
-  3. On the gateway:  adb connect 127.0.0.1:15000 && adb shell
+  1. Install the agent on the device:  adb install -r android/ard-agent.apk
+  2. Open it, enter this gateway address, press Enrol, and read out the code it shows
+  3. Approve it from the gateway host:  sudo ard-ca enrol -code <CODE>
+  4. Press Start in the app
 
-  Device credentials are on the gateway at
-  /etc/ard/pki/devices/leaves/. Copy the .crt, .key and server/ca.crt to the
-  device over a channel you trust; the private key must not travel in the clear
-  over the internet.
+  Operators never need an account on this host. On their own machine they run:
+
+     ard-connect -gateway <host>:7100 -ca server-ca.crt \
+                 -cert operator.crt -key operator.key
+     adb connect 127.0.0.1:15000 && adb -s 127.0.0.1:15000 shell
+
+  The device generates its own key pair and never sends it anywhere. This script only
+  relays the request to whoever holds the CA, and the certificate goes back the same
+  way. There are no credentials to copy by hand, and nothing to keep off the device.
 SUMMARY

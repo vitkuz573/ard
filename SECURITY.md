@@ -55,10 +55,18 @@ Stated because a security tool that overstates itself is worse than none.
 
 - **A compromised phone.** The agent runs as an ordinary app. Whatever can run
   code as the app can read its files, including its own private key.
-- **A malicious operator.** Anyone who passes the allowlist and holds an
-  operator certificate has real `adb` access to the listed devices. That is the
-  product. Roles in `operators.yaml` limit who may perform administrative
-  actions; they do not sandbox `shell`.
+- **A malicious operator.** Anyone holding an operator certificate has real `adb`
+  access to the devices their role grants. That is the product: `ard-connect`
+  bridges a raw ADB connection, and one ADB connection carries shell, install,
+  file transfer and port forwarding together. So the bridge requires the `shell`
+  permission specifically, and holding `shell` on a device means holding adb on
+  that device. Roles control *which devices* and *what class of access*; they do
+  not sandbox `shell` once granted.
+- **Permission checks that only look like they work.** An earlier version of the
+  ACL compared the required permission against a loop variable of the same name,
+  so `perm == perm` was always true and every role holding any permission passed
+  every check. Read-only roles reached shell. The mapping is now covered by tests
+  that assert a logcat-only role is refused the bridge.
 - **A hostile network** during first contact. A device enrolling has no CA
   certificate, so it cannot verify the gateway at all: the connection that carries
   its certificate request is not authenticated. It reports the fingerprint of the
@@ -72,6 +80,17 @@ Stated because a security tool that overstates itself is worse than none.
   boundary; there is no pinning of the server's *name*, only of its role.
 - **Traffic analysis and volume.** Every operator stream is multiplexed over the
   one connection the device made. That hides ADB's structure, not its existence.
+
+## Known platform constraint
+
+Android blocks network access for an app in the `APP_STANDBY` bucket, and a phone that is
+not charging makes that the default for anything not in the foreground. The agent is a
+long-lived outbound client, so the app holds a foreground service for as long as it is
+running; the operator must press **Start** rather than running the binary by hand.
+
+The failure mode is a dial timeout. Nothing mentions standby, so it reads as a network
+problem or a broken gateway, and it disappears when the phone is plugged in — which makes
+it look intermittent. Worth knowing before spending time on the gateway.
 
 ## Known exposure created by ADB itself
 

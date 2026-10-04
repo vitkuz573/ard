@@ -228,11 +228,15 @@ func (g *gateway) handleOperator(ctx context.Context, raw net.Conn, tlsCfg *tls.
 	// than in the client keeps the authorization decision on the server, where it
 	// cannot be bypassed by a modified client.
 	_ = conn.SetDeadline(time.Time{})
-	visible := make([]registry.Device, 0)
+	visible := make([]operatorDevice, 0)
 	for _, d := range g.reg.List() {
-		if g.authz.Authorize(name, d.UUID, "exec").Allowed {
-			visible = append(visible, d)
+		if !g.authz.CanSee(name, d.UUID) {
+			continue
 		}
+		visible = append(visible, operatorDevice{
+			Device:     d,
+			Bridgeable: g.authz.Authorize(name, d.UUID, "operator-bridge").Allowed,
+		})
 	}
 	if err := writeJSON(conn, operatorGreeting{
 		Operator: name,
@@ -242,19 +246,31 @@ func (g *gateway) handleOperator(ctx context.Context, raw net.Conn, tlsCfg *tls.
 		return err
 	}
 
-	// Hold the connection open until the operator disconnects. Full stream handling
-	// arrives with the CLI bridge and the web console; admitting and identifying
-	// the operator first means those are built on a trust boundary that already
-	// works.
-	<-ctx.Done()
+	// Hand the connection to the stream handler, which authorizes the requested device
+	// and pipes it through. This used to just wait for the operator to disconnect, which
+	// left the operator port able to identify people and nothing more -- the whole reason
+	// an operator had to be given SSH on the gateway instead.
+	g.serveOperatorStreams(ctx, conn, name, role.Name)
 	return nil
 }
 
 // operatorGreeting is the first frame on the operator leg.
 type operatorGreeting struct {
-	Operator string            `json:"operator"`
-	Role     string            `json:"role"`
-	Devices  []registry.Device `json:"devices"`
+	Operator string           `json:"operator"`
+	Role     string           `json:"role"`
+	Devices  []operatorDevice `json:"devices"`
+}
+
+// operatorDevice is one device as the operator is allowed to know about it.
+//
+// Bridgeable is included so the client does not advertise an adb serial the gateway will
+// then refuse. Without it, a client that published every visible device would let
+// `adb connect` succeed locally and fail on first use, which looks like a broken device
+// rather than a policy decision -- and the decision belongs on the server, so the server
+// is what states it.
+type operatorDevice struct {
+	registry.Device
+	Bridgeable bool `json:"bridgeable"`
 }
 
 // controlRequest is one request on the unix socket.

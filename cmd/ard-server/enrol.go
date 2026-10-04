@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"syscall"
 	"time"
 
@@ -255,22 +254,19 @@ func peerUID(conn net.Conn) (uid uint32, ok bool) {
 
 // requireRootControl authorises an enrolment operation on the control socket.
 //
-// The pre-existing control ops stay on filesystem permissions alone, because their worst
-// outcome is proxying a stream an authorised operator could have asked for anyway. This
-// one is different: it decides whether a certificate gets signed, so "the caller could
-// read the socket" is not the question being asked. Only root may answer it.
+// Only the peer's uid is checked, never the gateway's own.
+//
+// That distinction cost a deployment to get wrong. An earlier version also refused to
+// act unless the server itself was running as root, reasoning that a non-root server
+// could not be trusted to read peer credentials. That is simply false: SO_PEERCRED
+// reports the real uid of the other end regardless of what this process may do. The
+// gateway is supposed to run unprivileged, so that precondition guaranteed the feature
+// would be permanently unavailable in production -- while a test that started the
+// gateway with sudo passed, because there it accidentally held.
+//
+// The local end-to-end test now starts the gateway unprivileged for this reason.
 func (g *gateway) requireRootControl(conn net.Conn, op string) bool {
 	remote := conn.RemoteAddr().String()
-	if os.Geteuid() != 0 {
-		// getpeereid reports the real uid regardless of the server's privileges, but if
-		// the server is not root the uid==0 branch is unreachable and the check is
-		// vacuous. Say so rather than let it look like it is working.
-		g.audit.Record(audit.Event{
-			Kind: "enrol.unauthorised", Actor: "unknown", Remote: remote,
-			Detail: fmt.Sprintf("%s refused: the gateway is not running as root", op),
-		})
-		return false
-	}
 	uid, ok := peerUID(conn)
 	if !ok {
 		g.audit.Record(audit.Event{

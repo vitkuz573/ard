@@ -144,6 +144,17 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Say what the policy actually admits. A policy whose roles name no members refuses
+	// every operator with "has no role", which reads as a deliberate lockdown rather than
+	// as the configuration mistake it is -- and it loads without complaint. Stating the
+	// count at startup makes it visible, and gives the deploy script something reliable to
+	// check instead of grepping YAML for a key it might spell three ways.
+	log.Printf("operator policy: %d roles, %d admitted operator(s)%s",
+		len(authz.Roles()), len(authz.Members()), describeMembers(authz))
+	if len(authz.Members()) == 0 {
+		log.Printf("WARNING: no operator can authenticate; every role in %s names no members", cfg.operatorsFile)
+	}
+
 	gw := &gateway{
 		reg:     reg,
 		audit:   auditor,
@@ -221,6 +232,16 @@ func run() error {
 	_ = os.Remove(cfg.controlSocket)
 	wg.Wait()
 	return nil
+}
+
+// describeMembers lists the admitted operator names when there are few enough to be worth
+// reading in a log line.
+func describeMembers(p *acl.Policy) string {
+	m := p.Members()
+	if len(m) == 0 || len(m) > 8 {
+		return ""
+	}
+	return " (" + strings.Join(m, ", ") + ")"
 }
 
 func splitList(s string) []string {

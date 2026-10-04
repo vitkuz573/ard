@@ -1,5 +1,16 @@
 # Operator roles and device grants.
 #
+# Three independent things are stated here, and all three matter:
+#
+#   members     -- who holds the role, by certificate common name
+#   permissions -- what the role may do at all
+#   grants      -- which specific devices the role may do it on
+#
+# `members` is the one that is easy to forget, and forgetting it fails silently: the file
+# parses, the gateway loads it, and every operator is refused with "has no role". That
+# reads as a deliberate lockdown rather than as the configuration mistake it is, so a role
+# with no members admits nobody and that is asserted in the tests.
+#
 # Two independent questions are asked of every stream:
 #
 #   permission - may this role open this kind of stream at all
@@ -30,15 +41,27 @@
 roles:
   # Read-only observer. A safe default for onboarding an operator.
   - name: viewer
-    permissions: ["logcat", "files"]
+    permissions: ["logcat"]
     grants:
       - "CHANGE-ME-device-uuid"
+    # Certificate common names that hold this role. Empty means nobody.
+    members:
+      - "CHANGE-ME-operator-name"
 
   # Full interactive access, to one explicitly named device.
   - name: maintainer
     permissions: ["shell", "exec", "files", "install", "logcat"]
     grants:
       - "CHANGE-ME-device-uuid"
+    members:
+      - "CHANGE-ME-operator-name"
+
+    # NOTE on "shell" and the operator bridge: an operator connects through ard-connect,
+    # which bridges a raw ADB connection. One ADB connection carries shell, install, file
+    # transfer and port forwarding together, so the bridge cannot be separated by
+    # permission. Holding "shell" on a device therefore means holding adb on that device.
+    # A role without "shell" can still see the device in ard-connect's listing, and is
+    # told it is not permitted to drive it.
 
   # Break-glass role for a named operator. Holds no grants by default, so enabling
   # the role does not by itself grant access to anything: grants are added here
@@ -46,3 +69,4 @@ roles:
   - name: emergency
     permissions: ["*"]
     grants: []
+    members: []

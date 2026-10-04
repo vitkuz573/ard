@@ -23,6 +23,7 @@ package enrol
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,7 +264,7 @@ func (m *Mailbox) Put(sub Submit) (*Pending, string, error) {
 	}
 	now := m.now()
 	p := &Pending{
-		RequestID:         string(id),
+		RequestID:         hex.EncodeToString(id),
 		DeviceID:          sub.DeviceID,
 		DeviceName:        sub.DeviceName,
 		CSRPEM:            append([]byte(nil), sub.CSRPEM...),

@@ -72,11 +72,19 @@ ENPORT=$(( DEVPORT + 2 ))
 SOCK="$WORK/control.sock"
 AUDIT="$WORK/audit.log"
 
-# The device is not in the allowlist yet on purpose: enrolment must not depend on it,
-# and the test would otherwise pass for the wrong reason if it did.
-sudo -n true 2>/dev/null || { bad "this test needs passwordless sudo (it runs the gateway as root)"; exit 1; }
+sudo -n true 2>/dev/null || { bad "this test needs passwordless sudo (to sign as root)"; exit 1; }
 
-sudo -n "$WORK/bin/ard-server" \
+# The gateway runs as the current, unprivileged user -- deliberately, and this matches
+# how the systemd unit runs it in production.
+#
+# An earlier version of this test started it with sudo, and that is exactly why a bug
+# shipped: requireRootControl also refused to act unless the *server* was root, a
+# precondition that is both wrong and unreachable in production. Under sudo the test
+# passed; on the real gateway the feature was permanently unavailable. The check depends
+# on the peer's uid, which an unprivileged server can read perfectly well.
+#
+# Only the signing tool needs root, and that is the asymmetry the design intends.
+"$WORK/bin/ard-server" \
   -listen-devices "127.0.0.1:$DEVPORT" \
   -listen-operators "127.0.0.1:$OPPORT" \
   -listen-enrol "127.0.0.1:$ENPORT" \
@@ -95,6 +103,15 @@ for _ in $(seq 1 50); do
   if grep -q "enrol on" "$WORK/server.log" 2>/dev/null; then break; fi
   sleep 0.2
 done
+
+# Assert the gateway is unprivileged, so this test cannot quietly drift back into the
+# configuration that hid the bug.
+GW_UID="$(ps -o uid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
+if [[ -n "$GW_UID" && "$GW_UID" != "0" ]]; then
+  ok "gateway runs unprivileged (uid $GW_UID), as in production"
+else
+  bad "the gateway is running as root; this test no longer matches production"
+fi
 if grep -q "enrol on" "$WORK/server.log" 2>/dev/null; then
   ok "gateway listening, enrolment port reported"
 else

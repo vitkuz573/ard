@@ -7,7 +7,13 @@ go build ./...
 go test ./...
 scripts/e2e-local.sh      # mock device, real adb, full path
 scripts/e2e-enrol.sh      # certificate enrolment, end to end; needs passwordless sudo
+scripts/e2e-operator.sh   # operator path: stock adb from another machine, no SSH
 ```
+
+`e2e-operator.sh` is the one that proves the product shape. It drives a device with the
+real `adb` binary from a machine that is not the gateway, reachable only over TLS, with no
+SSH and no loopback — because the alternative is that every operator needs a login on the
+VPS, which is all-or-nothing access to the host holding the CA keys.
 
 `scripts/e2e-enrol.sh` runs the gateway as root, because enrolment is deliberately
 restricted to uid 0 on the control socket. It exists to check the one thing unit tests
