@@ -32,11 +32,13 @@ dim()  { printf '  %s%s%s\n' "$DIM" "$*" "$OFF"; }
 
 ROTATE_DEVICE=""
 FIRST_DEVICE=""
+BUILD_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rotate-device) ROTATE_DEVICE="${2:?--rotate-device needs a UUID}"; shift 2 ;;
     --first-device)  FIRST_DEVICE="${2:?--first-device needs a UUID}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    --build-only)    BUILD_ONLY=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) die "unknown flag $1" ;;
   esac
 done
@@ -71,6 +73,13 @@ for b in "${BINARIES[@]}"; do
   printf '  %s%-12s %s bytes\n' "$DIM" "$b" "$(stat -c%s "$DIST/$b")"
 done
 ok "binaries built for $TARGET_OS"
+
+if [[ $BUILD_ONLY -eq 1 ]]; then
+  # Local builds only. Needed to test a change without touching the gateway, which
+  # matters when the device under test is someone's actual phone.
+  printf '\n%sbuild only%s  binaries in %s\n' "$GREEN" "$OFF" "$DIST"
+  exit 0
+fi
 
 # ----------------------------------------------------------------- upload
 step "uploading"

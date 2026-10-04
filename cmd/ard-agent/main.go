@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vitkuz573/ard/internal/adbdloc"
 	"github.com/vitkuz573/ard/internal/hs"
 	"github.com/vitkuz573/ard/internal/tlsx"
 	"github.com/vitkuz573/ard/internal/transport"
@@ -63,7 +64,7 @@ func run() error {
 	flag.StringVar(&cfg.serverName, "server-name", "", "TLS server name to verify (defaults to the gateway host)")
 	flag.StringVar(&cfg.deviceID, "device", "", "device UUID this agent identifies as (required)")
 	flag.StringVar(&cfg.deviceName, "name", "", "human-readable label shown to operators")
-	flag.StringVar(&cfg.adbdAddr, "adbd", "", "address of adbd on this device (required)")
+	flag.StringVar(&cfg.adbdAddr, "adbd", "", "address of adbd on this device; discovered when empty")
 	flag.StringVar(&cfg.caPath, "ca", "", "path to the server CA certificate file (required)")
 	flag.StringVar(&cfg.certPath, "cert", "", "this device's certificate (required)")
 	flag.StringVar(&cfg.keyPath, "key", "", "this device's private key (required)")
@@ -82,7 +83,6 @@ func run() error {
 	missing("ca", cfg.caPath)
 	missing("cert", cfg.certPath)
 	missing("key", cfg.keyPath)
-	missing("adbd", cfg.adbdAddr)
 	if cfg.serverName == "" {
 		if host, _, err := net.SplitHostPort(cfg.gateway); err == nil {
 			cfg.serverName = host
@@ -97,21 +97,30 @@ func run() error {
 	log.Printf("version %s, device %s, gateway %s, adbd %s",
 		version, cfg.deviceID, cfg.gateway, cfg.adbdAddr)
 
-	// Fail fast on an unreachable adbd rather than looping forever against a device
-	// where wireless debugging was never enabled.
+	// Resolve adbd before connecting.
 	//
-	// There is deliberately no default address. An earlier version assumed
-	// 127.0.0.1:5555, which is what classic ADB did, and testing against a real
-	// Android 14 phone showed it is simply not there: adbd listens only on the port
-	// that wireless debugging or "adb tcpip" opened, and nothing else. A default
-	// would have failed on every modern device with a plausible but wrong message,
-	// so the address is required and the real value is reported back.
-	if err := probeAdbd(cfg.adbdAddr); err != nil {
-		return fmt.Errorf("adbd is not reachable at %s: %w\n"+
-			"on Android 11+ run `adb shell ss -tln | grep -E ':555[0-9]'` and pass the\n"+
-			"listening port to -adbd; enable Developer options and Wireless debugging first",
-			cfg.adbdAddr, err)
+	// The configured address is tried first because it costs nothing when right,
+	// but it is never trusted: after a reboot adbd has no socket at all, and when
+	// wireless debugging is the thing that opened it, the port is different every
+	// boot. An agent that remembered the address would work once and then fail
+	// silently forever, which is the failure mode this replaces.
+	//
+	// -adbd may be empty, in which case discovery runs unconditionally.
+	locateCtx, cancelLocate := context.WithTimeout(context.Background(), 90*time.Second)
+	adbdAddr, err := adbdloc.Resolvable(locateCtx, cfg.adbdAddr, adbdloc.Options{})
+	cancelLocate()
+	if err != nil {
+		return fmt.Errorf("%w\n"+
+			"this agent cannot make adbd appear, and neither can any app: after a\n"+
+			"reboot adbd listens only over USB until wireless debugging is enabled.\n"+
+			"either leave Wireless debugging switched on, or attach USB once and run\n"+
+			"`adb tcpip 5557`. Then start the agent again.",
+			err)
 	}
+	if adbdAddr != cfg.adbdAddr {
+		log.Printf("adbd resolved to %s (configured: %q)", adbdAddr, cfg.adbdAddr)
+	}
+	cfg.adbdAddr = adbdAddr
 
 	// Verification only: an agent has no reason to hold a CA key, and being
 	// unable to load one keeps that property from depending on filesystem
@@ -206,6 +215,10 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	}
 	log.Printf("connected, session %s", welcome.Session)
 
+	// The first resolve scanned the ephemeral range successfully, so subsequent
+	// streams in this session skip the scan and only try the known address.
+	cached := true
+
 	session, err := transport.New(conn, cfg.deviceID, cfg.deviceName)
 	if err != nil {
 		return err
@@ -223,8 +236,16 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	}()
 
 	log.Printf("serving")
+	// The resolver is per session, and remembers nothing: each call re-checks the
+	// cached address and re-scans if it is dead.
+	resolve := func(c context.Context, hint string) (string, error) {
+		if hint == "" {
+			hint = cfg.adbdAddr
+		}
+		return adbdloc.Resolvable(c, hint, adbdloc.Options{SkipDynamic: cached})
+	}
 	return session.Accept(ctx, func(route hs.Route, stream net.Conn) error {
-		return handleStream(route, stream, cfg.adbdAddr)
+		return handleStream(route, stream, resolve)
 	})
 }
 
@@ -236,14 +257,13 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 // socket. With a real adb server there is normally one transport per device
 // anyway, so the multiplexing case does not arise; if concurrent transports are
 // ever observed to upset adbd, this is the place to reintroduce it.
-func handleStream(route hs.Route, stream net.Conn, adbdAddr string) error {
+func handleStream(route hs.Route, stream net.Conn, resolve func(context.Context, string) (string, error)) error {
 	if route.Kind != hs.KindADB {
 		log.Printf("stream %s: unsupported kind %q", route.Stream, route.Kind)
 		return fmt.Errorf("unsupported stream kind %q", route.Kind)
 	}
-	upstream, err := net.DialTimeout("tcp", adbdAddr, 10*time.Second)
+	upstream, err := dialAdbd(stream, resolve)
 	if err != nil {
-		log.Printf("stream %s: dial adbd: %v", route.Stream, err)
 		return err
 	}
 	defer upstream.Close()
@@ -268,13 +288,36 @@ func handleStream(route hs.Route, stream net.Conn, adbdAddr string) error {
 	return err
 }
 
-// probeAdbd checks that adbd is listening before entering the reconnect loop.
-func probeAdbd(addr string) error {
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+// dialAdbd connects to adbd, rediscovering the address if the known one is dead.
+//
+// Rediscovery on failure is what makes a mid-session port change survivable: the
+// gateway side sees one failed stream and retries, and the operator never notices
+// that the device rebooted underneath them.
+func dialAdbd(stream net.Conn, resolve func(context.Context, string) (string, error)) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	addr, err := resolve(ctx, "")
 	if err != nil {
-		return err
+		log.Printf("stream %s: cannot reach adbd: %v", streamID(stream), err)
+		return nil, err
 	}
-	return c.Close()
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		log.Printf("stream %s: dial adbd at %s: %v", streamID(stream), addr, err)
+		return nil, err
+	}
+	return conn, nil
+}
+
+// streamID reads the stream's id for logging, best effort.
+func streamID(c net.Conn) string {
+	type stringer interface{ String() string }
+	_ = stringer(nil)
+	if v, ok := c.(interface{ ID() string }); ok {
+		return v.ID()
+	}
+	return "?"
 }
 
 // backoff produces growing reconnect delays with jitter.
