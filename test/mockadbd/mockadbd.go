@@ -159,9 +159,10 @@ func (c *Config) withDefaults() Config {
 		out.Banner = "device::ro.product.name=ard_mock;ro.product.model=Mock;ro.build.version.release=14;" +
 			"ro.build.type=user;features=cmd,stat_v2,shell_v2"
 	}
-	if out.Shell == nil {
-		out.Shell = defaultShell
+	if out.FS == nil {
+		out.FS = NewVFS()
 	}
+
 	return out
 }
 
@@ -479,6 +480,11 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 	cfg.debug("open service=%q arg=%q -> stream id=%d", service, arg, id)
 	if cfg.FS == nil {
 		cfg.FS = NewVFS()
+	}
+	if cfg.Shell == nil {
+		cfg.Shell = func(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
+			return newShellRunnerFor(cfg.FS).run(argv, stdin, stdout, stderr)
+		}
 	}
 	tracef("OPEN service=%q arg=%q", service, arg)
 	switch service {
@@ -831,50 +837,6 @@ func runShell(cfg Config, arg string, s *stream) {
 }
 
 // defaultShell answers a small, fixed command set.
-func defaultShell(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(argv) == 0 {
-		fmt.Fprintln(stderr, "mockadbd: empty command")
-		return 1
-	}
-	switch argv[0] {
-	case "echo":
-		fmt.Fprintln(stdout, strings.Join(argv[1:], " "))
-	case "get-state":
-		fmt.Fprintln(stdout, "device")
-	case "pwd":
-		fmt.Fprintln(stdout, "/")
-	case "whoami":
-		fmt.Fprintln(stdout, "shell")
-	case "cat":
-		data, err := io.ReadAll(stdin)
-		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return 1
-		}
-		stdout.Write(data)
-	case "exit":
-		return 0
-	case "true":
-		return 0
-	case "false", "fail":
-		return 1
-	default:
-		// A real shell reports "command not found" with status 127. Matching that
-		// lets tests assert on failure without special-casing the mock.
-		fmt.Fprintf(stderr, "mockadbd: %s: command not found\n", argv[0])
-		return 127
-	}
-	return 0
-}
-
-// parseServiceSpec splits an OPEN payload into a bare service type and its
-// argument.
-//
-// The wire format is "service[,key=value...]:argument". The options matter: a
-// modern host asks for "shell,v2,TERM=xterm-256color,raw", so splitting on the
-// comma is not optional. Getting this wrong means every shell request looks like
-// an unknown service and the device appears to accept connections but never
-// answers, which is exactly the failure this avoids.
 func parseServiceSpec(raw string) (service, arg string, v2 bool, err error) {
 	spec := strings.TrimRight(raw, "\x00")
 	colon := strings.IndexByte(spec, ':')
