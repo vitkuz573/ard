@@ -16,7 +16,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/vitaly/ard/test/mockadbd"
+	"github.com/vitkuz573/ard/test/mockadbd"
 )
 
 func main() {

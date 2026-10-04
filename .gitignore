@@ -12,4 +12,4 @@
 *.pem
 *.key
 *.crt
-pki/
+pki/.e2e-bin/

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vitaly/ard/test/mockadbd"
+	"github.com/vitkuz573/ard/test/mockadbd"
 )
 
 // These tests drive the mock with a Go implementation of the host side of the

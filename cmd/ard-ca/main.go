@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vitaly/ard/internal/tlsx"
+	"github.com/vitkuz573/ard/internal/tlsx"
 )
 
 func main() {

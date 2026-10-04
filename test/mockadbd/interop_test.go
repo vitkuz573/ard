@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vitaly/ard/test/mockadbd"
+	"github.com/vitkuz573/ard/test/mockadbd"
 )
 
 // These tests drive the real adb binary against the mock device. That is the only

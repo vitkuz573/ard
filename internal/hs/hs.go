@@ -274,3 +274,16 @@ func mustJSON(v any) string {
 	}
 	return string(b)
 }
+
+// ServerReply answers a device handshake.
+//
+// The refusal is a distinct verb rather than a WELCOME carrying an error,
+// because the agent must be able to tell "you are not enrolled" from "the network
+// broke". Only the first is worth retrying, and conflating them produces an agent
+// that reconnects forever against a permanent rejection.
+func ServerReply(w io.Writer, welcome Welcome) error {
+	if welcome.Error != "" {
+		return writeLine(w, Proto+" ERR "+welcome.Error)
+	}
+	return writeLine(w, Proto+" WELCOME "+mustJSON(welcome))
+}
