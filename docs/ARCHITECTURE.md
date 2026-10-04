@@ -12,10 +12,26 @@ in [Deferred](#deferred).
 
 These are structural, not features. They constrain every component.
 
-1. **`adbd` never touches a network.** The agent runs *on the device* and reaches
-   `127.0.0.1:5555` locally. ADB has no authentication: one `adb connect` to an
-   exposed `adbd` is full control of the phone (files, install, shell, screen).
-   So `adbd` is never bound to anything but loopback, on the device.
+1. **`adbd` is never deliberately exposed.** ADB has no authentication: one
+   `adb connect` to an exposed `adbd` is full control of the phone (files, install,
+   shell, screen). The agent runs on the device and reaches adbd over an address
+   the device's own debugging settings opened — see the correction below. What
+   ARD guarantees is that it never widens that exposure itself.
+
+   > **Corrected against real hardware.** This document originally said the agent
+   > reaches `127.0.0.1:5555` on the device's loopback. Measured on a <handset>
+   > running Android 14: **nothing listens on 5555 at all.** `/proc/net/tcp6`
+   > shows adbd bound only to the single port that wireless debugging or
+   > `adb tcpip` opened, on an IPv6 wildcard. `ard-agent` therefore requires
+   > `-adbd` with no default, because a default that is wrong on every modern
+   > device fails in a way that looks like a network problem.
+   >
+   > Worse, `adb tcpip 5557` binds adbd to `*`, i.e. every interface including the
+   > mobile network. That was verified, not assumed: from the laptop the phone's
+   > CGNAT address `<cgnat-address>:5557` accepted a connection. **Prefer wireless
+   > debugging with pairing**, which binds to the WiFi interface only and uses
+   > per-session tokens. Where `adb tcpip` is used, it is a temporary exposure
+   > that a reboot clears.
 2. **Device and operator trust are separate roots.** A stolen operator cert must
    not be able to enroll a device, and a stolen device must not reach any device
    other than itself.
@@ -174,10 +190,12 @@ finish existing streams during graceful disconnect instead of cutting them.
 
 ## 7. Open risks to spike before building on top
 
-1. **Reaching `adbd` from the agent.** Requires Developer options + USB debugging
-   enabled once per device. On Android 11+ wireless debugging can be paired instead.
-   If an OEM blocks loopback access from the agent's context, this changes the
-   design.
+1. ~~Reaching `adbd` from the agent.~~ **Now resolved, and it changed the design.**
+   On Android 11+ there is no loopback listener to reach. The agent is pointed at
+   whichever address the device's debugging settings expose, discovered with
+   `adb shell ss -tln`. Onboarding must therefore enable wireless debugging (or
+   `adb tcpip`) before the agent can run at all, and a reboot clears it — so the
+   agent's startup probe is what tells an operator what to do.
 2. **Concurrent `adbd` connections.** Decides whether the inner framing layer
    stays. Test empirically.
 3. **`adb connect 127.0.0.1:<port>`.** The loopback bridge depends on this exact

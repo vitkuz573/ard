@@ -64,7 +64,7 @@ func run() error {
 	flag.StringVar(&cfg.serverName, "server-name", "", "TLS server name to verify (defaults to the gateway host)")
 	flag.StringVar(&cfg.deviceID, "device", "", "device UUID this agent identifies as (required)")
 	flag.StringVar(&cfg.deviceName, "name", "", "human-readable label shown to operators")
-	flag.StringVar(&cfg.adbdAddr, "adbd", "127.0.0.1:5555", "adbd address on this device's loopback")
+	flag.StringVar(&cfg.adbdAddr, "adbd", "", "address of adbd on this device (required)")
 	flag.StringVar(&cfg.caPath, "ca", "", "server CA certificate (required)")
 	flag.StringVar(&cfg.certPath, "cert", "", "this device's certificate (required)")
 	flag.StringVar(&cfg.keyPath, "key", "", "this device's private key (required)")
@@ -83,6 +83,7 @@ func run() error {
 	missing("ca", cfg.caPath)
 	missing("cert", cfg.certPath)
 	missing("key", cfg.keyPath)
+	missing("adbd", cfg.adbdAddr)
 	if cfg.serverName == "" {
 		if host, _, err := net.SplitHostPort(cfg.gateway); err == nil {
 			cfg.serverName = host
@@ -97,12 +98,19 @@ func run() error {
 	log.Printf("version %s, device %s, gateway %s, adbd %s",
 		version, cfg.deviceID, cfg.gateway, cfg.adbdAddr)
 
-	// Fail fast on a missing adbd rather than looping forever against a device
-	// where USB debugging was never enabled. This is the single most common
-	// onboarding failure and it is much easier to diagnose as a startup error.
+	// Fail fast on an unreachable adbd rather than looping forever against a device
+	// where wireless debugging was never enabled.
+	//
+	// There is deliberately no default address. An earlier version assumed
+	// 127.0.0.1:5555, which is what classic ADB did, and testing against a real
+	// Android 14 phone showed it is simply not there: adbd listens only on the port
+	// that wireless debugging or "adb tcpip" opened, and nothing else. A default
+	// would have failed on every modern device with a plausible but wrong message,
+	// so the address is required and the real value is reported back.
 	if err := probeAdbd(cfg.adbdAddr); err != nil {
 		return fmt.Errorf("adbd is not reachable at %s: %w\n"+
-			"enable Developer options and USB debugging on the device, or pair over Wi-Fi, then retry",
+			"on Android 11+ run `adb shell ss -tln | grep -E ':555[0-9]'` and pass the\n"+
+			"listening port to -adbd; enable Developer options and Wireless debugging first",
 			cfg.adbdAddr, err)
 	}
 
