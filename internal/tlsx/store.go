@@ -2,6 +2,7 @@ package tlsx
 
 import (
 	"crypto/ecdsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -99,4 +100,74 @@ func parseKeyPEM(data []byte) (*ecdsa.PrivateKey, error) {
 		return nil, fmt.Errorf("tlsx: parse EC key: %w", err)
 	}
 	return key, nil
+}
+
+// Verification is separated from issuance on purpose.
+//
+// The gateway verifies device and operator certificates against their roots, and
+// never issues anything. If it loaded a CA as a keypair it would be handed a path
+// it must never use, and the filesystem would have to make that CA key readable in
+// order for the process to start — which is precisely the escalation we are trying
+// to prevent. So the gateway loads roots as certificates only, and the CA private
+// keys stay unreadable to it. That constraint is now enforced by the type system
+// rather than by remembering to pass a flag.
+
+// Verifier is a certificate authority usable for verification only.
+type Verifier struct {
+	Cert *x509.Certificate
+	// Pool trusts this root, for use as a TLS ClientCAs.
+	Pool *x509.CertPool
+}
+
+// LoadVerifier reads <dir>/ca.crt and never touches ca.key.
+func LoadVerifier(dir string) (*Verifier, error) {
+	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.crt"))
+	if err != nil {
+		return nil, fmt.Errorf("tlsx: read ca.crt: %w", err)
+	}
+	cert, err := parseCertPEM(certPEM)
+	if err != nil {
+		return nil, err
+	}
+	if !cert.IsCA {
+		return nil, fmt.Errorf("tlsx: %s/ca.crt is not a CA certificate", dir)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return &Verifier{Cert: cert, Pool: pool}, nil
+}
+
+// ServerTLSFromVerifier builds a listener config trusting exactly one root,
+// addressed by the verification-only representation.
+func ServerTLSFromVerifier(v *Verifier, serverCert tls.Certificate, minVer uint16) (*tls.Config, error) {
+	if minVer == 0 {
+		minVer = tls.VersionTLS13
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    v.Pool,
+		MinVersion:   minVer,
+		// The platform has no use for renegotiation, and pinning it off keeps the
+		// post-handshake state machine small.
+		Renegotiation: tls.RenegotiateNever,
+	}, nil
+}
+
+// ClientTLSFromVerifier builds an outbound config that authenticates with id and
+// verifies the gateway against a root, without loading any CA key.
+func ClientTLSFromVerifier(v *Verifier, id *Identity, serverName string, minVer uint16) (*tls.Config, error) {
+	if minVer == 0 {
+		minVer = tls.VersionTLS13
+	}
+	cert, err := id.TLSCertificate()
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      v.Pool,
+		ServerName:   serverName,
+		MinVersion:   minVer,
+	}, nil
 }

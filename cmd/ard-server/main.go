@@ -112,20 +112,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	deviceCA, err := tlsx.LoadCA(filepath.Join(cfg.pkiDir, "devices"))
+	// Roots are loaded for verification only. The gateway must never hold a CA
+	// private key: it would then be able to mint device and operator identities,
+	// turning a single compromised process into authority over the whole fleet.
+	// Loading a keypair here would also force the CA key to be readable by the
+	// gateway user, which is the exact escalation being avoided.
+	deviceCA, err := tlsx.LoadVerifier(filepath.Join(cfg.pkiDir, "devices"))
 	if err != nil {
 		return fmt.Errorf("load device CA: %w", err)
 	}
-	operatorCA, err := tlsx.LoadCA(filepath.Join(cfg.pkiDir, "operators"))
+	operatorCA, err := tlsx.LoadVerifier(filepath.Join(cfg.pkiDir, "operators"))
 	if err != nil {
 		return fmt.Errorf("load operator CA: %w", err)
 	}
 
-	deviceTLS, err := tlsx.ServerTLS(deviceCA, serverTLS, 0)
+	deviceTLS, err := tlsx.ServerTLSFromVerifier(deviceCA, serverTLS, 0)
 	if err != nil {
 		return err
 	}
-	operatorTLS, err := tlsx.ServerTLS(operatorCA, serverTLS, 0)
+	operatorTLS, err := tlsx.ServerTLSFromVerifier(operatorCA, serverTLS, 0)
 	if err != nil {
 		return err
 	}

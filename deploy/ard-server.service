@@ -1,0 +1,81 @@
+[Unit]
+Description=ARD remote ADB gateway
+Documentation=file:/opt/ard/docs/ARCHITECTURE.md
+# The gateway must not accept a device or an operator connection while it believes
+# a firewall is in place when it is not, so this is ordered before the gateway and
+# a non-zero exit is visible in the boot log.
+After=network-online.target nftables.service ard-firewall-verify.service
+Wants=network-online.target
+Requires=ard-firewall-verify.service
+# Refuse to start if the unit or its certificates are missing rather than running
+# degraded.
+ConditionPathExists=/etc/ard/ard-server.env
+
+[Service]
+Type=simple
+User=ard
+Group=ard
+# Configuration is external so dev, staging and prod differ by file, never by
+# code. Values come from an environment file rather than a bespoke config parser,
+# because systemd already provides the parsing, the escaping and the override
+# mechanism.
+EnvironmentFile=/etc/ard/ard-server.env
+ExecStart=/opt/ard/bin/ard-server \
+  -listen-devices   ${ARD_LISTEN_DEVICES} \
+  -listen-operators ${ARD_LISTEN_OPERATORS} \
+  -control-socket   ${ARD_CONTROL_SOCKET} \
+  -pki              ${ARD_PKI_DIR} \
+  -devices          ${ARD_DEVICES} \
+  -operators        ${ARD_OPERATORS_FILE} \
+  -loopback-base    ${ARD_LOOPBACK_BASE} \
+  -audit            ${ARD_AUDIT_LOG}
+Restart=always
+RestartSec=3s
+
+# The gateway holds one connection per device and multiplexes operator streams over
+# it. A restart drops every live session, so give in-flight work a moment to notice
+# and be torn down cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+StateDirectory=ard
+RuntimeDirectory=ard
+LogsDirectory=ard
+WorkingDirectory=/var/lib/ard
+
+# The gateway reads its PKI and policy, and writes only its state and audit log.
+# Everything else is read-only, so a compromised process cannot replace its own
+# binaries or rewrite its own policy.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Filesystem-type restrictions are omitted; see the note in deploy/README.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/ard /var/log/ard /run/ard
+ReadOnlyPaths=/etc/ard /opt/ard
+
+LimitNOFILE=65536
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

@@ -106,7 +106,10 @@ func run() error {
 			cfg.adbdAddr, err)
 	}
 
-	ca, err := tlsx.LoadCA(filepath.Dir(cfg.caPath))
+	// Verification only: an agent has no reason to hold a CA key, and being
+	// unable to load one keeps that property from depending on filesystem
+	// permissions alone.
+	ca, err := tlsx.LoadVerifier(filepath.Dir(cfg.caPath))
 	if err != nil {
 		return fmt.Errorf("load server CA: %w", err)
 	}
@@ -146,8 +149,8 @@ func run() error {
 }
 
 // serve runs one connection to completion.
-func serve(ctx context.Context, cfg config, ca *tlsx.CA, id *tlsx.Identity) error {
-	tlsCfg, err := tlsx.ClientTLS(ca, id, cfg.serverName, 0)
+func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity) error {
+	tlsCfg, err := tlsx.ClientTLSFromVerifier(ca, id, cfg.serverName, 0)
 	if err != nil {
 		return err
 	}

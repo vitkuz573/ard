@@ -1,0 +1,48 @@
+# Operator roles and device grants.
+#
+# Two independent questions are asked of every stream:
+#
+#   permission - may this role open this kind of stream at all
+#   grant      - may this role touch this specific device
+#
+# A role with the right permission but no grant for a device is refused. This
+# separation is what lets one operator be allowed to install on a lab bench and
+# nothing else.
+#
+# Permissions:
+#   "*"          every permission below
+#   shell        interactive shell
+#   exec         one-shot commands
+#   files        push and pull
+#   install      install and uninstall packages
+#   logcat       read the device log
+#   screen       view the screen and inject input
+#   forward      adb port forward. This is the sensitive one: a forward can expose
+#                a device port to anyone who can reach the gateway, so keep it off
+#                unless it is genuinely needed.
+#   reverse      adb reverse forwarding
+#
+# Grants are device UUIDs, a trailing "*" prefix such as lab-*, or "*" for all.
+#
+# Prefer explicit UUIDs. A role holding "*" with "*" grants is fleet-wide remote
+# shell, which is almost never what was intended.
+
+roles:
+  # Read-only observer. A safe default for onboarding an operator.
+  - name: viewer
+    permissions: ["logcat", "files"]
+    grants:
+      - "CHANGE-ME-device-uuid"
+
+  # Full interactive access, to one explicitly named device.
+  - name: maintainer
+    permissions: ["shell", "exec", "files", "install", "logcat"]
+    grants:
+      - "CHANGE-ME-device-uuid"
+
+  # Break-glass role for a named operator. Holds no grants by default, so enabling
+  # the role does not by itself grant access to anything: grants are added here
+  # deliberately, with the change recorded in version control.
+  - name: emergency
+    permissions: ["*"]
+    grants: []

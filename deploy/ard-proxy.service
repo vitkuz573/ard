@@ -1,0 +1,58 @@
+[Unit]
+Description=ARD loopback bridge that presents remote devices to the stock adb server
+Documentation=file:/opt/ard/docs/ARCHITECTURE.md
+After=ard-server.service
+# Deliberately Requires: without the gateway there is nothing to bridge, and a
+# proxy that keeps running with a stale device list would report devices online
+# that no longer exist.
+Requires=ard-server.service
+
+[Service]
+Type=simple
+User=ard
+Group=ard
+EnvironmentFile=/etc/ard/ard-proxy.env
+ExecStart=/opt/ard/bin/ard-proxy -control ${ARD_CONTROL_SOCKET}
+Restart=always
+RestartSec=3s
+
+# Reconciles every two seconds, so give it time to notice the socket appearing
+# after a gateway restart.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+StateDirectory=ard
+RuntimeDirectory=ard
+WorkingDirectory=/var/lib/ard
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Filesystem-type restrictions are omitted; see the note in deploy/README.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadOnlyPaths=/etc/ard /opt/ard
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

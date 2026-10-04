@@ -22,11 +22,11 @@ type Link struct {
 
 	writeMu sync.Mutex
 
-	mu        sync.Mutex
-	streams   map[string]*Stream
-	opens     chan openFrame
-	closed    chan struct{}
-	err       error
+	mu         sync.Mutex
+	streams    map[string]*Stream
+	opens      chan openFrame
+	closed     chan struct{}
+	err        error
 	finishOnce sync.Once
 }
 
