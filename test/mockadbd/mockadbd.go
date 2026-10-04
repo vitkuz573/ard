@@ -27,6 +27,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Commands as they appear on the wire, little-endian.
@@ -527,11 +528,24 @@ func (c *conn) deliver(id uint32, data []byte) {
 		}
 		switch frameID {
 		case v2Stdin:
+			tracef("stdin frame id=%d len=%d", frameID, len(payload))
 			if len(payload) > 0 {
 				s.in <- payload
 			}
+			// Top the stdin window back up as data is consumed.
+			//
+			// Flow control has to be acknowledged in step: a window granted once up
+			// front is not what the peer expects, and in this mock it made adb stop
+			// sending stdin entirely. Replenishing per frame is both closer to a real
+			// adbd and, unlike the up-front grant, does not confuse the client.
+			if len(payload) > 0 {
+				grant := make([]byte, 4)
+				binary.LittleEndian.PutUint32(grant, mockStdinWindow)
+				_ = s.writeFrame(v2WindowSizeChg, grant)
+			}
 		case v2CloseStdin:
 			// The host signals end of stdin with this frame, not an empty WRTE.
+			tracef("closeStdin id=%d len=%d", frameID, len(payload))
 			s.setEOF()
 			return
 		case v2WindowSizeChg:
@@ -693,6 +707,11 @@ const (
 	v2Exit          byte = 3
 	v2CloseStdin    byte = 4
 	v2WindowSizeChg byte = 5
+
+	// mockStdinWindow is the amount of stdin the mock grants the host at once. Large
+	// enough that no test has to care about windowing, small enough to be a real number
+	// rather than an obvious "unlimited" sentinel.
+	mockStdinWindow uint32 = 256 * 1024
 )
 
 // v2HeaderSize is 1 byte identifier plus a 4-byte length (AOSP
@@ -965,4 +984,23 @@ func writeMessage(w io.Writer, m Message, version uint32) error {
 		}
 	}
 	return nil
+}
+
+// tracef writes a diagnostic line when MOCKADBD_TRACE names a file.
+//
+// This exists because a hang has no other evidence: the symptom is that nothing happens,
+// so without a record of which frames actually arrived the only honest options are to
+// guess or to add tracing. Gate it behind an environment variable so it costs nothing
+// when nobody is debugging.
+func tracef(format string, args ...any) {
+	path := os.Getenv("MOCKADBD_TRACE")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("15:04:05.000"), fmt.Sprintf(format, args...))
 }
