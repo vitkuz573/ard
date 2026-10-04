@@ -31,7 +31,7 @@ public class MainActivity extends Activity {
     private EditText gateway, serverName, deviceId, deviceName, adbd;
     private CheckBox autostart;
     private TextView status;
-    private Button toggle, scanBtn, clearBtn;
+    private Button toggle, scanBtn, clearBtn, enrolBtn;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -89,6 +89,20 @@ public class MainActivity extends Activity {
         toggle = button("Start");
         root.addView(toggle);
 
+        // Enrolment is a separate action from starting, because it is a separate
+        // operation: it needs the operator, and until they have run one command on the
+        // gateway there is nothing for the agent to connect with.
+        enrolBtn = button(enrolLabel());
+        enrolBtn.setOnClickListener(v -> onEnrol());
+        root.addView(enrolBtn);
+
+        TextView enrolHelp = new TextView(this);
+        enrolHelp.setTextSize(11);
+        enrolHelp.setText("First run only: press Enrol, then type the code it shows into "
+                + "`ard-ca enrol -code <CODE>` on the gateway. The device creates its own "
+                + "key, so nothing has to be copied to or from it.");
+        root.addView(enrolHelp);
+
         status = new TextView(this);
         status.setTextIsSelectable(true);
         status.setTextSize(11);
@@ -117,6 +131,38 @@ public class MainActivity extends Activity {
         e.setSingleLine(true);
         root.addView(e);
         return e;
+    }
+
+    /** The button doubles as the status line: it says whether a certificate is held. */
+    private String enrolLabel() {
+        return Enrol.enrolled(this) ? "Re-enrol (replace certificate)" : "Enrol";
+    }
+
+    /**
+     * Starts enrolment on a background thread.
+     *
+     * The flow blocks on a human reading a code off this screen and typing it into a
+     * terminal elsewhere, so running it on the main thread would freeze the UI for as
+     * long as the operator takes.
+     */
+    private void onEnrol() {
+        Config c = Config.load(this);
+        String gw = gateway.getText().toString().trim();
+        String id = deviceId.getText().toString().trim();
+        String name = deviceName.getText().toString().trim();
+        if (gw.isEmpty() || id.isEmpty()) {
+            toast("the gateway address and device id are required");
+            return;
+        }
+        enrolBtn.setEnabled(false);
+        enrolBtn.setText("Enrolling\u2026 read the code, then approve it on the gateway");
+        Enrol.runAsync(this, gw, id, name);
+        // The thread posts its own result to the UI thread. This only restores the
+        // button, so the state shown is whatever is true once the work has settled.
+        enrolBtn.postDelayed(() -> {
+            enrolBtn.setEnabled(true);
+            enrolBtn.setText(enrolLabel());
+        }, 1000);
     }
 
     private Button button(String text) {

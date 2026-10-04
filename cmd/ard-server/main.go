@@ -26,9 +26,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/vitkuz573/ard/internal/acl"
 	"github.com/vitkuz573/ard/internal/audit"
+	"github.com/vitkuz573/ard/internal/enrol"
 	"github.com/vitkuz573/ard/internal/registry"
 	"github.com/vitkuz573/ard/internal/tlsx"
 )
@@ -45,6 +47,8 @@ func main() {
 type config struct {
 	deviceListen   string
 	operatorListen string
+	enrolListen    string
+	enrolTTL       time.Duration
 	controlSocket  string
 	pkiDir         string
 	allowedDevices string
@@ -57,6 +61,8 @@ func run() error {
 	var cfg config
 	flag.StringVar(&cfg.deviceListen, "listen-devices", ":7000", "device listener (TLS, device certificates only)")
 	flag.StringVar(&cfg.operatorListen, "listen-operators", ":7100", "operator listener (TLS, operator certificates only)")
+	flag.StringVar(&cfg.enrolListen, "listen-enrol", ":7200", "enrolment listener (TLS, no client certificate: devices have none yet)")
+	flag.DurationVar(&cfg.enrolTTL, "enrol-ttl", 15*time.Minute, "how long a certificate request waits for operator approval")
 	flag.StringVar(&cfg.controlSocket, "control-socket", "/run/ard/control.sock", "unix socket for ard-proxy")
 	flag.StringVar(&cfg.pkiDir, "pki", "/etc/ard/pki", "directory produced by ard-ca")
 	flag.StringVar(&cfg.allowedDevices, "devices", "", "comma-separated device UUIDs permitted to connect (required)")
@@ -138,7 +144,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	gw := &gateway{reg: reg, audit: auditor, authz: authz, logger: log.Default()}
+	gw := &gateway{
+		reg:     reg,
+		audit:   auditor,
+		authz:   authz,
+		logger:  log.Default(),
+		mailbox: enrol.NewMailbox(cfg.enrolTTL),
+	}
 
 	deviceLn, err := net.Listen("tcp", cfg.deviceListen)
 	if err != nil {
@@ -148,6 +160,12 @@ func run() error {
 	if err != nil {
 		_ = deviceLn.Close()
 		return fmt.Errorf("listen operators: %w", err)
+	}
+	enrolLn, err := net.Listen("tcp", cfg.enrolListen)
+	if err != nil {
+		_ = deviceLn.Close()
+		_ = operatorLn.Close()
+		return fmt.Errorf("listen enrol: %w", err)
 	}
 
 	var wg sync.WaitGroup
@@ -160,6 +178,14 @@ func run() error {
 	go func() {
 		defer wg.Done()
 		gw.serveOperators(ctx, operatorLn, operatorTLS)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Deliberately no client certificate: a device cannot present one before it is
+		// enrolled. This is the only listener that accepts an unauthenticated peer, so
+		// it is also the one that must assume everything it reads is hostile.
+		gw.serveEnrol(ctx, enrolLn, enrolServerTLS(serverTLS))
 	}()
 
 	// ard-proxy attaches over a unix socket rather than TCP: loopback TCP would be
@@ -183,13 +209,14 @@ func run() error {
 		gw.serveControl(ctx, controlLn)
 	}()
 
-	log.Printf("devices on %s, operators on %s, control on %s",
-		deviceLn.Addr(), operatorLn.Addr(), cfg.controlSocket)
+	log.Printf("devices on %s, operators on %s, enrol on %s, control on %s",
+		deviceLn.Addr(), operatorLn.Addr(), enrolLn.Addr(), cfg.controlSocket)
 
 	<-ctx.Done()
 	log.Printf("shutting down")
 	_ = deviceLn.Close()
 	_ = operatorLn.Close()
+	_ = enrolLn.Close()
 	_ = controlLn.Close()
 	_ = os.Remove(cfg.controlSocket)
 	wg.Wait()

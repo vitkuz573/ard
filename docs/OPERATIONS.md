@@ -100,6 +100,27 @@ regenerated.
 | `ard-proxy` | presents each device on a loopback port to the stock `adb` |
 | `ard-firewall-verify` | asserts at boot that the firewall is really enforcing |
 
+### Enrolling a device
+
+```sh
+sudo ard-ca enrol -code <CODE>
+```
+
+The device shows the code; this command shows the request it is about to sign -- device
+id, request id, role and the SHA-256 of the CSR -- and asks for confirmation. `-yes`
+skips the prompt for unattended use, which then shows up in the audit log as an approval
+that did not pause.
+
+Two things are refused rather than warned about, because both mean the approval covered
+something other than what was signed:
+
+- the CSR names a different device than the one it was submitted as
+- the device reports a gateway certificate that is not the one this PKI signs for, which
+  is what an interception attempt looks like
+
+The CA key is root-only and `ard-ca enrol` needs it, so this runs as root over SSH. It is
+the only signing path: the gateway holds no CA key and cannot issue anything.
+
 Loopback ports are assigned from the order of `ARD_DEVICES` in
 `/etc/ard/ard-server.env`, so **treat that list as append-only**: reordering it
 changes every operator's saved `adb` serial.

@@ -19,7 +19,7 @@ Verify the resulting posture with `systemd-analyze security ard-server.service`.
 
 ## Port exposure
 
-Only two TCP ports are opened, both requiring mutual TLS against separate roots:
+Three TCP ports are opened. Two require mutual TLS against separate roots:
 
     7000/tcp   device listener   trusts the device CA
     7100/tcp   operator listener trusts the operator CA

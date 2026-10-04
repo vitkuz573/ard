@@ -27,6 +27,8 @@ EnvironmentFile=/etc/ard/ard-server.env
 ExecStart=/opt/ard/bin/ard-server \
   -listen-devices   ${ARD_LISTEN_DEVICES} \
   -listen-operators ${ARD_LISTEN_OPERATORS} \
+  -listen-enrol     ${ARD_LISTEN_ENROL} \
+  -enrol-ttl        ${ARD_ENROL_TTL} \
   -control-socket   ${ARD_CONTROL_SOCKET} \
   -pki              ${ARD_PKI_DIR} \
   -devices          ${ARD_DEVICES} \

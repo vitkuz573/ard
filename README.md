@@ -34,35 +34,40 @@ Idempotent. Preserves the PKI and the device allowlist. Prints what it verified.
 adb install -r android/ard-agent.apk
 ```
 
-Open it, press **Discover adbd**, then **Start**. You type the gateway address;
+Press **Enrol** first (below), then **Discover adbd**, then **Start**. You type the gateway address;
 everything else the app works out for itself. There is no gateway baked into the
 APK, so the same build works for every deployment and nobody has to publish an
 address to use it.
 
-### Known remaining step: certificates
+### Certificates
 
-The APK ships the agent but **not** a device identity. Until in-app enrolment
-exists, the credentials are put in place once:
+The device generates its own key pair and asks for a certificate. No private key is ever
+copied to or from the phone, and nothing has to be pushed with `adb`.
+
+On the phone: install the APK, fill in the gateway address, press **Enrol**. The app
+shows a code and waits.
+
+On the gateway host:
 
 ```sh
-# on the gateway
-ard-ca device -dir /etc/ard/pki -id <device-id>
-
-# on the device
-adb push <device-id>.crt /data/local/tmp/device.crt
-adb push <device-id>.key /data/local/tmp/device.key
-adb shell "run-as dev.ard.agent mkdir -p files/ard"
-adb shell "cat /data/local/tmp/device.crt | run-as dev.ard.agent sh -c 'cat > files/ard/device.crt'"
-adb shell "cat /data/local/tmp/device.key | run-as dev.ard.agent sh -c 'cat > files/ard/device.key'"
-adb push <server-ca>.crt /data/local/tmp/ca.crt
-adb shell "cat /data/local/tmp/ca.crt | run-as dev.ard.agent sh -c 'cat > files/ard/ca.crt'"
+sudo ard-ca enrol -code <CODE>      # prints the request, then asks before signing
 ```
 
-This is the part that is not yet "one step". The fix is a CSR flow: the app
-generates its own key pair, sends a CSR to the gateway, and receives a
-certificate. Nothing leaves the device that does not need to, and the operator
-stops touching key material. The gateway side is a small addition; it is simply
-not written yet.
+That is the whole procedure. The device keeps the key it generated, the gateway never
+signs anything, and `ard-ca` -- which holds the CA -- is the only party that can.
+
+Three properties are worth stating, because they are the reason the flow is shaped this
+way:
+
+- **The key never moves.** The device generates it, stores it, and presents it. The CA
+  only ever sees a signature request.
+- **The gateway cannot mint identities.** It holds no CA key. It stores requests and
+  forwards them; signing happens in `ard-ca`, wherever the CA lives.
+- **The approval is specific.** The operator is shown which device, which request id and
+  which CSR, and the code binds that approval to that one request. The device also
+  reports the fingerprint of the gateway certificate it actually reached, which the
+  signing side compares against the PKI -- so an interception attempt at first contact
+  fails before anything is signed.
 
 ## Build the agent APK
 
@@ -89,7 +94,12 @@ reported success for an APK containing no binary at all.
 ```sh
 go test ./...                 # unit and protocol tests
 scripts/e2e-local.sh          # full path against a mock device, real adb
+scripts/e2e-enrol.sh          # certificate enrolment, device through gateway to a session
 ```
+
+`e2e-enrol.sh` runs the gateway as root, because enrolment is deliberately restricted to
+uid 0 on the control socket. It asserts the part that unit tests cannot: that a
+certificate obtained this way actually opens a mutual-TLS session.
 
 The mock in `test/mockadbd` speaks adbd's wire protocol and is tested against the
 actual `adb` binary. Several of its bugs were found only by that interop, and

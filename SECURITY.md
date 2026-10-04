@@ -40,7 +40,12 @@ Stated so a report can be judged rather than triaged by intuition.
   Same mechanism, opposite direction.
 - **A compromised gateway process** must not be able to mint identities. The
   gateway holds `ca.crt` and never `ca.key`; this is enforced by the type
-  system, not by discipline.
+  system, not by discipline. Certificate enrolment preserves this: the gateway
+  stores certificate requests and delivers signed certificates, and signing
+  happens in `ard-ca` on the operator's side. Because the control socket is mode
+  0660 and group-owned by the gateway's own user, enrolment operations there
+  additionally require peer uid 0 -- otherwise the gateway could issue
+  certificates to itself.
 - **A device behind carrier-grade NAT** is reachable only by dialling out.
   There is no inbound path to add, so there is nothing to forward.
 
@@ -54,6 +59,14 @@ Stated because a security tool that overstates itself is worse than none.
   operator certificate has real `adb` access to the listed devices. That is the
   product. Roles in `operators.yaml` limit who may perform administrative
   actions; they do not sandbox `shell`.
+- **A hostile network** during first contact. A device enrolling has no CA
+  certificate, so it cannot verify the gateway at all: the connection that carries
+  its certificate request is not authenticated. It reports the fingerprint of the
+  certificate it was shown, and `ard-ca` compares it against the PKI before
+  signing, so an interception attempt fails before a certificate exists. After
+  enrolment the device verifies the gateway normally. Between those two points the
+  only thing standing between a device and a machine-in-the-middle is the operator
+  noticing a mismatch.
 - **A hostile network**, in the sense of an attacker who can intercept and
   terminate TLS. Mutual TLS with private keys that never leave their host is the
   boundary; there is no pinning of the server's *name*, only of its role.

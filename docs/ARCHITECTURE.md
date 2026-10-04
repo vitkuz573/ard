@@ -33,17 +33,39 @@ These are structural, not features. They constrain every component.
    > port. **Prefer wireless debugging with pairing**, which binds to the WiFi
    > interface only and uses per-session tokens. Where `adb tcpip` is used, it is
    > a temporary exposure that a reboot clears.
-2. **Device and operator trust are separate roots.** A stolen operator cert must
+2. **Enrolment is a mailbox, not a signing service.** A device with no certificate has
+   nothing to verify the gateway with and nothing to present, so it cannot use the device
+   listener at all. It therefore gets a third listener that completes a server-only TLS
+   handshake, submits a CSR, and receives a short claim code. The gateway stores the
+   request; it holds no CA key and cannot sign anything. `ard-ca enrol`, running wherever
+   the CA lives, claims the request by code, prints it, signs locally and sends the
+   certificate back, which the gateway delivers to the waiting device.
+
+   The code is what makes the approval specific: without it, approving "device-7" would
+   sign whatever request happened to be filed under that name, and anyone can file one.
+
+   Signing is authorised on the control socket by peer uid 0, not by filesystem
+   permissions alone. That socket is mode 0660 and group-owned by the gateway's own user,
+   so permissions would otherwise let the gateway process itself hand out certificates --
+   which is exactly the escalation this PKI layout exists to prevent.
+
+   First contact is the awkward part, because a device with no CA certificate cannot
+   verify anything. Rather than trusting the gateway blindly, the device reports the
+   fingerprint of the certificate it was actually shown, and `ard-ca` compares it against
+   the server root in the PKI. A machine-in-the-middle can complete the handshake,
+   receive the CSR and look entirely convincing; it cannot produce a fingerprint that
+   matches, so the attempt fails before a certificate exists.
+3. **Device and operator trust are separate roots.** A stolen operator cert must
    not be able to enroll a device, and a stolen device must not reach any device
    other than itself.
-3. **Every operator action is attributable.** Auth says *which human*, not *which
+4. **Every operator action is attributable.** Auth says *which human*, not *which
    certificate*. Audit is written before the action starts, not after.
-4. **No implicit reachability.** Nothing is reachable because it exists. Device
+5. **No implicit reachability.** Nothing is reachable because it exists. Device
    ports are allowlisted by UUID, operator access by ACL, `adb forward` targets
    are a separate permission.
-5. **Devices are inert by default.** A device may only be routed to by an operator
+6. **Devices are inert by default.** A device may only be routed to by an operator
    who holds a grant for that device.
-6. **A completed TLS handshake is not an authorization decision.** Under TLS 1.3 the
+7. **A completed TLS handshake is not an authorization decision.** Under TLS 1.3 the
    client finishes its side of the handshake *before* the server has verified the
    client certificate, which travels in the second flight. A rejected certificate
    surfaces later, as an alert on the first application read or write. So every

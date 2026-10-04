@@ -14,6 +14,7 @@ import (
 
 	"github.com/vitkuz573/ard/internal/acl"
 	"github.com/vitkuz573/ard/internal/audit"
+	"github.com/vitkuz573/ard/internal/enrol"
 	"github.com/vitkuz573/ard/internal/hs"
 	"github.com/vitkuz573/ard/internal/registry"
 	"github.com/vitkuz573/ard/internal/tlsx"
@@ -22,10 +23,14 @@ import (
 
 // gateway is the shared state behind both listeners and the control socket.
 type gateway struct {
-	reg    *registry.Registry
-	audit  *audit.Auditor
-	authz  *acl.Policy
-	logger *log.Logger
+	// mailbox holds certificate requests from devices that have no identity yet.
+	// It is storage and a rendezvous point, never a signing authority: the gateway
+	// holds no CA key, so nothing here can produce a certificate on its own.
+	mailbox *enrol.Mailbox
+	reg     *registry.Registry
+	audit   *audit.Auditor
+	authz   *acl.Policy
+	logger  *log.Logger
 }
 
 // serveDevices accepts agent connections.
@@ -260,6 +265,14 @@ type operatorGreeting struct {
 type controlRequest struct {
 	Op     string `json:"op"`
 	Device string `json:"device,omitempty"`
+
+	// Enrolment fields. Code identifies a pending request; CertPEM and CAPEM carry the
+	// signed certificate back. They travel in the same request rather than a second
+	// frame so the uid check in requireRootControl can happen before any of them is
+	// looked at.
+	Code    string `json:"code,omitempty"`
+	CertPEM []byte `json:"cert_pem,omitempty"`
+	CAPEM   []byte `json:"ca_pem,omitempty"`
 }
 
 // listResponse describes every known device, online or not.
@@ -311,6 +324,18 @@ func (g *gateway) handleControl(ctx context.Context, conn net.Conn) {
 		_ = writeJSON(conn, listResponse{Devices: g.reg.List()})
 	case "attach":
 		g.controlAttach(ctx, conn, req)
+	case "enrol.claim":
+		if !g.requireRootControl(conn, req.Op) {
+			_ = writeJSON(conn, enrol.Claimed{Error: "enrol: this operation requires uid 0"})
+			return
+		}
+		g.enrolControlClaim(conn, req)
+	case "enrol.deliver":
+		if !g.requireRootControl(conn, req.Op) {
+			_ = writeJSON(conn, enrol.Outcome{Error: "enrol: this operation requires uid 0"})
+			return
+		}
+		g.enrolControlDeliver(conn, req)
 	default:
 		_ = writeJSON(conn, attachResponse{Error: fmt.Sprintf("unknown op %q", req.Op)})
 	}

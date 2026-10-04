@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -70,7 +71,46 @@ func run() error {
 	flag.StringVar(&cfg.keyPath, "key", "", "this device's private key (required)")
 	flag.DurationVar(&cfg.heartbeat, "heartbeat", 30*time.Second, "gateway heartbeat interval")
 	flag.DurationVar(&cfg.maxBackoff, "max-backoff", 2*time.Minute, "ceiling for reconnect backoff")
+	// Enrolment is a separate mode, not a flag combination. It runs before the required
+	// flags below are checked, because a device enrolling has no certificate yet and
+	// therefore nothing to satisfy -cert, -key or -ca with. Sharing one flag set would
+	// mean either weakening those checks or adding conditions to every one of them.
+	var (
+		enrolGateway string
+		enrolID      string
+		enrolName    string
+		enrolOut     string
+		enrolWait    time.Duration
+	)
+	flag.StringVar(&enrolGateway, "enrol", "", "enrol against this gateway address and exit, instead of connecting")
+	flag.StringVar(&enrolID, "enrol-id", "", "identity to request a certificate for (required with -enrol)")
+	flag.StringVar(&enrolName, "enrol-name", "", "human-readable label for this device")
+	flag.StringVar(&enrolOut, "enrol-out", "", "directory to write device.key, device.crt and ca.crt into (required with -enrol)")
+	flag.DurationVar(&enrolWait, "enrol-timeout", enrolTimeout, "how long to wait for the operator to approve")
 	flag.Parse()
+
+	if enrolGateway != "" {
+		if enrolID == "" {
+			return errors.New("-enrol-id is required with -enrol")
+		}
+		if enrolOut == "" {
+			return errors.New("-enrol-out is required with -enrol")
+		}
+		name := cfg.serverName
+		if name == "" {
+			if host, _, err := net.SplitHostPort(enrolGateway); err == nil {
+				name = host
+			}
+		}
+		return runEnrol(enrolOptions{
+			Gateway:    enrolGateway,
+			ServerName: name,
+			DeviceID:   enrolID,
+			DeviceName: enrolName,
+			OutDir:     enrolOut,
+			Timeout:    enrolWait,
+		})
+	}
 
 	missing := func(name, value string) {
 		if value == "" {

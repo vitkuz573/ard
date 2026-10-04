@@ -31,7 +31,7 @@ func main() {
 }
 
 func usage() error {
-	return errors.New("usage: ard-ca <init|device|operator|list> [flags]")
+	return errors.New("usage: ard-ca <init|device|operator|list|enrol> [flags]")
 }
 
 func run(args []string) error {
@@ -47,6 +47,8 @@ func run(args []string) error {
 		return cmdIssue(args[1:], tlsx.OrgUnitOperator, "operators")
 	case "list":
 		return cmdList(args[1:])
+	case "enrol":
+		return cmdEnrol(args[1:])
 	case "-h", "--help", "help":
 		return usage()
 	default:

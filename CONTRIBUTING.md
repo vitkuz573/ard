@@ -6,9 +6,16 @@
 go build ./...
 go test ./...
 scripts/e2e-local.sh      # mock device, real adb, full path
+scripts/e2e-enrol.sh      # certificate enrolment, end to end; needs passwordless sudo
 ```
 
-`scripts/e2e-local.sh` is the one that matters. The mock in `test/mockadbd`
+`scripts/e2e-enrol.sh` runs the gateway as root, because enrolment is deliberately
+restricted to uid 0 on the control socket. It exists to check the one thing unit tests
+cannot: that a certificate obtained through the CSR flow actually opens a mutual-TLS
+session. An enrolment bug can be perfectly self-consistent and still produce an identity
+the agent cannot use, and that shows up as a handshake error on the first real connection.
+
+`scripts/e2e-local.sh` is the other one that matters. The mock in `test/mockadbd`
 speaks adbd's wire protocol and is checked against the actual `adb` binary;
 several of its bugs surfaced only there, and each presented as a *silent hang*
 rather than an error. A change that passes `go test ./...` but breaks the mock's

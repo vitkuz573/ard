@@ -277,6 +277,7 @@ verify "gateway ports in firewall" "nft list chain inet ard input | grep -c 'dpo
 verify "no raw adb port exposed"   "nft list ruleset | grep -cE '5555|dport @adb'" "0"
 verify "device listener bound"     "ss -tln | grep -c ':7000'" "1"
 verify "operator listener bound"   "ss -tln | grep -c ':7100'" "1"
+verify "enrol listener bound"      "ss -tln | grep -c ':7200'" "1"
 verify "control socket present"    "test -S /run/ard/control.sock && echo present" "present"
 verify "no CA key readable by ard" "sudo -u ard test -r /etc/ard/pki/devices/ca.key 2>/dev/null && echo LEAKED || echo clean" "clean"
 verify "audit log writable"        "test -w /var/log/ard && echo writable" "writable"
