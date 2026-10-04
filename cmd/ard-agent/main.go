@@ -22,7 +22,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -65,7 +64,7 @@ func run() error {
 	flag.StringVar(&cfg.deviceID, "device", "", "device UUID this agent identifies as (required)")
 	flag.StringVar(&cfg.deviceName, "name", "", "human-readable label shown to operators")
 	flag.StringVar(&cfg.adbdAddr, "adbd", "", "address of adbd on this device (required)")
-	flag.StringVar(&cfg.caPath, "ca", "", "server CA certificate (required)")
+	flag.StringVar(&cfg.caPath, "ca", "", "path to the server CA certificate file (required)")
 	flag.StringVar(&cfg.certPath, "cert", "", "this device's certificate (required)")
 	flag.StringVar(&cfg.keyPath, "key", "", "this device's private key (required)")
 	flag.DurationVar(&cfg.heartbeat, "heartbeat", 30*time.Second, "gateway heartbeat interval")
@@ -117,7 +116,14 @@ func run() error {
 	// Verification only: an agent has no reason to hold a CA key, and being
 	// unable to load one keeps that property from depending on filesystem
 	// permissions alone.
-	ca, err := tlsx.LoadVerifier(filepath.Dir(cfg.caPath))
+	//
+	// The argument is the certificate file itself, not a directory. It used to be a
+	// directory that was then passed through filepath.Dir, which silently looked one
+	// level too high: on a device with the files in one directory the agent reported
+	// "no such file or directory" for a file that was right there. Flags whose
+	// meaning can be misread in one direction are worth fixing rather than
+	// documenting.
+	ca, err := tlsx.LoadVerifierFile(cfg.caPath)
 	if err != nil {
 		return fmt.Errorf("load server CA: %w", err)
 	}

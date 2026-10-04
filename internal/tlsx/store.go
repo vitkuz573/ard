@@ -119,18 +119,31 @@ type Verifier struct {
 	Pool *x509.CertPool
 }
 
+// LoadVerifierFile reads a CA certificate file and never touches any key.
+func LoadVerifierFile(path string) (*Verifier, error) {
+	certPEM, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("tlsx: read CA %s: %w", path, err)
+	}
+	return verifierFromPEM(certPEM, path)
+}
+
 // LoadVerifier reads <dir>/ca.crt and never touches ca.key.
 func LoadVerifier(dir string) (*Verifier, error) {
 	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.crt"))
 	if err != nil {
 		return nil, fmt.Errorf("tlsx: read ca.crt: %w", err)
 	}
+	return verifierFromPEM(certPEM, dir)
+}
+
+func verifierFromPEM(certPEM []byte, origin string) (*Verifier, error) {
 	cert, err := parseCertPEM(certPEM)
 	if err != nil {
 		return nil, err
 	}
 	if !cert.IsCA {
-		return nil, fmt.Errorf("tlsx: %s/ca.crt is not a CA certificate", dir)
+		return nil, fmt.Errorf("tlsx: %s is not a CA certificate", origin)
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(cert)

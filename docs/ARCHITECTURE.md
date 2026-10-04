@@ -201,6 +201,41 @@ finish existing streams during graceful disconnect instead of cutting them.
 3. **`adb connect 127.0.0.1:<port>`.** The loopback bridge depends on this exact
    behaviour. Validate early; if it is not allowed, the bridge changes shape.
 
+## 7b. The device agent is an APK
+
+The agent ships as `dev.ard.agent`, a single APK carrying the ARM64 Go binary
+inside itself. Deployment is `adb install ard-agent.apk`; everything else is
+discovered from the device.
+
+Build without Gradle (`scripts/build-apk.sh`): aapt2, javac, d8, zipalign,
+apksigner. No dependency resolution means a build that cannot break on a phone
+with no network.
+
+Four constraints found by testing on a real Android 14 phone, each of which
+produced a failure that looked like something else:
+
+1. **The agent must ship as a native library, not an asset.**
+   `/data/user/<n>/<pkg>/files` is mounted `noexec`, so a binary extracted there
+   dies with `error=13, Permission denied`. `nativeLibraryDir` is the one
+   app-writable exec-mounted directory, because it is where the platform puts
+   executables. Hence `lib/arm64-v8a/libardagent.so`; `execve` does not care
+   about the suffix.
+2. **A normal app cannot read `/proc/net/tcp`.** It sees only its own sockets, so
+   any discovery method based on reading it always reports "not found". Discovery
+   is done by attempting connections instead.
+3. **Discovery must not run on the main thread.** Android throws
+   `NetworkOnMainThreadException` before the first `connect()`, so a probe that
+   ran synchronously from a button handler reported no adbd on a device that had
+   one, and the error named a permissions problem that did not exist.
+4. **`-ca` is a file path, not a directory.** It used to be a directory that was
+   then passed through `filepath.Dir`, which looked one level too high and
+   reported a missing file that was present.
+
+The build script asserts the APK actually contains what the app reads at runtime:
+`assets`/`lib` entry, uncompressed vs compressed as appropriate, ELF magic, and
+`e_machine` for AArch64. It previously reported "APK ready" while shipping an APK
+with no binary in it, and the failure only surfaced on a phone.
+
 ## 8. Repository layout
 
 ```

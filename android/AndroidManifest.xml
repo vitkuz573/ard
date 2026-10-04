@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ARD agent.
+
+  Deliberately no third-party dependencies: the whole point is that installing
+  this file is the entire deployment. Every library added here would be another
+  thing to fetch, resolve or break on a phone with no WiFi.
+
+  The Go agent is shipped in assets/ rather than as a shared library in jniLibs.
+  A static binary in the app's private storage is executed directly, which avoids
+  JNI entirely and keeps the agent updatable without touching the APK's native ABI.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.ard.agent"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- The agent talks to the device's own adbd. That is the single capability
+         the platform does not expose to a normal app, which is why this is a
+         privileged-looking install rather than something any app can do. -->
+    <uses-permission android:name="android.permission.DUMP" />
+
+    <application
+        android:name=".App"
+        android:label="ARD Agent"
+        android:icon="@android:drawable/ic_menu_upload"
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="ARD Agent">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".AgentService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

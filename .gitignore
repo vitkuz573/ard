@@ -13,3 +13,6 @@
 *.key
 *.crt
 pki/.e2e-bin/
+/android/build/
+/android/ard-agent.apk
+/android/*.jks
