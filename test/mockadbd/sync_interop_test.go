@@ -16,14 +16,14 @@ import (
 // which is the only way to tell "the bytes arrived" from "the command did not fail".
 // requireSync skips the push and pull tests while the text protocol is incomplete.
 //
-// They are the specification for the remaining work, written and waiting: bytes land on
-// the device, they come back byte for byte through a 512 KiB binary round trip, a missing
-// path fails without creating the destination, an empty file stays empty, and a push adds
-// exactly one node.
+// They are the specification for the work that remains: bytes land on the device, they come
+// back byte for byte through a 512 KiB round trip, a missing path fails without creating
+// the destination, an empty file stays empty, and a push adds exactly one node.
 func requireSync(t *testing.T) {
 	t.Helper()
-	t.Skip("text sync protocol: STA2 parses and replies, but adb still blocks after it; " +
-		"the next mismatch is one MOCKADBD_TRACE run away. See test/mockadbd/sync_text.go.")
+	t.Skip("text sync protocol: STA2 is parsed and replied to, but adb blocks instead of " +
+		"sending SND2. One command away: MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ " +
+		"-run TestInteropPushLands. See test/mockadbd/sync_text.go.")
 }
 
 func connectMock(t *testing.T) (string, *mockadbd.VFS) {

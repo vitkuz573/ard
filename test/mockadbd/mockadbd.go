@@ -757,6 +757,17 @@ func (s *stream) writeFrame(id byte, p []byte) error {
 	return s.writeChunked(payload)
 }
 
+// writeRaw sends bytes verbatim, with no shell-v2 framing.
+//
+// The sync service is one of the places that need this. Its replies are their own
+// protocol -- four-character words and little-endian integers -- and wrapping them in
+// v2 stdout frames produces a byte stream the client cannot parse, which it responds to by
+// waiting for more rather than by reporting anything. Stream.Write is the shell's path and
+// must not be used here.
+func (s *stream) writeRaw(p []byte) error {
+	return s.writeChunked(p)
+}
+
 // writeChunked sends payload as a sequence of WRTE packets no larger than maxPayload.
 func (s *stream) writeChunked(payload []byte) error {
 	const chunk = maxPayload - 16

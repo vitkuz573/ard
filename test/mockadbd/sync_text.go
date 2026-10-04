@@ -188,11 +188,15 @@ func readLenString(r io.Reader) (string, error) {
 	return string(buf), nil
 }
 
-func putWord(w io.Writer, v uint32) error {
+// putWord writes one command word.
+//
+// It takes a *stream rather than an io.Writer precisely so it can reach writeRaw: going
+// through stream.Write would frame the word as shell-v2 stdout, and the client would be
+// reading a protocol this is not.
+func putWord(s *stream, v uint32) error {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)
-	_, err := w.Write(b[:])
-	return err
+	return s.writeRaw(b[:])
 }
 
 func failMsg(s *stream, format string, args ...any) {
@@ -200,7 +204,7 @@ func failMsg(s *stream, format string, args ...any) {
 	_ = putWord(s, failW)
 	var n [4]byte
 	binary.LittleEndian.PutUint32(n[:], uint32(len(msg)))
-	_, _ = s.Write(append(n[:], msg...))
+	_ = s.writeRaw(append(n[:], msg...))
 }
 
 // writeStatV2 emits id followed by the 68-byte body.
@@ -227,8 +231,7 @@ func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	le64(b[44:], uint64(n.ModTime.UnixNano()))
 	le64(b[52:], uint64(n.ModTime.UnixNano()))
 	le64(b[60:], uint64(n.ModTime.UnixNano()))
-	_, err := s.Write(b[:])
-	return err
+	return s.writeRaw(b[:])
 }
 
 func le32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
@@ -295,13 +298,13 @@ func listV2(cfg Config, s *stream, path string) {
 		le64(b[52:], uint64(e.ModTime.UnixNano()))
 		le64(b[60:], uint64(e.ModTime.UnixNano()))
 		le32(b[68:], uint32(len(e.Name)))
-		if _, err := s.Write(append(b[:], e.Name...)); err != nil {
+		if err := s.writeRaw(append(b[:], e.Name...)); err != nil {
 			return
 		}
 	}
 	// DONE carries 16 bytes, not an empty payload.
 	_ = putWord(s, doneW)
-	_, _ = s.Write(make([]byte, 16))
+	_ = s.writeRaw(make([]byte, 16))
 }
 
 // splitSendV1 parses the v1 push form, "path,mode".
@@ -392,10 +395,10 @@ func recvFile(cfg Config, s *stream, path string) {
 		if err := putWord(s, uint32(end-off)); err != nil {
 			return
 		}
-		if _, err := s.Write(data[off:end]); err != nil {
+		if err := s.writeRaw(data[off:end]); err != nil {
 			return
 		}
 	}
 	_ = putWord(s, doneW)
-	_, _ = s.Write(make([]byte, 16))
+	_ = s.writeRaw(make([]byte, 16))
 }
