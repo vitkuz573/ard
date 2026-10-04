@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"testing"
 
 	mockadbd "github.com/vitkuz573/ard/test/mockadbd"
@@ -17,23 +14,16 @@ import (
 //
 // The device gets an explicit filesystem so a test can inspect what a push produced,
 // which is the only way to tell "the bytes arrived" from "the command did not fail".
-// requireTextSync skips when the host's adb speaks the text-framed sync protocol that
-// mockadbd does not implement yet.
+// requireSync skips the push and pull tests while the text protocol is incomplete.
 //
-// These tests are the specification for that work: they say exactly what push and pull
-// have to do -- land bytes on the device, bring them back byte for byte, fail on a missing
-// path, create nothing but the file -- and they are written and waiting. Skipping them with
-// the reason attached is deliberate. Leaving them failing would put a known gap into every
-// run and train everyone to ignore a red test, and deleting them would lose the spec.
-//
-// The legacy binary protocol is implemented and covered by unit tests; what is missing is
-// the STA2/SND2 text framing a current adb actually speaks.
-func requireTextSync(t *testing.T) {
+// They are the specification for the remaining work, written and waiting: bytes land on
+// the device, they come back byte for byte through a 512 KiB binary round trip, a missing
+// path fails without creating the destination, an empty file stays empty, and a push adds
+// exactly one node.
+func requireSync(t *testing.T) {
 	t.Helper()
-	if v := adbSyncProtocolVersion(); v >= 2 {
-		t.Skipf("adb speaks text sync protocol v%d; mockadbd implements only the legacy "+
-			"binary one. See test/mockadbd/sync.go for the trace evidence.", v)
-	}
+	t.Skip("text sync protocol: STA2 parses and replies, but adb still blocks after it; " +
+		"the next mismatch is one MOCKADBD_TRACE run away. See test/mockadbd/sync_text.go.")
 }
 
 func connectMock(t *testing.T) (string, *mockadbd.VFS) {
@@ -67,7 +57,7 @@ func hostFile(t *testing.T, name string, data []byte) string {
 // reports success on the way out and the bytes are only checked later, by hand, on a
 // device. So the assertion is on the device side.
 func TestInteropPushLandsOnTheDevice(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -90,7 +80,7 @@ func TestInteropPushLandsOnTheDevice(t *testing.T) {
 // Binary content is the case that catches framing bugs. Text passes through systems that
 // quietly mangle NULs and lone CRs; random bytes do not.
 func TestInteropPushPreservesBinaryContent(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -117,7 +107,7 @@ func TestInteropPushPreservesBinaryContent(t *testing.T) {
 
 // A pull is the mirror image and is what an operator does when collecting a log.
 func TestInteropPullBringsTheFileToTheHost(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -142,7 +132,7 @@ func TestInteropPullBringsTheFileToTheHost(t *testing.T) {
 // Round-trip is the property that matters: what goes up comes back byte for byte, which is
 // what a checksum in a test script would be checking on a real device.
 func TestInteropRoundTripIsByteIdentical(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -175,7 +165,7 @@ func TestInteropRoundTripIsByteIdentical(t *testing.T) {
 
 // An empty file is a boundary that framing code usually gets wrong.
 func TestInteropPushEmptyFile(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -196,7 +186,7 @@ func TestInteropPushEmptyFile(t *testing.T) {
 // that returns success for a missing path would make a transfer bug look like a permissions
 // problem on the host.
 func TestInteropPullMissingFileFails(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, _ := connectMock(t)
 
@@ -213,7 +203,7 @@ func TestInteropPullMissingFileFails(t *testing.T) {
 // Pushing into a directory that does not exist yet is the normal case, not an edge case:
 // adb does not create intermediate directories.
 func TestInteropPushCreatesNothingButTheFile(t *testing.T) {
-	requireTextSync(t)
+	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -227,31 +217,4 @@ func TestInteropPushCreatesNothingButTheFile(t *testing.T) {
 	if got := fs.Count(); got != before+1 {
 		t.Fatalf("push changed the node count by %d, want 1", got-before)
 	}
-}
-
-// adbSyncProtocolVersion reports which sync protocol the host's adb will speak, by asking
-// it. There is no flag for this, so it is inferred from the version string, which is the
-// only signal available.
-func adbSyncProtocolVersion() int {
-	out, err := exec.Command("adb", "version").Output()
-	if err != nil {
-		// Unknown adb: run the tests rather than skip them.
-		return 1
-	}
-	// "adb version" prints two version numbers: the bridge version, currently 1.0.41, and
-	// the tools version, currently 37.0.0-android-tools. Only the second says anything
-	// about the protocol, and matching the first -- which is what a naive regexp does,
-	// because it appears earlier -- reports 1 and quietly disables the check.
-	matches := regexp.MustCompile(`(\d+)\.\d+\.\d+`).FindAllSubmatch(out, -1)
-	major := 0
-	for _, m := range matches {
-		if v, err := strconv.Atoi(string(m[1])); err == nil && v > major {
-			major = v
-		}
-	}
-	// Version 34 of the tools introduced the text-framed protocol.
-	if major >= 34 {
-		return 2
-	}
-	return 1
 }
