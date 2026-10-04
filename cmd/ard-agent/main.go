@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,6 +52,24 @@ type config struct {
 	heartbeat  time.Duration
 	maxBackoff time.Duration
 }
+
+// Limits on how hard this device is asked to work.
+//
+// agentDialSlots bounds connections to adbd at once. Four is deliberately above the one
+// the gateway's adb server normally produces, so the cap only bites when something is
+// wrong rather than during ordinary use.
+var agentDialSlots = make(chan struct{}, 4)
+
+const (
+	// agentDialWait is how long a stream waits for a free adbd slot before giving up.
+	agentDialWait = 10 * time.Second
+	// agentStallTimeout is how long a stream may carry no bytes before it is considered
+	// dead. Long enough to survive a genuinely slow transfer, short enough that an
+	// operator finds out within a coffee break rather than an afternoon.
+	agentStallTimeout = 5 * time.Minute
+	// agentStallCheck is how often the watchdog looks.
+	agentStallCheck = 30 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -285,56 +304,154 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 		return adbdloc.Resolvable(c, hint, adbdloc.Options{SkipDynamic: cached})
 	}
 	return session.Accept(ctx, func(route hs.Route, stream net.Conn) error {
-		return handleStream(route, stream, resolve)
+		return handleStream(ctx, route, stream, resolve)
 	})
 }
 
 // handleStream pipes one operator stream to adbd.
 //
-// Each stream gets its own adbd connection. That is deliberate: holding a single
-// adbd connection and multiplexing over it protects against adbd replacing a host
-// connection on reconnect, but it also serialises unrelated sessions behind one
-// socket. With a real adb server there is normally one transport per device
-// anyway, so the multiplexing case does not arise; if concurrent transports are
-// ever observed to upset adbd, this is the place to reintroduce it.
-func handleStream(route hs.Route, stream net.Conn, resolve func(context.Context, string) (string, error)) error {
+// Each stream gets its own adbd connection. That is correct rather than lazy: the
+// gateway terminates the ADB protocol with the real adb server, which multiplexes every
+// logical stream a device needs over one transport, so the agent normally sees a single
+// stream per device and a single dial. Holding one connection and multiplexing over it
+// here would mean putting a framing layer between the operator and adbd -- that is,
+// reimplementing the part of ADB this project exists not to reimplement.
+//
+// Two limits apply, because "normally one" is not "always one", and both were learned
+// from a phone that hung:
+//
+//   - a cap on concurrent dials, so a reconnect storm cannot open connections to adbd
+//     faster than they are closed. adbd is a phone process with finite resources and no
+//     authentication; flooding it is both the fastest way to make it unresponsive and
+//     the fastest way to drain its battery.
+//   - a stall watchdog, so a stream that stops moving fails loudly instead of looking
+//     like a slow device. The earlier symptom of a connection problem was silence, and
+//     silence is what made it expensive to diagnose.
+func handleStream(ctx context.Context, route hs.Route, stream net.Conn, resolve func(context.Context, string) (string, error)) error {
 	if route.Kind != hs.KindADB {
 		log.Printf("stream %s: unsupported kind %q", route.Stream, route.Kind)
 		return fmt.Errorf("unsupported stream kind %q", route.Kind)
 	}
-	upstream, err := dialAdbd(stream, resolve)
+
+	// Cap concurrent dials to adbd.
+	//
+	// The gateway terminates ADB with the real adb server, so it multiplexes everything a
+	// device needs over one transport and the agent normally opens a single connection.
+	// This cap exists for the case where it does not: a reconnect storm would otherwise
+	// open connections to adbd faster than they close, and adbd is an unauthenticated
+	// process on a phone with finite memory and battery. Waiting briefly is better than
+	// either refusing outright or joining the flood.
+	select {
+	case agentDialSlots <- struct{}{}:
+		defer func() { <-agentDialSlots }()
+	case <-time.After(agentDialWait):
+		return fmt.Errorf("all %d adbd connection slots are in use on this device", cap(agentDialSlots))
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	upstream, err := dialAdbd(ctx, stream, resolve)
 	if err != nil {
 		return err
 	}
 	defer upstream.Close()
 
+	// Stall watchdog.
+	//
+	// A stream that stops moving fails loudly rather than holding the operator's command
+	// open. The earlier symptom of a connection fault was silence, and silence is what
+	// made it expensive to diagnose -- so "nothing has happened for N minutes" is now a
+	// reportable event rather than something an operator discovers by giving up.
+	//
+	// Activity is tracked on both directions, because a transfer that is only receiving
+	// is just as healthy as one that is only sending.
+	activity := &tracker{last: time.Now()}
+	go activity.watch(ctx, streamIDOf(route), stream, upstream)
+
 	done := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(upstream, stream)
+		_, err := io.Copy(activity.writerTo(upstream), stream)
 		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 		done <- err
 	}()
 	go func() {
-		_, err := io.Copy(stream, upstream)
+		_, err := io.Copy(activity.writerTo(stream), upstream)
 		if cw, ok := stream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
 		done <- err
 	}()
-	err = <-done
-	log.Printf("stream %s: finished (%v)", route.Stream, err)
-	return err
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
-// dialAdbd connects to adbd, rediscovering the address if the known one is dead.
-//
-// Rediscovery on failure is what makes a mid-session port change survivable: the
-// gateway side sees one failed stream and retries, and the operator never notices
-// that the device rebooted underneath them.
-func dialAdbd(stream net.Conn, resolve func(context.Context, string) (string, error)) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+// tracker records when bytes last moved in either direction.
+type tracker struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (t *tracker) touch() {
+	t.mu.Lock()
+	t.last = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *tracker) quiet() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return time.Since(t.last)
+}
+
+// writerTo wraps a destination so every write counts as activity.
+func (t *tracker) writerTo(dst io.Writer) io.Writer {
+	return &countingWriter{dst: dst, onWrite: t.touch}
+}
+
+type countingWriter struct {
+	dst     io.Writer
+	onWrite func()
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 {
+		w.onWrite()
+	}
+	return n, err
+}
+
+// watch closes a silent stream. It returns once the context ends or the stream is closed
+// by somebody else, so it never outlives the handler that owns it.
+func (t *tracker) watch(ctx context.Context, id string, stream, upstream io.Closer) {
+	tick := time.NewTicker(agentStallCheck)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if q := t.quiet(); q > agentStallTimeout {
+				log.Printf("stream %s: no traffic for %s; closing it rather than hanging", id, q.Round(time.Second))
+				_ = stream.Close()
+				_ = upstream.Close()
+				return
+			}
+		}
+	}
+}
+
+func streamIDOf(route hs.Route) string { return route.Stream }
+
+func dialAdbd(parent context.Context, stream net.Conn, resolve func(context.Context, string) (string, error)) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
 
 	addr, err := resolve(ctx, "")

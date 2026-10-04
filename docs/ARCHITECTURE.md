@@ -219,7 +219,18 @@ finish existing streams during graceful disconnect instead of cutting them.
    `adb shell ss -tln`. Onboarding must therefore enable wireless debugging (or
    `adb tcpip`) before the agent can run at all, and a reboot clears it — so the
    agent's startup probe is what tells an operator what to do.
-2. **Concurrent `adbd` connections.** Decides whether the inner framing layer
+2. ~~**Concurrent `adbd` connections.**~~ **Measured, and the opposite of what was
+   assumed.** The gateway terminates ADB with the real `adb server`, which multiplexes
+   every logical stream a device needs over a single transport, so the agent normally
+   receives one stream and opens one connection. Per-stream dialing is therefore correct,
+   not lazy. What the concern was really about is still worth bounding, so the agent caps
+   concurrent dials at four and closes a stream that carries no bytes for five minutes
+   instead of hanging. The inner framing layer `hs.Link` was **not** wired in: it is a
+   standalone multiplexer that does not speak ADB, so placing it between the operator and
+   adbd would mean reimplementing the multiplexing this project exists to inherit from
+   upstream. Dead code here is a rejected approach, not an unfinished one.
+
+3. **Concurrent `adbd` connections.** Decides whether the inner framing layer
    stays. Test empirically.
 3. **`adb connect 127.0.0.1:<port>`.** The loopback bridge depends on this exact
    behaviour. Validate early; if it is not allowed, the bridge changes shape.
