@@ -1,0 +1,15 @@
+# ARD build artefacts and local secrets.
+# Credentials live in ~/.ard-secrets/ (outside the repository) on purpose:
+# a secret inside the tree is one `git add -A` away from being published.
+/ard-agent
+/ard-server
+/ard-proxy
+/ard-tap
+/ard-ca
+/ardctl
+/bin/
+/dist/
+*.pem
+*.key
+*.crt
+pki/
