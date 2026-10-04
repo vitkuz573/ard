@@ -487,7 +487,7 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 	// "sync", not "sync:" -- the trailing colon is not what adb sends, and guessing it
 	// from the documentation rather than from a trace cost a debugging round.
 	case "sync", "sync:", "sync:v1", "sync:,version=1":
-		go runSync(cfg, arg, s)
+		go runSync2(cfg, s)
 	case "host:version", "host:devices", "host:transport":
 		// Answer with a plausible line so a host that probes these sees
 		// something sane rather than a hang.
