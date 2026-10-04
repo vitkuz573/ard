@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -492,4 +493,38 @@ var defaultProps = map[string]string{
 	"service.adb.tcp.port":            "",
 	"sys.boot_completed":              "1",
 	"net.hostname":                    "localhost",
+}
+
+// Touch sets a file's modification time.
+//
+// A push carries the source's mtime and adbd preserves it, so a pull returns a file whose
+// timestamps match what was sent. A simulator that stamped everything with the current
+// time would make that untestable.
+func (v *VFS) Touch(p string, mod time.Time) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	n, err := v.resolve(p)
+	if err != nil {
+		return err
+	}
+	n.ModTime = mod
+	return nil
+}
+
+// EnsureFile creates an empty file with the given mode if it does not exist, and leaves an
+// existing one alone.
+//
+// A push is a stream of appends, so the file has to exist before the first DATA frame
+// arrives. Creating it here rather than on first write is what lets the requested mode be
+// applied exactly once, instead of being decided by whichever path happened to run first.
+func (v *VFS) EnsureFile(p string, mode os.FileMode) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if existing, err := v.resolve(p); err == nil {
+		if existing.Dir {
+			return ErrIsDir
+		}
+		return nil
+	}
+	return v.WriteFile(p, nil, mode)
 }

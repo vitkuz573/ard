@@ -74,6 +74,11 @@ type Message struct {
 
 // Config configures a mock device.
 type Config struct {
+	// FS is the filesystem the device presents. Nil means "build a seeded default",
+	// because a simulator with no storage can only answer eight commands and is not
+	// worth much as a test fixture.
+	FS *VFS
+
 	// Banner is sent in CNXN. The real format is
 	// "device::ro.product.name=...;ro.product.model=...;features=...".
 	Banner string
@@ -472,9 +477,17 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 	}
 
 	cfg.debug("open service=%q arg=%q -> stream id=%d", service, arg, id)
+	if cfg.FS == nil {
+		cfg.FS = NewVFS()
+	}
+	tracef("OPEN service=%q arg=%q", service, arg)
 	switch service {
 	case "shell", "shell,v2", "shell,raw":
 		go runShell(cfg, arg, s)
+	// "sync", not "sync:" -- the trailing colon is not what adb sends, and guessing it
+	// from the documentation rather than from a trace cost a debugging round.
+	case "sync", "sync:", "sync:v1", "sync:,version=1":
+		go runSync(cfg, arg, s)
 	case "host:version", "host:devices", "host:transport":
 		// Answer with a plausible line so a host that probes these sees
 		// something sane rather than a hang.
