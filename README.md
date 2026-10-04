@@ -34,8 +34,10 @@ Idempotent. Preserves the PKI and the device allowlist. Prints what it verified.
 adb install -r android/ard-agent.apk
 ```
 
-Open it, press **Discover adbd**, then **Start**. The app fills in the gateway
-address, device id and the adbd address by itself.
+Open it, press **Discover adbd**, then **Start**. You type the gateway address;
+everything else the app works out for itself. There is no gateway baked into the
+APK, so the same build works for every deployment and nobody has to publish an
+address to use it.
 
 ### Known remaining step: certificates
 
@@ -49,10 +51,11 @@ ard-ca device -dir /etc/ard/pki -id <device-id>
 # on the device
 adb push <device-id>.crt /data/local/tmp/device.crt
 adb push <device-id>.key /data/local/tmp/device.key
-adb shell "run-as dev.ard.agent sh -c 'mkdir -p files/ard'
+adb shell "run-as dev.ard.agent mkdir -p files/ard"
 adb shell "cat /data/local/tmp/device.crt | run-as dev.ard.agent sh -c 'cat > files/ard/device.crt'"
 adb shell "cat /data/local/tmp/device.key | run-as dev.ard.agent sh -c 'cat > files/ard/device.key'"
-adb shell "adb shell run-as dev.ard.agent sh -c 'cat < ca.crt > files/ard/ca.crt'"   # server CA
+adb push <server-ca>.crt /data/local/tmp/ca.crt
+adb shell "cat /data/local/tmp/ca.crt | run-as dev.ard.agent sh -c 'cat > files/ard/ca.crt'"
 ```
 
 This is the part that is not yet "one step". The fix is a CSR flow: the app
@@ -78,7 +81,7 @@ reported success for an APK containing no binary at all.
 ## Documentation
 
 - `docs/ARCHITECTURE.md` — design, and the constraints real hardware imposed
-- `docs/OPERATIONS.md` — the gateway host, PKI permissions, maintenance
+- `docs/OPERATIONS.md` — gateway hardening, PKI permissions, maintenance lessons
 - `deploy/README.md` — deployment notes and why each decision was made
 
 ## Testing

@@ -1,24 +1,30 @@
-# Gateway host: `<hostname>`
+# Gateway operations
 
-Provisioning record for the production gateway. Kept in the repository so the
-host's state is described somewhere other than in a chat log.
+Hardening and maintenance notes for an ARD gateway host.
+
+This is a **template and a set of lessons**, not a record of any particular
+deployment. The host-specific parts — address, hostname, sizes, versions — are
+placeholders to be filled in locally, and are deliberately kept out of version
+control: a repository that names a reachable gateway is a repository that gets
+scanned. Keep the real values in your own provisioning notes or password
+manager, not in a file the world can read.
 
 ## Baseline
 
+Record this per host, locally:
+
 | | |
 |---|---|
-| Provider VPS | `<gateway-address>` (IPv6 `<ipv6-address>`) |
+| Provider VPS | `<address>` |
 | Hostname | `<hostname>` |
-| OS | Debian 13 (trixie), userspace 13.7 |
-| Kernel | `6.12.111+deb13-cloud-amd64` |
-| Resources | 2 vCPU, 3.9 GiB RAM, 40 GB disk |
-| OpenSSH | 10.0p2 |
+| OS | Debian 13 (trixie) or newer |
+| Resources | `<vCPU / RAM / disk>` |
 | No Go toolchain | binaries are cross-compiled locally with `CGO_ENABLED=0` |
-| No `/dev/kvm` | the emulator cannot run here; device testing happens on the dev host |
+| No `/dev/kvm` | the emulator cannot run here; device testing happens on a dev host |
 
 ## Access
 
-- **Key-based** for automation: `~/.ssh/id_ed25519_ard`, installed in
+- **Key-based** for automation: an `~/.ssh/id_ed25519_ard` key, installed in
   `/root/.ssh/authorized_keys`. Use `scripts/ssh.sh` — it refuses to run if the
   host key is unknown, so it cannot silently connect to a substituted host.
 - **Password authentication stays enabled** by explicit operator request, because
@@ -71,9 +77,9 @@ operator port reachable. This turns that into a visible failure.
 
 ## Maintenance notes
 
-- `/etc/apt/sources.list.d/debian.sources.bookworm-backup` holds the pre-upgrade
-  suite definition, and `/root/pre-trixie-etc.tar.gz` plus
-  `/root/pre-trixie-selections.txt` hold the pre-upgrade `/etc` and package set.
+- Before a release upgrade, keep a copy of the suite definition, `/etc`, and the
+  installed package set somewhere outside the host. Naming the exact filenames is
+  deployment-specific; taking the backup is not.
 - Release upgrades must be run detached (`setsid nohup`), never in a foreground
   SSH session: openssh and systemd are replaced mid-run, the connection dies, and
   a foreground dpkg would take a SIGHUP and leave package management inconsistent.
@@ -107,7 +113,7 @@ and never opens `ca.key`, so this is enforced by the type system rather than by
 remembering not to use the key. The deploy verifies the gateway user genuinely
 cannot read those files.
 
-Current posture, measured on the host:
+Posture to verify on every host after deploy:
 
     systemd-analyze security ard-server.service   ->  1.3 OK
     gateway can read devices/ca.key               ->  no

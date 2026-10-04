@@ -16,11 +16,15 @@ public class Config {
 
     private static final String PREFS = "ard_config";
 
-    // Defaults assume a gateway reachable by name. Everything is overridable in
-    // the UI because no two deployments are alike: the gateway host may be a DNS
-    // name, a public IP, or a tunnel.
-    private static final String DEF_GATEWAY = "<gateway-address>:7000";
-    private static final String DEF_SERVER_NAME = "<hostname>";
+    // No gateway default, on purpose.
+    //
+    // A baked-in address would ship inside the APK, which means it reaches every
+    // person who installs it and cannot be recalled afterwards. It would also be
+    // wrong for everyone else: the gateway may be a DNS name, a public IP, or a
+    // tunnel, and no single default can be right for all of them. The UI asks for
+    // it instead, and refuses to start without it.
+    private static final String DEF_GATEWAY = "";
+    private static final String DEF_SERVER_NAME = "";
     private static final String DEF_DEVICE_ID = Build.MODEL.replaceAll("[^A-Za-z0-9._-]", "-");
     private static final String DEF_DEVICE_NAME = Build.MANUFACTURER + " " + Build.MODEL;
     private static final String DEF_ADBD = "";

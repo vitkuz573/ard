@@ -1,18 +1,35 @@
 # ARD build artefacts and local secrets.
-# Credentials live in ~/.ard-secrets/ (outside the repository) on purpose:
-# a secret inside the tree is one `git add -A` away from being published.
+#
+# Credentials live outside the repository on purpose: a secret inside the tree is
+# one `git add -A` away from being published, and .gitignore is not a security
+# boundary -- it does not apply to files that are already tracked, and history
+# keeps copies of anything that was ever committed.
+
+# Compiled binaries.
 /ard-agent
 /ard-server
 /ard-proxy
-/ard-tap
 /ard-ca
 /ardctl
 /bin/
 /dist/
+
+# Locally built binaries, including the ones the end-to-end script compiles.
+/.e2e-bin/
+
+# Key material. Certificates are excluded too: a public .crt is not a secret, but
+# nothing in this repository needs one committed, and a PKI directory that is
+# half-committed is worse than one that is entirely absent.
 *.pem
 *.key
 *.crt
-pki/.e2e-bin/
+*.jks
+*.keystore
 /android/build/
-/android/ard-agent.apk
 /android/*.jks
+/android/ard-agent.apk
+/android/ard-agent.apk.idsig
+
+# Editor and OS noise.
+*.swp
+.DS_Store

@@ -1,0 +1,16 @@
+# Keeps the bug and feature reports above from becoming the only way in, and stops
+# the silent-hang class of report from arriving without the logs that identify it.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/vitkuz573/ard/blob/main/SECURITY.md
+    about: >
+      Do not open a public issue for a vulnerability. Read SECURITY.md first; it
+      says where to send it and why a public report is worse than a slow fix.
+
+  - name: Before filing a bug
+    url: https://github.com/vitkuz573/ard/blob/main/docs/ARCHITECTURE.md
+    about: >
+      Several confusing symptoms are documented there as known constraints,
+      including why adbd has no port after a reboot and why a remembered address
+      stops working. Check it before reporting; the answer is often already there.

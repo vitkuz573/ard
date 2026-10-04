@@ -125,7 +125,11 @@ if [[ -f "$P/server/server.crt" ]]; then
   echo "     existing PKI found; leaving it untouched"
 else
   install -d -o root -g root -m 0750 "$P/server" "$P/devices" "$P/operators"
-  SAN="<hostname>,localhost,127.0.0.1,$(hostname -I | awk '{print $1}')"
+  # The SAN names the host it is generated on, so it must come from the host rather
+  # than from a literal baked into the script: a hardcoded name is wrong on every
+  # deployment except the one it was written for, and it publishes that host's name
+  # to anyone reading the repository.
+  SAN="$(hostname -s),$(hostname -f 2>/dev/null || hostname -s),localhost,127.0.0.1,$(hostname -I | awk '{print $1}')"
   "$ARD_BIN_DIR/ard-ca" init -dir "$P" -san "$SAN" >/dev/null 2>&1 \
     || /opt/ard/bin/ard-ca init -dir "$P" -san "$SAN" >/dev/null
   echo "     PKI created"

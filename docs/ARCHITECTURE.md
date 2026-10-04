@@ -19,19 +19,20 @@ These are structural, not features. They constrain every component.
    ARD guarantees is that it never widens that exposure itself.
 
    > **Corrected against real hardware.** This document originally said the agent
-   > reaches `127.0.0.1:5555` on the device's loopback. Measured on a <handset>
-   > running Android 14: **nothing listens on 5555 at all.** `/proc/net/tcp6`
+   > reaches `127.0.0.1:5555` on the device's loopback. Measured on a mid-range
+   > Android 14 handset: **nothing listens on 5555 at all.** `/proc/net/tcp6`
    > shows adbd bound only to the single port that wireless debugging or
-   > `adb tcpip` opened, on an IPv6 wildcard. `ard-agent` therefore requires
-   > `-adbd` with no default, because a default that is wrong on every modern
-   > device fails in a way that looks like a network problem.
+   > `adb tcpip` opened, on an IPv6 wildcard. `ard-agent` therefore discovers
+   > that port rather than assuming one, and the address is optional rather than
+   > required, because a default that is wrong on every modern device fails in a
+   > way that looks like a network problem.
    >
    > Worse, `adb tcpip 5557` binds adbd to `*`, i.e. every interface including the
-   > mobile network. That was verified, not assumed: from the laptop the phone's
-   > CGNAT address `<cgnat-address>:5557` accepted a connection. **Prefer wireless
-   > debugging with pairing**, which binds to the WiFi interface only and uses
-   > per-session tokens. Where `adb tcpip` is used, it is a temporary exposure
-   > that a reboot clears.
+   > mobile network. That was verified, not assumed: from a host on the same
+   > mobile network the device's CGNAT address accepted a connection on that
+   > port. **Prefer wireless debugging with pairing**, which binds to the WiFi
+   > interface only and uses per-session tokens. Where `adb tcpip` is used, it is
+   > a temporary exposure that a reboot clears.
 2. **Device and operator trust are separate roots.** A stolen operator cert must
    not be able to enroll a device, and a stolen device must not reach any device
    other than itself.

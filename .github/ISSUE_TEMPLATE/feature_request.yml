@@ -1,0 +1,68 @@
+name: feature_request
+
+description: Propose a change
+labels: ["enhancement", "needs triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        Describe the situation you are in, not the solution you have in mind. The
+        situation is the part that stays true even if the solution turns out to be
+        different from what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints this must respect
+      description: |
+        ARD has a few non-negotiables, and a proposal that breaks one of them will
+        not be accepted as written. Worth knowing before you spend effort on it:
+
+        - The device dials out. It is behind NAT and cannot be connected to.
+        - Nothing about ADB is reimplemented. The real `adb server` runs on the
+          gateway, so features come from upstream rather than being written again.
+        - The gateway must never hold a CA private key or a device private key.
+        - No third-party VPN, tunnel or overlay network.
+        - Device deployment must stay a single step, installable from one file.
+      render: text
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the system?
+      options:
+        - Gateway (ard-server, registry, transport)
+        - Agent on the device
+        - APK and enrolment
+        - Proxy and the adb integration
+        - PKI and certificates
+        - Deployment and operations
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+
+  - type: checkboxes
+    id: no-hardware
+    attributes:
+      label: Before submitting
+      options:
+        - label: >
+            I did not include private keys, certificates, IP addresses or other
+            details that identify a specific deployment.
+          required: true

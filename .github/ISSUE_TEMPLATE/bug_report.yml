@@ -1,0 +1,93 @@
+name: bug_report
+
+description: Something does not work
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for filing this. A few things make remote-adb bugs much easier
+        to pin down, because the interesting failures are almost always in the
+        join between two machines.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you see, and what did you expect instead?
+      placeholder: |
+        The device shows in `adb devices`, but `adb -s 127.0.0.1:15000 shell` hangs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Agent and gateway logs
+      description: |
+        From the device:
+        `adb shell run-as dev.ard.agent cat files/ard/agent.log`
+
+        From the gateway:
+        `journalctl -u ard-server -n 100 --no-pager`
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Gateway OS, Android version, and `adb version` output.
+      placeholder: Debian 13, Android 14, adb 1.0.41 (version 37.0.0)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: topology
+    attributes:
+      label: How is the device reaching the gateway?
+      description: >
+        This decides which code path ran. A device behind carrier-grade NAT that
+        dials out is the case ARD is built for; a device on the same LAN can mask
+        bugs that only appear through CGNAT.
+      options:
+        - Mobile internet only, behind carrier-grade NAT
+        - Mobile internet and WiFi
+        - WiFi only, same LAN as the gateway
+        - Emulator
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: adbd
+    attributes:
+      label: How is adbd reachable on the device?
+      description: |
+        `adb shell ss -tln | grep -E ':555[0-9]'` and the output of
+        `adb shell getprop service.adb.tcp.port`.
+        ARD never opens this socket itself; it is either wireless debugging or
+        `adb tcpip`, and which one changes what should be running.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: no-hardware
+    attributes:
+      label: Before submitting
+      options:
+        - label: >
+            I did not include private keys, certificates, IP addresses or other
+            details that identify a specific deployment.
+          required: true
+
+  - type: checkboxes
+    id: reproducible
+    attributes:
+      label: Reproducibility
+      options:
+        - label: This reproduces on more than one run.
+        - label: This reproduces against the mock device, not only real hardware.
+        - label: I can reproduce it with `scripts/e2e-local.sh`.
