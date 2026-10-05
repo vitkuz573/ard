@@ -74,6 +74,10 @@ type Message struct {
 
 // Config configures a mock device.
 type Config struct {
+	// Faults makes the device misbehave on purpose. Nil means it behaves, which is what
+	// every test that is not about misbehaviour wants.
+	Faults *Faults
+
 	// FS is the filesystem the device presents. Nil means "build a seeded default",
 	// because a simulator with no storage can only answer eight commands and is not
 	// worth much as a test fixture.
@@ -462,6 +466,7 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 		id:     id,
 		hostID: m.Arg0,
 		v2:     v2,
+		faults: cfg.Faults,
 		in:     make(chan []byte, 64),
 		done:   make(chan struct{}),
 		eofCh:  make(chan struct{}),
@@ -643,6 +648,10 @@ type stream struct {
 	// bytes are simply ignored by such a host.
 	v2 bool
 
+	// faults is the device's fault configuration, or nil. Held per stream rather than
+	// read from the listener so a test can change behaviour for one stream if it wants to.
+	faults *Faults
+
 	in   chan []byte
 	done chan struct{}
 	// eofCh fires when the host closes the input side, so a blocked reader such as
@@ -771,6 +780,30 @@ func (s *stream) writeRaw(p []byte) error {
 
 // writeChunked sends payload as a sequence of WRTE packets no larger than maxPayload.
 func (s *stream) writeChunked(payload []byte) error {
+	// Faults apply to everything the device sends, which is the write path rather than
+	// the framing above it: a test that asks for latency or truncation wants it to affect
+	// the bytes on the wire regardless of which protocol framed them.
+	if f := s.faults; f != nil {
+		switch f.beforeWrite(len(payload)) {
+		case drop:
+			tracef("fault: dropped a %d-byte write", len(payload))
+			return nil
+		case corruptWrite:
+			tracef("fault: corrupted a %d-byte write", len(payload))
+			payload = corruptBytes(payload, f.rng)
+		case stall:
+			tracef("fault: stalled after a %d-byte write", len(payload))
+			// Deliberately silent: the connection stays open and nothing more is sent.
+			// That is what produces a hang rather than an error, and it is the case a
+			// watchdog on the other side exists for.
+			select {}
+		case truncate:
+			tracef("fault: truncating after a %d-byte write", len(payload))
+			s.conn.closeAll(io.ErrUnexpectedEOF)
+			return nil
+		}
+		f.afterWrite()
+	}
 	const chunk = maxPayload - 16
 	if len(payload) <= chunk {
 		return s.conn.write(Message{Cmd: CmdWRTE, Arg0: s.id, Arg1: s.hostID, Data: payload})

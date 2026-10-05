@@ -145,3 +145,9 @@ certificate obtained this way actually opens a mutual-TLS session.
 The mock in `test/mockadbd` speaks adbd's wire protocol and is tested against the
 actual `adb` binary. Several of its bugs were found only by that interop, and
 each presented as a silent hang rather than an error — see the commit history.
+
+It also has a virtual filesystem, a property store, a 26-command shell, and
+deterministic fault injection — latency, dropped and corrupted writes, truncation
+mid-transfer, and a stall that hangs rather than errors. It stands on its own as a
+device simulator; see [its README](test/mockadbd/README.md) for what it does and
+does not implement.
