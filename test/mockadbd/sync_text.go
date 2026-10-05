@@ -18,25 +18,18 @@ package mockadbd
 //     the same id carries mode and flags. RCV2 carries the path, then flags.
 //
 // STATUS: the reply is complete and correct against the specification, and adb still does
-// not proceed. The trace now shows the whole exchange, so this is one command to reproduce
+// not proceed. The trace shows the whole exchange, and it is one command to reproduce
 // rather than an investigation:
 //
-//	MOCKADBD_FORCE_SYNC=1 MOCKADBD_TRACE=/tmp/t.log \
-//	  go test ./test/mockadbd/ -run TestInteropPushLands
+//	MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
 //
-// and it currently reads:
+// Two things stopped adb after that reply, and neither was in what this file writes. Both
+// are recorded in sync_interop_test.go, which is where the traces and the reasoning live:
 //
-//	OPEN service="sync"
-//	  <- "STA2" 0x32415453
-//	  <- 0x0000001a                      path length, 26
-//	  -> "STA2"
-//	  -> raw 4 bytes                     the id word
-//	  -> raw 68 bytes                    the body
-//	  (nothing further)
-//
-// Everything adb sent was understood, and everything it should have received was sent.
-// What is missing is the specification of what it does next, which is client-side code
-// rather than protocol code.
+//   - A WRTE went unacknowledged. adb's server does not read the client again until the
+//     device acks what it forwarded, so the exchange above was the last one that happened.
+//   - SND2 repeats its own id before the mode and the flags, and the banner advertised
+//     compression that nothing here implements.
 //
 // The v2 stat body is 68 bytes, laid out IQQIIIIQqqq:
 //
@@ -78,6 +71,11 @@ var (
 	failW uint32 = mkid('F', 'A', 'I', 'L')
 	quitW uint32 = mkid('Q', 'U', 'I', 'T')
 )
+
+// syncFlagDryRun is the one setup-word bit this mock understands. The other three from
+// file_sync_protocol.h are compression requests -- 1 brotli, 2 lz4, 4 zstd -- and nothing
+// here compresses, so a word carrying any of them is refused rather than ignored.
+const syncFlagDryRun uint32 = 0x80000000
 
 func mkid(a, b, c, d byte) uint32 {
 	return uint32(a) | uint32(b)<<8 | uint32(c)<<16 | uint32(d)<<24
@@ -150,13 +148,27 @@ func runSync2(cfg Config, s *stream) {
 			mode := os.FileMode(0o644)
 			flags := uint32(0)
 			if cmd == snd2 {
-				// The second request carries the mode and the flags.
+				// The setup request repeats the command word before its mode and
+				// flags, so the words after the path are three and not two.
+				//
+				// Reading two leaves the trailing flags word where the DATA frames
+				// are expected, and it desynchronises the stream for good: the next
+				// "command" the transfer sees is that word. A flags word of zero
+				// turned a 256 KiB push into `unexpected sync command 0x00000000`.
+				// Small pushes never noticed, because adb sends the v1 form for them.
+				if err := expectSetupID(s, cmd); err != nil {
+					return
+				}
 				modeWord, err := readWord(s)
 				if err != nil {
 					return
 				}
 				flags, err = readWord(s)
 				if err != nil {
+					return
+				}
+				if !compressionSupported(flags) {
+					failMsg(s, "%s: compression flag %#x is not supported", path, flags)
 					return
 				}
 				mode = os.FileMode(modeWord & 0o7777)
@@ -174,7 +186,17 @@ func runSync2(cfg Config, s *stream) {
 				return
 			}
 			if cmd == rcv2 {
-				if _, err := readWord(s); err != nil { // flags
+				// As with SND2, the setup request repeats the command word, and
+				// only the flags follow it.
+				if err := expectSetupID(s, cmd); err != nil {
+					return
+				}
+				flags, err := readWord(s)
+				if err != nil {
+					return
+				}
+				if !compressionSupported(flags) {
+					failMsg(s, "%s: compression flag %#x is not supported", path, flags)
 					return
 				}
 			}
@@ -195,6 +217,31 @@ func readWord(r io.Reader) (uint32, error) {
 	v := binary.LittleEndian.Uint32(b[:])
 	tracef("  <- %q 0x%08x", string([]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}), v)
 	return v, nil
+}
+
+// expectSetupID consumes the repeated command word that opens the second half of a v2
+// request. adb writes SND2 and RCV2 as one buffer of id, length, path, then the same id
+// again followed by the setup words, so the repeat is part of the framing rather than a
+// second command to dispatch.
+func expectSetupID(r io.Reader, want uint32) error {
+	got, err := readWord(r)
+	if err != nil {
+		return err
+	}
+	if got != want {
+		return fmt.Errorf("sync: setup request id %q, want %q", idString(got), idString(want))
+	}
+	return nil
+}
+
+// compressionSupported reports whether a setup word asks for something this mock can do.
+//
+// Nothing here decompresses or compresses, and the banner does not offer the features
+// that would make adb ask (see Config.withDefaults), so the only acceptable word is zero
+// apart from the dry-run bit. Accepting a real compression request and then writing the
+// bytes as they arrived would corrupt the file without saying so.
+func compressionSupported(flags uint32) bool {
+	return flags & ^syncFlagDryRun == 0
 }
 
 func readLenString(r io.Reader) (string, error) {
@@ -228,6 +275,7 @@ func putWord(s *stream, v uint32) error {
 
 func failMsg(s *stream, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
+	tracef("  -> FAIL %q", msg)
 	_ = putWord(s, failW)
 	var n [4]byte
 	binary.LittleEndian.PutUint32(n[:], uint32(len(msg)))
@@ -461,6 +509,11 @@ func drainSend(s *stream, cfg Config, path string, b []byte) ([]byte, bool) {
 			var reply [8]byte
 			binary.LittleEndian.PutUint32(reply[:4], okayW)
 			tracef("  -> %q", idString(okayW))
+			// Whatever follows DONE belongs to the next request. adb sends them
+			// back to back -- a directory push is one long run of them -- and this
+			// handler is the only thing holding those bytes, because it reads in
+			// 64 KiB chunks. Hand them back rather than dropping them.
+			s.unread(b[8:])
 			if err := s.writeRaw(reply[:]); err != nil {
 				return nil, true
 			}

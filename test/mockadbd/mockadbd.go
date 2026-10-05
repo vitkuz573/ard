@@ -160,10 +160,19 @@ func shortData(b []byte) string {
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.Banner == "" {
+		// The sendrecv_v2_brotli, sendrecv_v2_lz4 and sendrecv_v2_zstd features are
+		// deliberately absent. Nothing here decompresses, and adb reads the list
+		// before it chooses: advertised, the best one it knows wins, and it then
+		// compresses the payload of a push above its own size threshold. The mock
+		// reads those compressed bytes as sync framing and answers FAIL with
+		// "unexpected sync command 0x00000004", because the first four bytes of a
+		// zstd frame happen to be that word. Absent, adb falls back to no compression
+		// and the same push succeeds. A feature in this list is a promise the mock has
+		// to be able to keep.
 		out.Banner = "device::ro.product.name=ard_mock;ro.product.model=Mock;ro.build.version.release=14;" +
 			"ro.build.type=user;features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,apex,abb," +
 			"fixed_push_symlink_timestamp,abb_exec,remount_shell,track_app,sendrecv_v2," +
-			"sendrecv_v2_brotli,sendrecv_v2_lz4,sendrecv_v2_zstd,sendrecv_v2_dry_run_send," +
+			"sendrecv_v2_dry_run_send," +
 			"openscreen_mdns,devicetracker_proto_format,devraw,app_info,server_status,track_mdns,push_sync"
 	}
 	if out.FS == nil {
@@ -333,10 +342,26 @@ func (l *Listener) serve(nc net.Conn) error {
 				c.deliver(m.Arg1, m.Data)
 			}
 		case CmdWRTE:
-			// Acknowledge before delivering. The protocol is ack-based in both
-			// directions, and a host that gets no ack for its write waits for its send
-			// window to reopen, which is why a push showed a long silence before the
-			// transfer began.
+			// Acknowledge before delivering, because every WRTE the host sends has
+			// to be answered with an OKAY and the server's flow control turns on it.
+			// In sockets.cpp the server's local_socket_flush_outgoing() stops reading
+			// the client socket as soon as it forwards a chunk to the device, and
+			// only local_socket_ack(), which runs when this OKAY arrives, re-arms the
+			// read. Real adbd raises the same packet from local_socket_flush_incoming()
+			// once the bytes are in the command's socket, so the ack covers the
+			// handoff rather than the command's consumption of it, and sending it
+			// first keeps the reader loop off a possibly full input channel.
+			//
+			// Without it a sync stream stalls after its first request: the server
+			// waits for an ack that never comes, so it never reads the client's next
+			// request, and the client waits forever for the reply it has not been
+			// allowed to ask for. `adb shell` survives the omission only because it
+			// needs no second write from the client after the device speaks.
+			if s := c.lookup(m.Arg1); s != nil {
+				if err := c.write(Message{Cmd: CmdOKAY, Arg0: s.id, Arg1: s.hostID}); err != nil {
+					return err
+				}
+			}
 			c.deliver(m.Arg1, m.Data)
 		case CmdCLSE:
 			// The host closing its side ends input but must not tear the stream
@@ -688,11 +713,38 @@ type stream struct {
 	// partial holds an incomplete shell v2 frame. A frame can be split across
 	// several WRTE packets, and discarding the remainder loses stdin silently.
 	partial []byte
-	bufMu   sync.Mutex
-	buf     *bytes.Buffer
-	eof     bool
-	closed  sync.Once
-	err     error
+	// pushback holds bytes read ahead of what a parser consumed, so a handler that
+	// stops mid-stream can hand the remainder to the next one.
+	pushback []byte
+	bufMu    sync.Mutex
+	buf      *bytes.Buffer
+	eof      bool
+	closed   sync.Once
+	err      error
+}
+
+// unread returns bytes taken from the stream to the front of it.
+//
+// A handler that reads in chunks rather than framing exactly -- the sync send path
+// reads up to 64 KiB at a time -- can end up holding bytes past the end of what it
+// parsed. The host is allowed to have put the next request in the same packet, and it
+// does: adb pushes several files by sending their requests back to back. Dropping that
+// tail desynchronises the stream for good, because every word after it is read as a
+// command, and the first thing the host's payload happens to contain is not one.
+func (s *stream) unread(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
+	if len(s.pushback) == 0 {
+		s.pushback = append([]byte(nil), b...)
+		return
+	}
+	both := make([]byte, 0, len(b)+len(s.pushback))
+	both = append(both, b...)
+	both = append(both, s.pushback...)
+	s.pushback = both
 }
 
 func (s *stream) Read(p []byte) (int, error) {
@@ -709,6 +761,17 @@ func (s *stream) Read(p []byte) (int, error) {
 		// for the same reason: chunks sit in the channel, not in the buffer, until
 		// they are moved across.
 		s.bufMu.Lock()
+		// pushback first: unread bytes were read later than anything in buf, so
+		// they belong in front of it.
+		if len(s.pushback) > 0 {
+			n := copy(p, s.pushback)
+			s.pushback = s.pushback[n:]
+			if len(s.pushback) == 0 {
+				s.pushback = nil
+			}
+			s.bufMu.Unlock()
+			return n, nil
+		}
 		if s.buf.Len() > 0 {
 			n, _ := s.buf.Read(p)
 			s.bufMu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -388,4 +389,151 @@ func TestHostUnknownServiceIsClosed(t *testing.T) {
 	if !closed {
 		t.Fatal("unknown service left the stream open")
 	}
+}
+
+// Every WRTE the host sends has to be answered with an OKAY, and this is the rule `adb
+// push` hangs without.
+//
+// adb's server proxies a client's socket to the device stream through asocket rather than
+// splicing the two together. In sockets.cpp, local_socket_flush_outgoing() forwards what it
+// read and then deletes FDE_READ, so the client socket goes unread until an ack re-arms it,
+// and the ack arrives as an A_OKAY from the device: local_socket_ack() is what calls ready()
+// again. adbd sends that packet from local_socket_flush_incoming(), in the same file.
+//
+// A device that stays quiet instead leaves both ends waiting on each other. The host has
+// already sent the rest of its request and is waiting for a reply; the server is not reading
+// the socket to find it. `adb shell` survives this, because a shell command needs no second
+// write from the client after the device speaks.
+func TestHostWriteIsAcknowledged(t *testing.T) {
+	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	h := dialHost(t, l.Addr().String())
+	h.handshake()
+	id := h.open("sync:")
+
+	// Three requests, all three sent before any reply is read. That ordering is the point:
+	// it is what the server does, forwarding a chunk and only then waiting for its ack.
+	const cmdWRTE, cmdOKAY = 0x45545257, 0x59414b4f
+	path := "/data/local/tmp/x"
+	var lenWord [4]byte
+	le(lenWord[:], uint32(len(path)))
+	statReq := append([]byte{'S', 'T', 'A', '2'}, lenWord[:]...)
+	statReq = append(statReq, path...)
+
+	acks := 0
+	for i := 0; i < 3; i++ {
+		h.writePacket(cmdWRTE, id, h.streams[id], statReq)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for acks < 3 && time.Now().Before(deadline) {
+		_ = h.conn.SetReadDeadline(deadline)
+		p := h.readPacket()
+		if p.cmd == cmdOKAY && p.arg1 == id {
+			acks++
+		}
+	}
+	if acks != 3 {
+		t.Fatalf("got %d OKAYs for 3 WRTEs, want 3: the server's socket to the client is "+
+			"never re-armed and adb push will hang", acks)
+	}
+}
+
+// Two files' requests in one packet, which is what adb sends when a push has more than
+// one file: their requests run back to back on the same sync stream.
+//
+// The device reads that stream in 64 KiB chunks rather than framing exactly, so the
+// handler for the first file ends up holding the second file's request in the chunk it
+// just read. Losing it desynchronises the stream permanently -- every word after the
+// gap is read as a command, and the first thing the payload contains is not one. The
+// symptom is a FAIL against the second file reading `unknown sync command` followed by
+// four bytes of the file that was being uploaded.
+func TestHostTwoSyncSendsInOnePacket(t *testing.T) {
+	fs := mockadbd.NewVFS()
+	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{FS: fs})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	h := dialHost(t, l.Addr().String())
+	h.handshake()
+	id := h.open("sync:")
+
+	files := []struct {
+		path string
+		data []byte
+	}{
+		{"/data/local/tmp/first.bin", []byte(strings.Repeat("a", 70_000))},
+		{"/data/local/tmp/second.bin", []byte(strings.Repeat("b", 70_000))},
+	}
+
+	var body []byte
+	for _, f := range files {
+		body = append(body, syncWord("SND2")...)
+		body = append(body, encWord(uint32(len(f.path)))...)
+		body = append(body, f.path...)
+		// The setup request repeats the command word before its mode and flags.
+		body = append(body, syncWord("SND2")...)
+		body = append(body, encWord(0o644)...)
+		body = append(body, encWord(0)...) // flags: no compression
+		body = append(body, syncWord("DATA")...)
+		body = append(body, encWord(uint32(len(f.data)))...)
+		body = append(body, f.data...)
+		body = append(body, syncWord("DONE")...)
+		body = append(body, encWord(0)...) // mtime
+	}
+
+	const cmdWRTE, cmdOKAY = 0x45545257, 0x59414b4f
+	h.writePacket(cmdWRTE, id, h.streams[id], body)
+
+	// Two transfers, two replies. Each is an eight-byte ID_OKAY status, carried in a
+	// WRTE; the A_OKAY that acknowledges the packet has no payload, so the length is what
+	// tells the two apart even though the words are the same.
+	done := 0
+	deadline := time.Now().Add(10 * time.Second)
+	for done < len(files) && time.Now().Before(deadline) {
+		_ = h.conn.SetReadDeadline(deadline)
+		p := h.readPacket()
+		if p.cmd != cmdWRTE || p.arg1 != id {
+			continue
+		}
+		switch {
+		case len(p.data) >= 4 && string(p.data[:4]) == "FAIL":
+			// The FAIL word and its body arrive as two packets, so this one may
+			// carry the word alone.
+			t.Fatalf("device refused a send: %q", p.data)
+		case len(p.data) == 8 && string(p.data[:4]) == "OKAY":
+			done++
+		}
+	}
+	if done != len(files) {
+		t.Fatalf("got %d transfers, want %d: the stream desynchronised after the first DONE",
+			done, len(files))
+	}
+
+	for _, f := range files {
+		got, err := fs.ReadFile(f.path)
+		if err != nil {
+			t.Fatalf("%s is not on the device: %v", f.path, err)
+		}
+		if !bytes.Equal(got, f.data) {
+			t.Fatalf("%s: %d bytes, want %d", f.path, len(got), len(f.data))
+		}
+	}
+}
+
+// syncWord encodes a four-character sync command, and encWord a little-endian one. The
+// wire is little-endian throughout, so "DONE" is already in order on it.
+func syncWord(s string) []byte {
+	var b [4]byte
+	copy(b[:], s)
+	return b[:]
+}
+
+func encWord(v uint32) []byte {
+	return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}
 }

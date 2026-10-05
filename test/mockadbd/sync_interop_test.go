@@ -3,6 +3,7 @@ package mockadbd_test
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,96 +11,93 @@ import (
 	mockadbd "github.com/vitkuz573/ard/test/mockadbd"
 )
 
-// requireSync skips the push and pull tests until the adb process exits.
-//
-// The push and pull themselves work: the bytes arrive and the file is on the device. What
-// does not work is that the adb process never returns, so a test that waits for adb to exit
-// hangs instead of failing. MOCKADBD_FORCE_SYNC runs them anyway.
-//
-// The measurements behind that sentence are in the file comment above the first test.
-func requireSync(t *testing.T) {
-	t.Helper()
-	if os.Getenv("MOCKADBD_FORCE_SYNC") != "" {
-		return
-	}
-	t.Skip("the push completes and the file lands, but adb never exits: it blocks polling " +
-		"its socket to the adb server after printing \"1 file pushed\". The file comment " +
-		"records how that was established.")
-}
-
 // These tests push and pull against a real adb and assert on the device's filesystem.
 //
-// The transfer works and the bytes arrive. What does not work is that the adb process
-// never returns, so requireSync skips these: a test that waits for adb would hang rather
-// than fail.
+// Why they used to be skipped, and why they are not any more.
 //
-// Where the time goes, measured rather than argued. All four processes were traced: the
-// device with MOCKADBD_TRACE, the client with an LD_PRELOAD shim, the wire with cmd/probe,
-// and the adb server with the same shim injected into it. The delay is in the server.
+// The transfer worked and the bytes arrived, but the adb process never returned, so a test
+// that waits for adb hangs rather than fails, and the whole file was skipped for that reason.
+// The delay was in the adb server, and it was this repository's fault after all.
 //
-//   - The device answers the stat in the same millisecond it is asked, as does a real adbd.
-//   - The client writes SEND in that same millisecond, and on the phone the reply comes back
-//     four milliseconds later. This mock's reply also leaves immediately.
-//   - The server ingests the device's reply and flushes the client's copy of it: its trace
-//     shows enqueue 72 and flush_incoming rc=72, exactly as it does for the phone. The
-//     client has the stat reply in hand, on both.
-//   - The server then stops. Its socket to the client holds the eighty-three bytes of SEND
-//     unread, and it does not read them for about thirty seconds.
+// The server is not a pipe. It proxies the client's sync socket to the device stream
+// through asocket, and local_socket_flush_outgoing() in adb's sockets.cpp stops reading the
+// client as soon as it has forwarded a chunk: it deletes FDE_READ and waits. Only
+// local_socket_ack() puts that read back, and it runs when an A_OKAY arrives from the
+// device. adbd raises that packet from local_socket_flush_incoming(), in the same
+// sockets.cpp the server shares, once the bytes are in the command's socket.
 //
-// The first shim only intercepted read, write, poll and epoll_wait, and what it showed was
-// silence: no read, no write, not one epoll_wait across those thirty seconds. That ruled out
-// a busy loop and an event-loop timeout, which were the two guesses worth ruling out.
+// This mock never answered a WRTE with an OKAY. So the server forwarded the client's stat
+// request, delivered the stat reply it got back, deleted FDE_READ, and waited for an ack
+// that could not arrive. The client, holding the stat reply, sent the rest of the push and
+// waited for a reply the server was no longer allowed to ask for. Both waited forever.
 //
-// Intercepting more of the server's calls located it properly:
+// The server's own trace shows it, and only the last two lines matter:
 //
-//	SHIM +  7.027 read fd=13 -> 72       # the device's stat reply, ingested
-//	SHIM +  7.029 cond_wait -> blocking  # and straight into a condition variable
-//	SHIM + 52.013 read fd=8  -> 83       # the client's SEND, only now
+//	sockets.cpp:128 LS(8) local_socket_flush_incoming: rc = 72   # the stat reply reaches the client
+//	sockets.cpp:237 LS(8): acks not deferred, blocking          # and the client socket stops being read
+//	                                                                  ... and nothing else
 //
-// So the thread that reads from the device puts the data where it belongs, flushes it, and
-// then blocks in pthread_cond_wait rather than returning to the event loop. It stays there
-// until the socket is readable anyway, some thirty seconds later, which suggests it is
-// waiting on the wrong condition or a lost wakeup rather than on data.
-//
-// What that means for this repository: everything on the device side already matches a real
-// adbd, so there is nothing here left to fix by changing the mock. The remaining work is to
-// find which adb condition variable is involved, which needs recv, send, accept and the futex
-// waits added to the shim. That is debugging a process this project does not own.
-
-// So the device behaves like a real adbd, the client behaves like a real client, and the
-// thirty seconds happen in between, in a process this repository does not own. The next
-// step is tracing the server's remaining blocking calls -- recv, send, accept and futex are
-// not intercepted yet -- and that is not something to fix by changing this mock.
+// `adb shell` passed throughout, which is the prediction that identifies it: a shell
+// command needs no second write from the client after the device speaks, so it never asks
+// for the ack again. Every sync request after the first does, because the next command
+// cannot be sent until the previous reply has arrived.
 //
 // Three explanations were checked against the reference and dropped, each by measurement:
 //
 //   - The CNXN Arg1 window is 0x100000 on this mock and on the phone, identical.
-//   - The device's ack of the host's WRTE makes no difference to the timing either way.
 //   - The stream id does not matter: the phone picks 112 and this mock picked 1, and
 //     forcing 112 changed nothing.
+//   - The server's write thread blocking in pthread_cond_wait is not it. That is
+//     BlockingConnectionAdapter's write queue waiting for work, which it does for the phone
+//     too. The client socket going unread is the FDE_READ deletion above, not a condition
+//     variable, and the two appear in one trace at a glance.
 //
-// What the reference did settle, and what is fixed here: a real adbd sends the whole
-// 72-byte stat reply as one packet and the whole 8-byte DONE reply as one packet, and it
-// leaves every byte after the errno zero for a path that does not exist. All three now match.
-// Its banner advertises twenty-three features against this mock's three, and that matches
-// too; adb reads the list and chooses paths on it. Declaring sendrecv_v2 does not move adb
-// onto the SND2 form for push -- confirmed against the wire -- so the extra features do not
-// route a push onto a path this mock has not been made to satisfy.
+// What the reference settled before that, and what is fixed here: a real adbd sends the
+// whole 72-byte stat reply as one packet and the whole 8-byte DONE reply as one packet, and
+// it leaves every byte after the errno zero for a path that does not exist.
+//
+// Three more things the wire turned up once the hang was gone, all of them invisible
+// while it was there because adb never got far enough to exercise them:
+//
+//   - SND2 and RCV2 are written as one buffer: id, length, path, then the same id again
+//     before the mode and the flags. Reading the two setup words without the repeated id
+//     left the flags word where the DATA frames were expected, and a flags word of zero
+//     turned a 256 KiB push into `unexpected sync command 0x00000000`. Small pushes missed
+//     it because adb sends the v1 SEND form for those.
+//   - The banner offered sendrecv_v2_brotli, sendrecv_v2_lz4 and sendrecv_v2_zstd, and
+//     nothing here compresses. adb reads the feature list and picks the best one it knows,
+//     so above its own size threshold it compressed the payload and the mock read a zstd
+//     frame as sync framing -- the same error, with 0x00000004 instead of zero. Those three
+//     features are gone from the default banner.
+//   - The device reads the send stream in 64 KiB chunks rather than framing exactly, so
+//     the handler for one file held the next file's request in the chunk it had just read
+//     and dropped it. adb writes those requests back to back -- a directory push is one
+//     long run of them -- so the stream desynchronised at the second file. It is handed
+//     back now; TestHostTwoSyncSendsInOnePacket is the guard, because reproducing the
+//     coalescing through adb would depend on how fast adb writes.
 //
 // The tools, in order of what each was worth:
 //
-//	ADB_TRACE=all adb nodaemon server   # both exchanges, and the diff that found the framing
+//	ADB_TRACE=sockets,transport,sync adb nodaemon server   # "acks not deferred, blocking",
+//	                                                             and the silence after it
 //	MOCKADBD_TRACE=/tmp/t.log ...       # the device's own view
-//	cmd/probe                           # the wire, from either side
 //	LD_PRELOAD=shim.so adb ...          # the client's own reads, byte for byte
-//	LD_PRELOAD=shim.so adb nodaemon ... # the server, where the delay turns out to be
+//	LD_PRELOAD=shim.so adb nodaemon ... # the server; needs writev as well as read and
+//	                                     write, because that is how the reply arrives
+//	cmd/probe                           # the wire, from either side
 //
 // ptrace and gdb are both refused on this host -- kernel.yama.ptrace_scope is 1 -- so the
 // shim is what made either process visible without privileges. It is roughly forty lines of
 // C that intercept read, write, poll and epoll_wait and print a timestamp; it is not part
-// of the repository because it needs a C compiler to build, and a diagnostic that cannot be
-// built with the tools the project already assumes is worth documenting rather than
+// of the repository because it needs a C compiler to build, and a diagnostic that cannot
+// be built with the tools the project already assumes is worth documenting rather than
 // shipping. Reproduce it from test/mockadbd/README.md.
+//
+// The line numbers above come from platform/packages/modules/adb: adb moved out of
+// platform_system_core, and sockets.cpp, transport.cpp and adb.cpp sit at the top level of
+// that tree. The adb installed here is 37.0.0-android-tools, built from vendor/adb, which
+// matches that tree rather than any older layout -- it imports no splice(2) and it does
+// have BlockingConnectionAdapter.
 
 // connectMock starts a mock device on a private adb server and returns its serial.
 //
@@ -136,7 +134,6 @@ func hostFile(t *testing.T, name string, data []byte) string {
 // reports success on the way out and the bytes are only checked later, by hand, on a
 // device. So the assertion is on the device side.
 func TestInteropPushLandsOnTheDevice(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -156,10 +153,52 @@ func TestInteropPushLandsOnTheDevice(t *testing.T) {
 	}
 }
 
-// Binary content is the case that catches framing bugs. Text passes through systems that
-// quietly mangle NULs and lone CRs; random bytes do not.
+// More than one file in a single push, end to end through a real adb.
+//
+// Whether adb coalesces both requests into one packet is a matter of how fast it writes,
+// so this is an assertion about the whole path rather than the guard for the chunked-read
+// bug. TestHostTwoSyncSendsInOnePacket is that guard: it puts both requests in one packet
+// on purpose, so the outcome does not depend on timing.
+func TestInteropPushSeveralFiles(t *testing.T) {
+	adb := requireAdb(t)
+	serial, fs := connectMock(t)
+
+	// Both files at least one 64 KiB DATA frame, so the device's chunked read ends
+	// mid-transfer rather than on a framing boundary.
+	sizes := []int{65536, 100_000}
+	srcs := make([]string, 0, len(sizes))
+	want := make(map[string][]byte, len(sizes))
+	for i, n := range sizes {
+		payload := make([]byte, n)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+		name := fmt.Sprintf("many-%d.bin", i)
+		srcs = append(srcs, hostFile(t, name, payload))
+		want["/data/local/tmp/"+name] = payload
+	}
+
+	args := append([]string{"-s", serial, "push"}, srcs...)
+	args = append(args, "/data/local/tmp/")
+	if out, err := adbCmd(t, adb, args...).CombinedOutput(); err != nil {
+		t.Fatalf("adb push: %v\n%s", err, out)
+	}
+
+	for path, payload := range want {
+		got, err := fs.ReadFile(path)
+		if err != nil {
+			t.Fatalf("%s is not on the device: %v", path, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("%s: length %d, want %d", path, len(got), len(payload))
+		}
+	}
+}
+
+// Large enough that adb uses SND2's two-request form rather than the v1 SEND, and that
+// the payload arrives as several DATA frames. A small push takes the v1 path and never
+// sees either.
 func TestInteropPushPreservesBinaryContent(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -186,7 +225,6 @@ func TestInteropPushPreservesBinaryContent(t *testing.T) {
 
 // A pull is the mirror image and is what an operator does when collecting a log.
 func TestInteropPullBringsTheFileToTheHost(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -208,10 +246,38 @@ func TestInteropPullBringsTheFileToTheHost(t *testing.T) {
 	}
 }
 
+// The pull counterpart of the large push, and the size at which the device answers with
+// DATA frames rather than one body. RCV2 has the same two-request shape as SND2, so it has
+// its own way to be mis-parsed; the pull above already reaches it, and this pins the
+// multi-frame case.
+func TestInteropPullLargeBinary(t *testing.T) {
+	adb := requireAdb(t)
+	serial, fs := connectMock(t)
+
+	want := make([]byte, 256*1024)
+	if _, err := rand.Read(want); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if err := fs.WriteFile("/data/local/tmp/blob.bin", want, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "blob.bin")
+	if out, err := adbCmd(t, adb, "-s", serial, "pull", "/data/local/tmp/blob.bin", dst).CombinedOutput(); err != nil {
+		t.Fatalf("adb pull: %v\n%s", err, out)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read pulled file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("pull corrupted the contents: %d bytes, want %d", len(got), len(want))
+	}
+}
+
 // Round-trip is the property that matters: what goes up comes back byte for byte, which is
 // what a checksum in a test script would be checking on a real device.
 func TestInteropRoundTripIsByteIdentical(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -244,7 +310,6 @@ func TestInteropRoundTripIsByteIdentical(t *testing.T) {
 
 // An empty file is a boundary that framing code usually gets wrong.
 func TestInteropPushEmptyFile(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 
@@ -265,7 +330,6 @@ func TestInteropPushEmptyFile(t *testing.T) {
 // that returns success for a missing path would make a transfer bug look like a permissions
 // problem on the host.
 func TestInteropPullMissingFileFails(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, _ := connectMock(t)
 
@@ -282,7 +346,6 @@ func TestInteropPullMissingFileFails(t *testing.T) {
 // Pushing into a directory that does not exist yet is the normal case, not an edge case:
 // adb does not create intermediate directories.
 func TestInteropPushCreatesNothingButTheFile(t *testing.T) {
-	requireSync(t)
 	adb := requireAdb(t)
 	serial, fs := connectMock(t)
 

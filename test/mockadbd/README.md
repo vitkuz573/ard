@@ -79,31 +79,24 @@ of its own in the relay.
 
 Stated plainly, because a simulator that overstates itself is worse than a stub.
 
-- **`adb push` and `adb pull` transfer the file and then hang.** The wire protocol is right:
-  the sync exchange matches a real adbd byte for byte -- the 72-byte stat reply in one
-  packet, the zeroed body for a missing file, the 8-byte DONE reply in one packet, the
-  twenty-three feature banner. The bytes arrive, the file is on the device, `adb shell cat`
-  returns it, and adb prints `1 file pushed`. Then adb waits about thirty seconds and never
-  exits.
+- **The sync transfer is not compressed, and `adb push` and `adb pull` depend on that.** The
+  exchange itself matches a real adbd: the 72-byte stat reply in one packet, the zeroed body
+  for a missing file, the 8-byte DONE reply in one packet.
 
-  The delay is in the adb server, and tracing all four processes located it: the thread
-  that reads the device's reply flushes the client's copy and then blocks in
-  `pthread_cond_wait` instead of returning to its event loop, and stays there until the socket
-  is readable anyway. That looks like a wrong condition or a lost wakeup inside adb. It is
-  not fixable from here, and no amount of changing this mock would move it -- the device side
-  already behaves like the real thing.
-
-  The seven push and pull tests skip with this attached, and enable themselves with
-  `MOCKADBD_FORCE_SYNC=1` for anyone who wants to watch the transfer work:
+  Compression is the one protocol feature deliberately not implemented, and the banner says
+  so: `sendrecv_v2_brotli`, `sendrecv_v2_lz4` and `sendrecv_v2_zstd` are absent, so adb
+  compresses nothing and there is nothing here to decompress. That is not a formality. adb
+  reads the feature list before it chooses, and above its own size threshold it will pick the
+  best one it is told about, so putting those features back into `Config.Banner` makes every
+  push over that size arrive zstd-framed and unreadable.
 
   ```sh
-  MOCKADBD_FORCE_SYNC=1 MOCKADBD_TRACE=/tmp/t.log \
-    go test ./test/mockadbd/ -run TestInteropPushLands
+  MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
   ```
 
-  - **`adb reverse` and `adb forward` are not implemented.** The protocol is captured from a
-    real device below, along with the reason `reverse` needs transport work rather than a
-    case in the service switch.
+- **`adb reverse` and `adb forward` are not implemented.** The protocol is captured from a
+  real device below, along with the reason `reverse` needs transport work rather than a
+  case in the service switch.
 
 - **No PTY.** `adb shell` without `-t` gets a pipe. `adb shell -t` is not implemented.
 
@@ -171,7 +164,14 @@ kernel.yama.ptrace_scope = 1
 ```
 
 `LD_PRELOAD` gets around that, because it needs no privileges. This intercepts `read`,
-`write`, `poll` and `epoll_wait`, prints a timestamp for each, and changes nothing:
+`write`, `writev`, `poll` and `epoll_wait`, prints a timestamp for each, and changes nothing.
+
+`writev` is not optional. The adb server hands a reply to the client with
+`local_socket_flush_incoming()`, which calls `adb_writev`, so without that one symbol the
+trace shows the device's reply being ingested and never reaching the client -- which reads
+exactly like a dropped packet and is not one. It is also worth logging the thread id: adb's
+server has a looper thread, a read thread and a write thread, and without it the three are
+indistinguishable.
 
 ```c
 #define _GNU_SOURCE
@@ -179,12 +179,15 @@ kernel.yama.ptrace_scope = 1
 #include <stdio.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <sys/time.h>
+#include <pthread.h>
 #include <unistd.h>
 
 static ssize_t (*r_read)(int, void *, size_t);
 static ssize_t (*r_write)(int, const void *, size_t);
+static ssize_t (*r_writev)(int, const struct iovec *, int);
 static int (*r_poll)(struct pollfd *, nfds_t, int);
 static int (*r_epoll_wait)(int, struct epoll_event *, int, int);
 static double t0;
@@ -199,23 +202,35 @@ static void init(void) {
     if (!t0) t0 = now();
     if (!r_read)  r_read  = dlsym(RTLD_NEXT, "read");
     if (!r_write) r_write = dlsym(RTLD_NEXT, "write");
+    if (!r_writev) r_writev = dlsym(RTLD_NEXT, "writev");
     if (!r_poll)  r_poll  = dlsym(RTLD_NEXT, "poll");
     if (!r_epoll_wait) r_epoll_wait = dlsym(RTLD_NEXT, "epoll_wait");
+}
+
+static void say(const char *what, int fd, ssize_t r) {
+    fprintf(stderr, "SHIM +%7.3f [tid %d] %s fd=%d -> %zd\n", now() - t0,
+            (int)pthread_self() % 100000, what, fd, r);
+    fflush(stderr);
 }
 
 ssize_t read(int fd, void *buf, size_t n) {
     init();
     ssize_t r = r_read(fd, buf, n);
-    fprintf(stderr, "SHIM +%7.3f read fd=%d -> %zd\n", now() - t0, fd, r);
-    fflush(stderr);
+    say("read", fd, r);
     return r;
 }
 
 ssize_t write(int fd, const void *buf, size_t n) {
     init();
     ssize_t r = r_write(fd, buf, n);
-    fprintf(stderr, "SHIM +%7.3f write fd=%d n=%zu -> %zd\n", now() - t0, fd, n, r);
-    fflush(stderr);
+    say("write", fd, r);
+    return r;
+}
+
+ssize_t writev(int fd, const struct iovec *iov, int c) {
+    init();
+    ssize_t r = r_writev(fd, iov, c);
+    say("writev", fd, r);
     return r;
 }
 
