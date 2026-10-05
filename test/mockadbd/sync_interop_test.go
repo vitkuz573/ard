@@ -31,44 +31,43 @@ func requireSync(t *testing.T) {
 //
 // The transfer works and the bytes arrive. What does not work is that the adb process
 // never returns, so requireSync skips these: a test that waits for adb would hang rather
-// than fail. The state, precisely, because the narrowing took real work to reach:
+// than fail. The state, precisely, because narrowing this took a working reference.
 //
-//   - adb sends STA2, gets a 68-byte stat body, pauses 15 to 25 seconds, then sends SEND
-//     with the content and DONE. The device writes the file and replies. The file is on
-//     the device and `adb shell cat` returns it.
-//   - adb sends CLSE immediately after DONE, without waiting for the reply. The device
-//     replies DONE and then closes.
-//   - The adb server receives that reply -- both packets -- and never forwards it. In the
-//     server's own trace the two WRTE arrive and are logged, and there is no LS(6): enqueue
-//     for either. Nothing is sent to the client.
-//   - The client waits forever. Not on the device, whose packets it read and acknowledged,
-//     and not on the socket, which is still open: strace from birth shows
-//     poll([{fd=3, events=POLLIN}], 1, 0) = 0 (Timeout) with no syscall before it, and
-//     the process sits at 0% CPU in wait_woken, blocked rather than spinning.
+// A real device was available, so both exchanges were captured with ADB_TRACE=all and
+// compared line by line. What the device does that this mock does not:
 //
-// So the bytes are lost between the adb server and the adb client, after the server has
-// them, because the client closed first. Nothing in the device is wrong at this point,
-// which is why it looked like a sync protocol problem for so long: from the device's side
-// there is no fault, and from the wire there is no fault. It is only visible in the
-// middle, and only in the server's own log.
+//   - It answers a stat in one 72-byte packet: the id word and the 68-byte body together.
+//     The mock sent four bytes and then sixty-eight, and the host -- which wants one
+//     72-byte message -- stalled for twenty seconds before producing anything else.
+//     Fixed: the reply is now a single write, which matches the reference.
+//   - It answers DONE in one 8-byte packet: OKAY and a zero length together. Also fixed.
+//   - After the DONE reply the host sends QUIT, and only then does the device close. The
+//     host is not supposed to close first, and on this mock it does -- it waits, gives up,
+//   and sends CLSE. That is the hang.
 //
-// Measured with, in order of how much each told me:
+// The remaining difference is the CNXN banner. A real adbd advertises twenty-three
+// features; this mock advertises three, among them no sendrecv_v2. Widening the mock's
+// banner to match the reference changed nothing and was reverted: claiming sendrecv_v2
+// switches the host to the SND2 two-request form, which is a different path and not one
+// this mock has been made to satisfy. Advertising a feature the device does not honour is
+// worse than not advertising it.
 //
-//	MOCKADBD_TRACE=/tmp/t.log adb -s PORT push FILE REMOTE   # the device
-//	ADB_TRACE=all adb nodaemon server                         # the server, verbose
-//	LD_PRELOAD=shim.so adb -s PORT push FILE REMOTE           # the client's own I/O
-//	strace -e trace=network,poll adb -s PORT push FILE REMOTE # the client, from birth
+// So what is still missing is the QUIT exchange, and it is missing because the host only
+// sends QUIT once it has the DONE reply -- which arrives, and is then dropped by the adb
+// server on its way to the client because the client has already closed. That is the loop
+// to break next, and it is a mock-side question: the reply has to be in the server's hands
+// before the host's CLSE can overtake it.
 //
-// The third is what showed the client blocking inside a read that never returned, and the
-// fourth is what showed it was not the device's socket at all. Neither ptrace nor gdb
-// attached here -- kernel.yama.ptrace_scope is 1 -- so the LD_PRELOAD shim is what made the
-// client visible without privileges.
+// The tools, and what each was worth:
 //
-// Reproduce with:
+//	ADB_TRACE=all adb nodaemon server   # both sides, and the diff that found the framing
+//	LD_PRELOAD=shim.so adb ... push     # the client's own reads, byte for byte
+//	MOCKADBD_TRACE=/tmp/t.log ...       # the device's own view
+//	strace -e trace=network,poll ...     # what the client is blocked on
 //
-//	ADB_TRACE=all adb nodaemon server 2>&1 | grep -E "from remote|enqueue"
-//
-// and watch the DONE reply arrive without an enqueue following it.
+// ptrace and gdb are both refused on this host -- kernel.yama.ptrace_scope is 1 -- so the
+// LD_PRELOAD shim is what made the client visible without privileges. It is small and it is
+// what compared the two devices' replies byte for byte.
 
 // connectMock starts a mock device on a private adb server and returns its serial.
 //

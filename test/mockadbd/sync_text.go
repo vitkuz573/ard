@@ -243,9 +243,9 @@ func failMsg(s *stream, format string, args ...any) {
 // once, so one write is both what the device does and what the client is shaped for; the
 // split was a quirk of how this code was written, not of the protocol.
 func writeStatV2(s *stream, id, errno uint32, n *Node) error {
-	if err := putWord(s, id); err != nil {
-		return err
-	}
+	var head [4]byte
+	binary.LittleEndian.PutUint32(head[:], id)
+	tracef("  -> %q", idString(id))
 	var b [statV2Len]byte
 	le32(b[0:], errno)
 	le64(b[4:], 1)         // dev
@@ -271,7 +271,14 @@ func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	le64(b[44:], secs) // atime
 	le64(b[52:], secs) // mtime
 	le64(b[60:], secs) // ctime
-	return s.writeRaw(b[:])
+	// The id and the body go out as one 72-byte packet.
+	//
+	// A real adbd sends them together, and a host reads them as one message: its stat
+	// read wants 72 bytes and is satisfied by exactly that. Written as two packets --
+	// four bytes then sixty-eight -- the host got the id, waited, and only produced the
+	// rest of the exchange twenty seconds later. Splitting them was correct-looking and
+	// it cost the push its entire stream.
+	return s.writeRaw(append(head[:], b[:]...))
 }
 
 func le32(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
