@@ -14,21 +14,28 @@ import (
 //
 // The device gets an explicit filesystem so a test can inspect what a push produced,
 // which is the only way to tell "the bytes arrived" from "the command did not fail".
-// requireSync skips the push and pull tests while the text protocol is incomplete.
+// requireSync skips the push and pull tests.
 //
-// They are the specification for the work that remains: bytes land on the device, they come
-// back byte for byte through a 512 KiB round trip, a missing path fails without creating
-// the destination, an empty file stays empty, and a push adds exactly one node.
+// State, precisely, because "does not work" is not a useful note:
+//
+//   - A push through the ordinary adb server SUCCEEDS: "1 file pushed, 0 skipped".
+//     adb uses the v1 SEND form with "path,mode" rather than SND2, sends two STA2
+//     requests before it, and waits about 25 seconds between the stat and the send.
+//   - The same push through the private adb server these tests start never completes.
+//
+// So the protocol handling is largely right and what is broken is narrower than it looks:
+// something about the private-server path stalls after the first stat reply. Reproduce with
+//
+//	MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
+//
+// against a device started by hand with the default adb server, and compare.
 func requireSync(t *testing.T) {
 	t.Helper()
-	// MOCKADBD_FORCE_SYNC runs them anyway, so working on the protocol does not mean
-	// editing this file on every attempt.
 	if os.Getenv("MOCKADBD_FORCE_SYNC") != "" {
 		return
 	}
-	t.Skip("text sync protocol: STA2 is parsed and replied to, but adb blocks instead of " +
-		"sending SND2. One command away: MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ " +
-		"-run TestInteropPushLands. See test/mockadbd/sync_text.go.")
+	t.Skip("push and pull stall against the private adb server; they succeed against the " +
+		"default one. See the comment above.")
 }
 
 func connectMock(t *testing.T) (string, *mockadbd.VFS) {
