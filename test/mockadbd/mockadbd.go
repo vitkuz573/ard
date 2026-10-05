@@ -765,6 +765,7 @@ func (s *stream) writeFrame(id byte, p []byte) error {
 // waiting for more rather than by reporting anything. Stream.Write is the shell's path and
 // must not be used here.
 func (s *stream) writeRaw(p []byte) error {
+	tracef("  -> raw %d bytes", len(p))
 	return s.writeChunked(p)
 }
 

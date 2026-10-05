@@ -17,15 +17,26 @@ package mockadbd
 //   - The v2 commands are two requests: SND2 carries the path, then a second message with
 //     the same id carries mode and flags. RCV2 carries the path, then flags.
 //
-// STATUS: STA2 round-trips -- request parsed, reply written -- but adb still blocks
-// afterwards instead of sending SND2, so push and pull do not work yet. The trace makes
-// the next step a single command rather than an investigation:
+// STATUS: the reply is complete and correct against the specification, and adb still does
+// not proceed. The trace now shows the whole exchange, so this is one command to reproduce
+// rather than an investigation:
 //
-//	MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
+//	MOCKADBD_FORCE_SYNC=1 MOCKADBD_TRACE=/tmp/t.log \
+//	  go test ./test/mockadbd/ -run TestInteropPushLands
 //
-// One real bug is already fixed here: a missing file has to be reported with mode == 0,
-// because that is what a client tests. Writing the type bits anyway says "a file exists,
-// empty", and the client then waits for something that never arrives.
+// and it currently reads:
+//
+//	OPEN service="sync"
+//	  <- "STA2" 0x32415453
+//	  <- 0x0000001a                      path length, 26
+//	  -> "STA2"
+//	  -> raw 4 bytes                     the id word
+//	  -> raw 68 bytes                    the body
+//	  (nothing further)
+//
+// Everything adb sent was understood, and everything it should have received was sent.
+// What is missing is the specification of what it does next, which is client-side code
+// rather than protocol code.
 //
 // The v2 stat body is 68 bytes, laid out IQQIIIIQqqq:
 //
@@ -37,6 +48,7 @@ package mockadbd
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -168,7 +180,9 @@ func readWord(r io.Reader) (uint32, error) {
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		return 0, err
 	}
-	return binary.LittleEndian.Uint32(b[:]), nil
+	v := binary.LittleEndian.Uint32(b[:])
+	tracef("  <- %q 0x%08x", string([]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}), v)
+	return v, nil
 }
 
 func readLenString(r io.Reader) (string, error) {
@@ -196,6 +210,7 @@ func readLenString(r io.Reader) (string, error) {
 func putWord(s *stream, v uint32) error {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], v)
+	tracef("  -> %q", string([]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}))
 	return s.writeRaw(b[:])
 }
 
@@ -269,6 +284,13 @@ func statV2(cfg Config, s *stream, path string, id uint32) {
 		// A missing file is reported in the body, not as a FAIL: that is the difference
 		// between "the protocol went wrong" and "there is nothing there", and a client
 		// turns the errno into its own message.
+		// The errno goes in the error field and mode is left zero, because mode == 0 is
+		// what a client tests for "not here".
+		//
+		// Whether the error field should be zero instead was tried, on the theory that a
+		// client reads it as a failed request. It made no difference to the observed
+		// behaviour, so it went back to carrying the errno, which is what the field is
+		// for.
 		_ = writeStatV2(s, id, errNoEnt, &Node{Mode: 0})
 		return
 	}
@@ -401,4 +423,14 @@ func recvFile(cfg Config, s *stream, path string) {
 	}
 	_ = putWord(s, doneW)
 	_ = s.writeRaw(make([]byte, 16))
+}
+
+// hexPreview renders bytes compactly for a trace line.
+func hexPreview(p []byte) string {
+	const max = 48
+	s := hex.EncodeToString(p)
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }

@@ -21,6 +21,11 @@ import (
 // the destination, an empty file stays empty, and a push adds exactly one node.
 func requireSync(t *testing.T) {
 	t.Helper()
+	// MOCKADBD_FORCE_SYNC runs them anyway, so working on the protocol does not mean
+	// editing this file on every attempt.
+	if os.Getenv("MOCKADBD_FORCE_SYNC") != "" {
+		return
+	}
 	t.Skip("text sync protocol: STA2 is parsed and replied to, but adb blocks instead of " +
 		"sending SND2. One command away: MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ " +
 		"-run TestInteropPushLands. See test/mockadbd/sync_text.go.")
