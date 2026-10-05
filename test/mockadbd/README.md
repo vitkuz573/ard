@@ -79,18 +79,31 @@ of its own in the relay.
 
 Stated plainly, because a simulator that overstates itself is worse than a stub.
 
-- **`adb push` and `adb pull` do not work.** The v1 binary sync protocol is implemented and
-  unit-tested. A current adb uses the v2 text protocol, and this implements enough of it to
-  parse `STA2` and reply correctly -- after which adb stops rather than continuing. The
-  remaining mismatch is one command away:
+- **`adb push` and `adb pull` transfer the file and then hang.** The wire protocol is right:
+  the sync exchange matches a real adbd byte for byte -- the 72-byte stat reply in one
+  packet, the zeroed body for a missing file, the 8-byte DONE reply in one packet, the
+  twenty-three feature banner. The bytes arrive, the file is on the device, `adb shell cat`
+  returns it, and adb prints `1 file pushed`. Then adb waits about thirty seconds and never
+  exits.
+
+  The delay is in the adb server, and tracing all four processes located it: the thread
+  that reads the device's reply flushes the client's copy and then blocks in
+  `pthread_cond_wait` instead of returning to its event loop, and stays there until the socket
+  is readable anyway. That looks like a wrong condition or a lost wakeup inside adb. It is
+  not fixable from here, and no amount of changing this mock would move it -- the device side
+  already behaves like the real thing.
+
+  The seven push and pull tests skip with this attached, and enable themselves with
+  `MOCKADBD_FORCE_SYNC=1` for anyone who wants to watch the transfer work:
 
   ```sh
   MOCKADBD_FORCE_SYNC=1 MOCKADBD_TRACE=/tmp/t.log \
     go test ./test/mockadbd/ -run TestInteropPushLands
   ```
 
-  The seven push and pull tests skip with that reason attached. They are the specification,
-  and they enable themselves when it works.
+  - **`adb reverse` and `adb forward` are not implemented.** The protocol is captured from a
+    real device below, along with the reason `reverse` needs transport work rather than a
+    case in the service switch.
 
 - **No PTY.** `adb shell` without `-t` gets a pipe. `adb shell -t` is not implemented.
 
@@ -116,6 +129,36 @@ Logs every frame the device receives and every byte it sends. Gate it behind an 
 variable so it costs nothing when nobody is debugging -- it was added after a hang had
 already been misdiagnosed twice, once as an adb bug and once as a client bug, both times
 wrongly.
+
+## Port forwarding: what the protocol actually is
+
+Not implemented here. The notes below were captured from a real adbd rather than guessed,
+because guessing cost a debugging round for `sync` and there is no reason to repeat it.
+
+`adb forward` never mentions the device. Setting one up produces no packets to it at all:
+the adb server binds the host-side port itself, and the device is only involved later, when
+a connection arrives and the server asks it to connect out. So a mock that wants to exercise
+`forward` has to notice the host-side connection, which it cannot see -- it is entirely
+outside the transport.
+
+`adb reverse` does talk to the device, and in one exchange:
+
+    adb reverse tcp:9911 tcp:9910
+
+    host -> device  OPEN   arg0=6 arg1=0  "reverse:forward:tcp:9911;tcp:9910"
+    device -> host  OKAY   arg0=114 arg1=6
+    device -> host  WRTE   arg0=114 arg1=6  "OKAY00049911"
+
+The reply is the daemon service acknowledgement: `OKAY`, then a four-hex-digit field, then
+the port. `0004` is the width of what follows and `9911` is the device port that was opened.
+
+The part that makes this more than a string match, and the reason it is worth writing down
+before implementing it: for every connection that reaches the device-side listener, the
+device has to open a *new* stream back to the host. That is a stream the device initiates,
+and this mock's transport has no path for it -- `handleOpen` only ever runs for a host-initiated
+OPEN. Supporting `reverse` properly therefore means adding device-initiated OPEN to the
+transport, not adding a case to the service switch, which is why it is listed as missing
+rather than half-built.
 
 ## Seeing what adb itself is doing
 
