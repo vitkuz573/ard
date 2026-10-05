@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -31,8 +32,10 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:5601", "where adb connects")
 	target := flag.String("target", "127.0.0.1:5555", "the mock device")
-	inject := flag.String("inject", "", "hex bytes appended to each device->adb message")
+	inject := flag.String("inject", "", "hex bytes appended to a device->adb message")
 	after := flag.Int("after", 0, "inject only once this many bytes have passed device->adb")
+	trigger := flag.String("trigger", "", "inject only into a device->adb message containing this text")
+	hexOut := flag.Bool("hex", false, "dump adb->device messages as hex instead of words")
 	flag.Parse()
 
 	var extra []byte
@@ -57,11 +60,11 @@ func main() {
 		if err != nil {
 			return
 		}
-		go handle(c, *target, extra, int64(*after))
+		go handle(c, *target, extra, int64(*after), *trigger, *hexOut)
 	}
 }
 
-func handle(client net.Conn, target string, extra []byte, after int64) {
+func handle(client net.Conn, target string, extra []byte, after int64, trigger string, hexOut bool) {
 	defer client.Close()
 	up, err := net.Dial("tcp", target)
 	if err != nil {
@@ -79,7 +82,11 @@ func handle(client net.Conn, target string, extra []byte, after int64) {
 			n, err := up.Read(buf)
 			if n > 0 {
 				toDevice += int64(n)
-				log("adb ->dev", buf[:n])
+				if hexOut {
+					logHex("dev ->adb", buf[:n])
+				} else {
+					log("dev ->adb", buf[:n])
+				}
 				if _, werr := client.Write(buf[:n]); werr != nil {
 					return
 				}
@@ -94,9 +101,14 @@ func handle(client net.Conn, target string, extra []byte, after int64) {
 		n, err := client.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			log("dev ->adb", chunk)
+			if hexOut {
+				logHex("adb ->dev", chunk)
+			} else {
+				log("adb ->dev", chunk)
+			}
 			toHost += int64(n)
-			if !injected && len(extra) > 0 && toHost >= after {
+			if !injected && len(extra) > 0 && toHost >= after &&
+				(trigger == "" || bytes.Contains(chunk, []byte(trigger))) {
 				injected = true
 				chunk = append(chunk, extra...)
 				log("probe INJECT", extra)
@@ -110,6 +122,10 @@ func handle(client net.Conn, target string, extra []byte, after int64) {
 			return
 		}
 	}
+}
+
+func logHex(dir string, b []byte) {
+	fmt.Printf("%s %s len=%d hex=%x\n", time.Now().Format("15:04:05.000"), dir, len(b), b)
 }
 
 func log(dir string, b []byte) {

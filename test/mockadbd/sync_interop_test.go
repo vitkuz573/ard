@@ -10,34 +10,58 @@ import (
 	mockadbd "github.com/vitkuz573/ard/test/mockadbd"
 )
 
-// connectMock starts a mock device and returns its serial.
+// requireSync skips the push and pull tests until the adb process exits.
 //
-// The device gets an explicit filesystem so a test can inspect what a push produced,
-// which is the only way to tell "the bytes arrived" from "the command did not fail".
-// requireSync skips the push and pull tests.
+// The push and pull themselves work: the bytes arrive and the file is on the device. What
+// does not work is that the adb process never returns, so a test that waits for adb to exit
+// hangs instead of failing. MOCKADBD_FORCE_SYNC runs them anyway.
 //
-// State, precisely, because "does not work" is not a useful note:
-//
-//   - A push through the ordinary adb server SUCCEEDS: "1 file pushed, 0 skipped".
-//     adb uses the v1 SEND form with "path,mode" rather than SND2, sends two STA2
-//     requests before it, and waits about 25 seconds between the stat and the send.
-//   - The same push through the private adb server these tests start never completes.
-//
-// So the protocol handling is largely right and what is broken is narrower than it looks:
-// something about the private-server path stalls after the first stat reply. Reproduce with
-//
-//	MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
-//
-// against a device started by hand with the default adb server, and compare.
+// The measurements behind that sentence are in the file comment above the first test.
 func requireSync(t *testing.T) {
 	t.Helper()
 	if os.Getenv("MOCKADBD_FORCE_SYNC") != "" {
 		return
 	}
-	t.Skip("push and pull stall against the private adb server; they succeed against the " +
-		"default one. See the comment above.")
+	t.Skip("the push completes and the file lands, but adb never exits: it blocks polling " +
+		"its socket to the adb server after printing \"1 file pushed\". The file comment " +
+		"records how that was established.")
 }
 
+// These tests push and pull against a real adb and assert on the device's filesystem.
+//
+// The transfer works and the bytes arrive. What does not work is that the adb process
+// never exits, which is why requireSync skips them rather than letting them hang. The
+// state, precisely:
+//
+//   - adb sends STA2, receives a 68-byte stat body, and then goes quiet for 15 to 25
+//     seconds before sending SEND. The device receives the SEND, writes the file, and
+//     replies DONE. The file is on the device and `adb shell cat` returns its content.
+//   - adb prints "1 file pushed, 0 skipped" -- so it considers the transfer finished --
+//     and then blocks in poll() on its socket to the adb server, forever. The server has
+//     sent the stat body and nothing more, and never sends anything else.
+//
+// That second point is why this read as a protocol failure for so long. The file lands,
+// adb reports success, and the only symptom is a process that will not die. Nothing in the
+// wire trace shows a fault, because from the wire there is no fault.
+//
+// Measured with, in order of how much each one told me:
+//
+//	MOCKADBD_TRACE=/tmp/t.log adb -s PORT push FILE REMOTE   # the device's own trace
+//	ADB_TRACE=all adb nodaemon server                         # the adb server, verbose
+//	strace -e trace=network,poll adb -s PORT push FILE REMOTE # the client, from birth
+//
+// The last is the decisive one and it is one line: poll([{fd=3, events=POLLIN}], 1, 0) = 0
+// (Timeout), with no syscall before it. The client is not waiting on the device, whose
+// packets it has already read and acknowledged. It is waiting on the adb server, which has
+// nothing left to send.
+//
+// So what is still missing is a reply the adb server owes the client once a push is done,
+// not anything in the sync protocol.
+
+// connectMock starts a mock device on a private adb server and returns its serial.
+//
+// The device gets an explicit filesystem so a test can inspect what a push produced,
+// which is the only way to tell "the bytes arrived" from "the command did not fail".
 func connectMock(t *testing.T) (string, *mockadbd.VFS) {
 	t.Helper()
 	adb := requireAdb(t)

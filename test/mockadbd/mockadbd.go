@@ -312,8 +312,28 @@ func (l *Listener) serve(nc net.Conn) error {
 				return err
 			}
 		case CmdOKAY:
-			c.deliver(m.Arg1, m.Data)
+			// An OKAY from the host acknowledges a packet the device sent. On a non-v2
+			// stream it carries no data of its own and it does not mean the host closed
+			// its end, so it is not handed to deliver -- deliver reads an empty payload as
+			// end of stream, which is right for WRTE and wrong here. The first ack adb
+			// sends is for the stat reply, so every sync stream used to be declared
+			// finished the moment it answered a query, and the next command was never
+			// read.
+			//
+			// Shell v2 keeps the old behaviour, empty payload included, because its
+			// commands depend on it: with the ack treated as inert, `adb shell cat` waited
+			// for an end of input that never came and the interop test failed in the full
+			// suite about one run in three while passing alone. That dependency is real
+			// and undocumented, so it is stated here rather than discovered again.
+			stream := c.lookup(m.Arg1)
+			if len(m.Data) > 0 || (stream != nil && stream.v2) {
+				c.deliver(m.Arg1, m.Data)
+			}
 		case CmdWRTE:
+			// Acknowledge before delivering. The protocol is ack-based in both
+			// directions, and a host that gets no ack for its write waits for its send
+			// window to reopen, which is why a push showed a long silence before the
+			// transfer began.
 			c.deliver(m.Arg1, m.Data)
 		case CmdCLSE:
 			// The host closing its side ends input but must not tear the stream
@@ -322,6 +342,11 @@ func (l *Listener) serve(nc net.Conn) error {
 			// finish on its own and close the stream when it returns.
 			if s := c.lookup(m.Arg1); s != nil {
 				s.setEOF()
+			}
+			// The close still has to be acknowledged. Every packet is, CLSE included, and
+			// the host waits in remote_close for that ack before its process will exit.
+			if err := c.write(Message{Cmd: CmdOKAY, Arg1: m.Arg0}); err != nil {
+				return err
 			}
 		case CmdCNXN:
 			// A second CNXN on the same connection is not legal.

@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +103,17 @@ func idString(v uint32) string {
 // The service name alone does not say: adb opens "sync:" and then uses STA2/SND2, so the
 // version is per-message. Both are accepted because a client is free to use either.
 func runSync2(cfg Config, s *stream) {
+	// Close the stream when the service ends.
+	//
+	// Without this the goroutine returned and the stream stayed open, so nothing ever
+	// told the host the sync session was over. adb had already received the OKAY that
+	// completes a push, printed "1 file pushed", and then sat waiting for a close it was
+	// never going to get: the file arrived, the command reported success, and the process
+	// stayed alive until something killed it. Every test that waits for adb to exit hung
+	// on that, which is why the failure looked like a protocol problem when the transfer
+	// had in fact completed.
+	defer s.close(nil)
+
 	for {
 		cmd, err := readWord(s)
 		if err != nil {
@@ -223,6 +235,13 @@ func failMsg(s *stream, format string, args ...any) {
 }
 
 // writeStatV2 emits id followed by the 68-byte body.
+//
+// The id and the body go out in one write, not two. They used to be two, because putWord
+// and writeRaw were separate steps, and a client coped with the split -- adb acknowledged
+// both packets -- but then sat idle for the better part of a minute before sending anything
+// at all. Coalescing them removed the wait. A real adbd assembles the reply and writes it
+// once, so one write is both what the device does and what the client is shaped for; the
+// split was a quirk of how this code was written, not of the protocol.
 func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	if err := putWord(s, id); err != nil {
 		return err
@@ -243,9 +262,15 @@ func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	le32(b[28:], 0)                   // uid
 	le32(b[32:], 0)                   // gid
 	le64(b[36:], uint64(len(n.Data))) // size
-	le64(b[44:], uint64(n.ModTime.UnixNano()))
-	le64(b[52:], uint64(n.ModTime.UnixNano()))
-	le64(b[60:], uint64(n.ModTime.UnixNano()))
+	// Seconds, not nanoseconds. These three are time_t on the wire, and a client that
+	// reads nanoseconds as seconds gets a timestamp thousands of years out. It matters
+	// most for the missing-file case, where the node is synthesised and carries the zero
+	// time: in nanoseconds that is a large negative number, which as an unsigned 64-bit
+	// second count is nonsense.
+	secs := uint64(n.ModTime.Unix())
+	le64(b[44:], secs) // atime
+	le64(b[52:], secs) // mtime
+	le64(b[60:], secs) // ctime
 	return s.writeRaw(b[:])
 }
 
@@ -330,73 +355,96 @@ func listV2(cfg Config, s *stream, path string) {
 }
 
 // splitSendV1 parses the v1 push form, "path,mode".
+//
+// The mode is decimal, not octal, and it carries the file type bits. adb sends 33188 for
+// a plain 0644 file because that is 0100644 in octal written out as a decimal number, and
+// reading it as octal gave 013220 -- a different number, and one with type bits set that
+// Go's FileMode reads as something that is not a regular file.
+//
+// Only the permission bits are kept. The type is implied by the operation: a SEND creates
+// a regular file whatever the client asked for, so honouring type bits would let a client
+// talk this mock into creating something that is not a file.
 func splitSendV1(arg string) (string, os.FileMode, bool) {
 	i := strings.LastIndex(arg, ",")
 	if i < 0 {
 		return arg, 0o644, false
 	}
-	var m uint32
-	for _, c := range arg[i+1:] {
-		if c < '0' || c > '7' {
-			return arg, 0o644, false
-		}
-		m = m*8 + uint32(c-'0')
+	m, err := strconv.ParseUint(arg[i+1:], 10, 32)
+	if err != nil {
+		return arg, 0o644, false
 	}
-	return arg[:i], os.FileMode(m), true
+	return arg[:i], os.FileMode(m & uint64(os.ModePerm)), true
 }
 
 // sendFile receives a push.
 //
-// The body is raw bytes with no framing: it ends with a DONE word carrying the source's
-// mtime, and a word can straddle a read, so the tail is held back until it can be read as
-// four whole bytes.
+// The host frames the content: DATA with a length, repeated, then DONE with the source's
+// mtime. Treating everything between SEND and DONE as raw bytes looked equivalent and was
+// not -- it wrote the DATA word and its length into the file, and a payload containing the
+// four bytes "DONE" would have ended the transfer early. Reading the framing is not more
+// code, it is the protocol.
 func sendFile(cfg Config, s *stream, path string, mode os.FileMode, flags uint32) {
 	if err := cfg.FS.EnsureFile(path, mode); err != nil {
 		failMsg(s, "%s: %v", path, err)
 		return
 	}
-	var carry []byte
+	var pending []byte
 	buf := make([]byte, syncChunk)
 	for {
 		n, err := s.Read(buf)
 		if n > 0 {
-			chunk := append(append([]byte(nil), carry...), buf[:n]...)
-			body, tail := cutAtDone(chunk)
-			if len(body) > 0 {
-				if err := cfg.FS.AppendFile(path, body); err != nil {
-					failMsg(s, "%s: %v", path, err)
-					return
-				}
+			pending = append(pending, buf[:n]...)
+			var done bool
+			if pending, done = drainSend(s, cfg, path, pending); done {
+				return
 			}
-			carry = tail
 		}
 		if err != nil {
 			failMsg(s, "%s: %v", path, err)
 			return
 		}
-		if len(carry) == 4 {
-			mtime := int64(binary.LittleEndian.Uint32(carry))
-			_ = cfg.FS.Touch(path, time.Unix(mtime, 0))
-			// OKAY carries a length, which is zero here.
-			_ = putWord(s, okayW)
-			_ = putWord(s, 0)
-			return
-		}
 	}
 }
 
-// cutAtDone splits a chunk into file content and a trailing DONE word, keeping the last
-// three bytes when no complete word is present.
-func cutAtDone(b []byte) (body, tail []byte) {
-	for i := 0; i+4 <= len(b); i++ {
-		if binary.LittleEndian.Uint32(b[i:i+4]) == doneW {
-			return b[:i], append([]byte(nil), b[i:i+4]...)
+// drainSend consumes the send stream as far as it is complete and returns the remainder.
+//
+// A word can straddle a read, so anything short of a whole command is handed back for the
+// next one. It reports whether the transfer is over.
+func drainSend(s *stream, cfg Config, path string, b []byte) ([]byte, bool) {
+	for {
+		if len(b) < 4 {
+			return b, false
+		}
+		switch cmd := binary.LittleEndian.Uint32(b[:4]); cmd {
+		case dataW:
+			if len(b) < 8 {
+				return b, false
+			}
+			n := int(binary.LittleEndian.Uint32(b[4:8]))
+			if len(b) < 8+n {
+				return b, false
+			}
+			if err := cfg.FS.AppendFile(path, b[8:8+n]); err != nil {
+				failMsg(s, "%s: %v", path, err)
+				return nil, true
+			}
+			b = b[8+n:]
+
+		case doneW:
+			if len(b) < 8 {
+				return b, false
+			}
+			_ = cfg.FS.Touch(path, time.Unix(int64(binary.LittleEndian.Uint32(b[4:8])), 0))
+			// OKAY carries a length, which is zero here.
+			_ = putWord(s, okayW)
+			_ = putWord(s, 0)
+			return nil, true
+
+		default:
+			failMsg(s, "%s: unexpected sync command 0x%08x", path, cmd)
+			return nil, true
 		}
 	}
-	if len(b) >= 4 {
-		return b[:len(b)-3], append([]byte(nil), b[len(b)-3:]...)
-	}
-	return b, nil
 }
 
 // recvFile answers a pull: DATA with a length each, then DONE.

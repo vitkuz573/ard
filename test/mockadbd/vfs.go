@@ -216,6 +216,18 @@ func (v *VFS) ReadFile(p string) ([]byte, error) {
 func (v *VFS) WriteFile(p string, data []byte, mode fs.FileMode) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	return v.writeFileLocked(p, data, mode)
+}
+
+// writeFileLocked is WriteFile without the lock.
+//
+// It exists because EnsureFile needs to create a missing file while already holding the
+// lock, and calling WriteFile from there locked the mutex twice. Go mutexes are not
+// reentrant, so that is not a slow path or a retry: the goroutine blocks forever holding
+// its own lock and every later operation on the filesystem queues behind it. A push to a
+// path that does not exist yet deadlocks exactly there, and the only symptom is silence --
+// the transfer stops and nothing ever arrives again.
+func (v *VFS) writeFileLocked(p string, data []byte, mode fs.FileMode) error {
 	parent, base, err := v.parentOf(p)
 	if err != nil {
 		if !errors.Is(err, ErrNotExist) {
@@ -526,5 +538,5 @@ func (v *VFS) EnsureFile(p string, mode os.FileMode) error {
 		}
 		return nil
 	}
-	return v.WriteFile(p, nil, mode)
+	return v.writeFileLocked(p, nil, mode)
 }
