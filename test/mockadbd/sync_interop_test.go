@@ -31,43 +31,57 @@ func requireSync(t *testing.T) {
 //
 // The transfer works and the bytes arrive. What does not work is that the adb process
 // never returns, so requireSync skips these: a test that waits for adb would hang rather
-// than fail. The state, precisely, because narrowing this took a working reference.
+// than fail.
 //
-// A real device was available, so both exchanges were captured with ADB_TRACE=all and
-// compared line by line. What the device does that this mock does not:
+// Where the time goes, measured rather than argued. All four processes were traced: the
+// device with MOCKADBD_TRACE, the client with an LD_PRELOAD shim, the wire with cmd/probe,
+// and the adb server with the same shim injected into it. The delay is in the server.
 //
-//   - It answers a stat in one 72-byte packet: the id word and the 68-byte body together.
-//     The mock sent four bytes and then sixty-eight, and the host -- which wants one
-//     72-byte message -- stalled for twenty seconds before producing anything else.
-//     Fixed: the reply is now a single write, which matches the reference.
-//   - It answers DONE in one 8-byte packet: OKAY and a zero length together. Also fixed.
-//   - After the DONE reply the host sends QUIT, and only then does the device close. The
-//     host is not supposed to close first, and on this mock it does -- it waits, gives up,
-//   and sends CLSE. That is the hang.
+//   - The device answers the stat in the same millisecond it is asked, as does a real adbd.
+//   - The client writes SEND in that same millisecond, and a real device's reply arrives
+//     four milliseconds later. This mock's reply also goes out immediately.
+//   - The server receives the client's 83 bytes immediately -- its own trace shows them
+//     arriving and sitting unread -- and writes them to the device about thirty seconds
+//     later, at which point it also reports is_eof=1.
+//   - With an LD_PRELOAD shim in the server, those thirty seconds are total silence: no
+//     read, no write, not one epoll_wait. Every thread is blocked somewhere the shim does
+//     not intercept, so the shim cannot say where. It does establish that the server is not
+//     spinning and not waiting in its event loop, which is the part that was worth knowing.
 //
-// The remaining difference is the CNXN banner. A real adbd advertises twenty-three
-// features; this mock advertises three, among them no sendrecv_v2. Widening the mock's
-// banner to match the reference changed nothing and was reverted: claiming sendrecv_v2
-// switches the host to the SND2 two-request form, which is a different path and not one
-// this mock has been made to satisfy. Advertising a feature the device does not honour is
-// worse than not advertising it.
+// So the device behaves like a real adbd, the client behaves like a real client, and the
+// thirty seconds happen in between, in a process this repository does not own. The next
+// step is tracing the server's remaining blocking calls -- recv, send, accept and futex are
+// not intercepted yet -- and that is not something to fix by changing this mock.
 //
-// So what is still missing is the QUIT exchange, and it is missing because the host only
-// sends QUIT once it has the DONE reply -- which arrives, and is then dropped by the adb
-// server on its way to the client because the client has already closed. That is the loop
-// to break next, and it is a mock-side question: the reply has to be in the server's hands
-// before the host's CLSE can overtake it.
+// Three explanations were checked against the reference and dropped, each by measurement:
 //
-// The tools, and what each was worth:
+//   - The CNXN Arg1 window is 0x100000 on this mock and on the phone, identical.
+//   - The device's ack of the host's WRTE makes no difference to the timing either way.
+//   - The stream id does not matter: the phone picks 112 and this mock picked 1, and
+//     forcing 112 changed nothing.
 //
-//	ADB_TRACE=all adb nodaemon server   # both sides, and the diff that found the framing
-//	LD_PRELOAD=shim.so adb ... push     # the client's own reads, byte for byte
+// What the reference did settle, and what is fixed here: a real adbd sends the whole
+// 72-byte stat reply as one packet and the whole 8-byte DONE reply as one packet, and it
+// leaves every byte after the errno zero for a path that does not exist. All three now match.
+// Its banner advertises twenty-three features against this mock's three, and that matches
+// too; adb reads the list and chooses paths on it. Declaring sendrecv_v2 does not move adb
+// onto the SND2 form for push -- confirmed against the wire -- so the extra features do not
+// route a push onto a path this mock has not been made to satisfy.
+//
+// The tools, in order of what each was worth:
+//
+//	ADB_TRACE=all adb nodaemon server   # both exchanges, and the diff that found the framing
 //	MOCKADBD_TRACE=/tmp/t.log ...       # the device's own view
-//	strace -e trace=network,poll ...     # what the client is blocked on
+//	cmd/probe                           # the wire, from either side
+//	LD_PRELOAD=shim.so adb ...          # the client's own reads, byte for byte
+//	LD_PRELOAD=shim.so adb nodaemon ... # the server, where the delay turns out to be
 //
 // ptrace and gdb are both refused on this host -- kernel.yama.ptrace_scope is 1 -- so the
-// LD_PRELOAD shim is what made the client visible without privileges. It is small and it is
-// what compared the two devices' replies byte for byte.
+// shim is what made either process visible without privileges. It is roughly forty lines of
+// C that intercept read, write, poll and epoll_wait and print a timestamp; it is not part
+// of the repository because it needs a C compiler to build, and a diagnostic that cannot be
+// built with the tools the project already assumes is worth documenting rather than
+// shipping. Reproduce it from test/mockadbd/README.md.
 
 // connectMock starts a mock device on a private adb server and returns its serial.
 //

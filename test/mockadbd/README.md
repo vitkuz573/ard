@@ -117,6 +117,105 @@ variable so it costs nothing when nobody is debugging -- it was added after a ha
 already been misdiagnosed twice, once as an adb bug and once as a client bug, both times
 wrongly.
 
+## Seeing what adb itself is doing
+
+`MOCKADBD_TRACE` shows the device. `ADB_TRACE=all` on the adb server shows the server. The
+third party -- the `adb` client, and the adb server when the server is what you need -- is
+only reachable through a debugger, and `ptrace` and `gdb` are both refused on many hosts:
+
+```
+kernel.yama.ptrace_scope = 1
+```
+
+`LD_PRELOAD` gets around that, because it needs no privileges. This intercepts `read`,
+`write`, `poll` and `epoll_wait`, prints a timestamp for each, and changes nothing:
+
+```c
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <time.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+static ssize_t (*r_read)(int, void *, size_t);
+static ssize_t (*r_write)(int, const void *, size_t);
+static int (*r_poll)(struct pollfd *, nfds_t, int);
+static int (*r_epoll_wait)(int, struct epoll_event *, int, int);
+static double t0;
+
+static double now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+static void init(void) {
+    if (!t0) t0 = now();
+    if (!r_read)  r_read  = dlsym(RTLD_NEXT, "read");
+    if (!r_write) r_write = dlsym(RTLD_NEXT, "write");
+    if (!r_poll)  r_poll  = dlsym(RTLD_NEXT, "poll");
+    if (!r_epoll_wait) r_epoll_wait = dlsym(RTLD_NEXT, "epoll_wait");
+}
+
+ssize_t read(int fd, void *buf, size_t n) {
+    init();
+    ssize_t r = r_read(fd, buf, n);
+    fprintf(stderr, "SHIM +%7.3f read fd=%d -> %zd\n", now() - t0, fd, r);
+    fflush(stderr);
+    return r;
+}
+
+ssize_t write(int fd, const void *buf, size_t n) {
+    init();
+    ssize_t r = r_write(fd, buf, n);
+    fprintf(stderr, "SHIM +%7.3f write fd=%d n=%zu -> %zd\n", now() - t0, fd, n, r);
+    fflush(stderr);
+    return r;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    init();
+    int r = r_poll(fds, nfds, timeout);
+    fprintf(stderr, "SHIM +%7.3f poll(n=%zu,to=%d)=%d\n", now() - t0, (size_t)nfds, timeout, r);
+    fflush(stderr);
+    return r;
+}
+
+int epoll_wait(int ep, struct epoll_event *ev, int maxev, int timeout) {
+    init();
+    double t = now() - t0;
+    int r = r_epoll_wait(ep, ev, maxev, timeout);
+    fprintf(stderr, "SHIM +%7.3f epoll_wait(to=%d)=%d [blocked %.3fs]\n",
+            now() - t0, timeout, r, now() - t);
+    for (int i = 0; i < r; i++)
+        fprintf(stderr, "SHIM +%7.3f   fd=%d events=0x%x\n", now() - t0, ev[i].data.fd, ev[i].events);
+    fflush(stderr);
+    return r;
+}
+```
+
+```sh
+gcc -shared -fPIC -O1 -o /tmp/shim.so /tmp/shim.c -ldl
+
+# the client
+LD_PRELOAD=/tmp/shim.so adb -s SERIAL push FILE REMOTE
+
+# the adb server
+adb kill-server
+LD_PRELOAD=/tmp/shim.so setsid adb nodaemon server >/tmp/srv.log 2>&1 &
+```
+
+It is not built by the Go tooling and is not part of this repository, because a diagnostic
+that needs a C compiler is worth documenting rather than shipping. What it bought, in the
+push that never finishes: the client's reads are fast and the device answers immediately, so
+both of the obvious suspects are innocent, and the server's thirty seconds are silence --
+no `read`, no `write`, not one `epoll_wait` -- which means the server's threads are blocked
+in calls this does not intercept. `recv`, `send`, `accept` and the futex waits are the next
+ones to add.
+
 ## Running the tests
 
 ```sh
