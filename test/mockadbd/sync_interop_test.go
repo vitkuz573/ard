@@ -38,16 +38,34 @@ func requireSync(t *testing.T) {
 // and the adb server with the same shim injected into it. The delay is in the server.
 //
 //   - The device answers the stat in the same millisecond it is asked, as does a real adbd.
-//   - The client writes SEND in that same millisecond, and a real device's reply arrives
-//     four milliseconds later. This mock's reply also goes out immediately.
-//   - The server receives the client's 83 bytes immediately -- its own trace shows them
-//     arriving and sitting unread -- and writes them to the device about thirty seconds
-//     later, at which point it also reports is_eof=1.
-//   - With an LD_PRELOAD shim in the server, those thirty seconds are total silence: no
-//     read, no write, not one epoll_wait. Every thread is blocked somewhere the shim does
-//     not intercept, so the shim cannot say where. It does establish that the server is not
-//     spinning and not waiting in its event loop, which is the part that was worth knowing.
+//   - The client writes SEND in that same millisecond, and on the phone the reply comes back
+//     four milliseconds later. This mock's reply also leaves immediately.
+//   - The server ingests the device's reply and flushes the client's copy of it: its trace
+//     shows enqueue 72 and flush_incoming rc=72, exactly as it does for the phone. The
+//     client has the stat reply in hand, on both.
+//   - The server then stops. Its socket to the client holds the eighty-three bytes of SEND
+//     unread, and it does not read them for about thirty seconds.
 //
+// The first shim only intercepted read, write, poll and epoll_wait, and what it showed was
+// silence: no read, no write, not one epoll_wait across those thirty seconds. That ruled out
+// a busy loop and an event-loop timeout, which were the two guesses worth ruling out.
+//
+// Intercepting more of the server's calls located it properly:
+//
+//	SHIM +  7.027 read fd=13 -> 72       # the device's stat reply, ingested
+//	SHIM +  7.029 cond_wait -> blocking  # and straight into a condition variable
+//	SHIM + 52.013 read fd=8  -> 83       # the client's SEND, only now
+//
+// So the thread that reads from the device puts the data where it belongs, flushes it, and
+// then blocks in pthread_cond_wait rather than returning to the event loop. It stays there
+// until the socket is readable anyway, some thirty seconds later, which suggests it is
+// waiting on the wrong condition or a lost wakeup rather than on data.
+//
+// What that means for this repository: everything on the device side already matches a real
+// adbd, so there is nothing here left to fix by changing the mock. The remaining work is to
+// find which adb condition variable is involved, which needs recv, send, accept and the futex
+// waits added to the shim. That is debugging a process this project does not own.
+
 // So the device behaves like a real adbd, the client behaves like a real client, and the
 // thirty seconds happen in between, in a process this repository does not own. The next
 // step is tracing the server's remaining blocking calls -- recv, send, accept and futex are
