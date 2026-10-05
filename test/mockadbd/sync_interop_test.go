@@ -30,33 +30,45 @@ func requireSync(t *testing.T) {
 // These tests push and pull against a real adb and assert on the device's filesystem.
 //
 // The transfer works and the bytes arrive. What does not work is that the adb process
-// never exits, which is why requireSync skips them rather than letting them hang. The
-// state, precisely:
+// never returns, so requireSync skips these: a test that waits for adb would hang rather
+// than fail. The state, precisely, because the narrowing took real work to reach:
 //
-//   - adb sends STA2, receives a 68-byte stat body, and then goes quiet for 15 to 25
-//     seconds before sending SEND. The device receives the SEND, writes the file, and
-//     replies DONE. The file is on the device and `adb shell cat` returns its content.
-//   - adb prints "1 file pushed, 0 skipped" -- so it considers the transfer finished --
-//     and then blocks in poll() on its socket to the adb server, forever. The server has
-//     sent the stat body and nothing more, and never sends anything else.
+//   - adb sends STA2, gets a 68-byte stat body, pauses 15 to 25 seconds, then sends SEND
+//     with the content and DONE. The device writes the file and replies. The file is on
+//     the device and `adb shell cat` returns it.
+//   - adb sends CLSE immediately after DONE, without waiting for the reply. The device
+//     replies DONE and then closes.
+//   - The adb server receives that reply -- both packets -- and never forwards it. In the
+//     server's own trace the two WRTE arrive and are logged, and there is no LS(6): enqueue
+//     for either. Nothing is sent to the client.
+//   - The client waits forever. Not on the device, whose packets it read and acknowledged,
+//     and not on the socket, which is still open: strace from birth shows
+//     poll([{fd=3, events=POLLIN}], 1, 0) = 0 (Timeout) with no syscall before it, and
+//     the process sits at 0% CPU in wait_woken, blocked rather than spinning.
 //
-// That second point is why this read as a protocol failure for so long. The file lands,
-// adb reports success, and the only symptom is a process that will not die. Nothing in the
-// wire trace shows a fault, because from the wire there is no fault.
+// So the bytes are lost between the adb server and the adb client, after the server has
+// them, because the client closed first. Nothing in the device is wrong at this point,
+// which is why it looked like a sync protocol problem for so long: from the device's side
+// there is no fault, and from the wire there is no fault. It is only visible in the
+// middle, and only in the server's own log.
 //
-// Measured with, in order of how much each one told me:
+// Measured with, in order of how much each told me:
 //
-//	MOCKADBD_TRACE=/tmp/t.log adb -s PORT push FILE REMOTE   # the device's own trace
-//	ADB_TRACE=all adb nodaemon server                         # the adb server, verbose
+//	MOCKADBD_TRACE=/tmp/t.log adb -s PORT push FILE REMOTE   # the device
+//	ADB_TRACE=all adb nodaemon server                         # the server, verbose
+//	LD_PRELOAD=shim.so adb -s PORT push FILE REMOTE           # the client's own I/O
 //	strace -e trace=network,poll adb -s PORT push FILE REMOTE # the client, from birth
 //
-// The last is the decisive one and it is one line: poll([{fd=3, events=POLLIN}], 1, 0) = 0
-// (Timeout), with no syscall before it. The client is not waiting on the device, whose
-// packets it has already read and acknowledged. It is waiting on the adb server, which has
-// nothing left to send.
+// The third is what showed the client blocking inside a read that never returned, and the
+// fourth is what showed it was not the device's socket at all. Neither ptrace nor gdb
+// attached here -- kernel.yama.ptrace_scope is 1 -- so the LD_PRELOAD shim is what made the
+// client visible without privileges.
 //
-// So what is still missing is a reply the adb server owes the client once a push is done,
-// not anything in the sync protocol.
+// Reproduce with:
+//
+//	ADB_TRACE=all adb nodaemon server 2>&1 | grep -E "from remote|enqueue"
+//
+// and watch the DONE reply arrive without an enqueue following it.
 
 // connectMock starts a mock device on a private adb server and returns its serial.
 //

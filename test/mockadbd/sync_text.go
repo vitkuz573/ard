@@ -435,9 +435,20 @@ func drainSend(s *stream, cfg Config, path string, b []byte) ([]byte, bool) {
 				return b, false
 			}
 			_ = cfg.FS.Touch(path, time.Unix(int64(binary.LittleEndian.Uint32(b[4:8])), 0))
-			// OKAY carries a length, which is zero here.
-			_ = putWord(s, okayW)
-			_ = putWord(s, 0)
+			// OKAY and its zero length go out as one write.
+			//
+			// Written separately they were two packets, and the host tears the stream
+			// down on its own CLSE as soon as it has sent DONE -- which it does without
+			// waiting for this reply. Two packets gave the host's server a chance to
+			// process the close in between and drop the reply on the floor, and a client
+			// that never sees the reply never returns from the command. One write is both
+			// what a real adbd sends and what leaves no gap to be cut in.
+			var reply [8]byte
+			binary.LittleEndian.PutUint32(reply[:4], okayW)
+			tracef("  -> %q", idString(okayW))
+			if err := s.writeRaw(reply[:]); err != nil {
+				return nil, true
+			}
 			return nil, true
 
 		default:
