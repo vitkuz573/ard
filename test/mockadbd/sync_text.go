@@ -248,25 +248,33 @@ func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	tracef("  -> %q", idString(id))
 	var b [statV2Len]byte
 	le32(b[0:], errno)
+
+	if errno != 0 {
+		// Everything else stays zero.
+		//
+		// This is what a real adbd sends, checked against one: for a path that does not
+		// exist the whole 68-byte body after the errno is zero -- dev, ino, mode, nlink,
+		// size and all three timestamps. Not "plausible values", zeros. A client decides
+		// "no such file" by mode == 0, so it needs nothing else, and it reads the rest
+		// as a stat structure it might compare against.
+		//
+		// Writing plausible values here was worse than writing nothing. dev=1, ino=1 and
+		// nlink=1 described a file that does not exist, and the timestamps came from a
+		// synthesised node whose zero time, written as seconds, is -62135596800: a
+		// client that treats it as an unsigned 64-bit second count gets a timestamp in
+		// the far future, and a push then compares a real file against it and decides
+		// something other than what it should.
+		return s.writeRaw(append(head[:], b[:]...))
+	}
+
 	le64(b[4:], 1)         // dev
 	le64(b[12:], inoOf(n)) // ino
-	mode := statMode(n.Dir, n.Mode)
-	if errno != 0 {
-		// A client decides "no such file" by mode == 0, not by reading the error field.
-		// Writing the type bits anyway reports a file that exists and has no content,
-		// and the client then waits for something that will never come.
-		mode = 0
-	}
-	le32(b[20:], mode)
+	le32(b[20:], statMode(n.Dir, n.Mode))
 	le32(b[24:], 1)                   // nlink
 	le32(b[28:], 0)                   // uid
 	le32(b[32:], 0)                   // gid
 	le64(b[36:], uint64(len(n.Data))) // size
-	// Seconds, not nanoseconds. These three are time_t on the wire, and a client that
-	// reads nanoseconds as seconds gets a timestamp thousands of years out. It matters
-	// most for the missing-file case, where the node is synthesised and carries the zero
-	// time: in nanoseconds that is a large negative number, which as an unsigned 64-bit
-	// second count is nonsense.
+	// Seconds, not nanoseconds: these three are time_t on the wire.
 	secs := uint64(n.ModTime.Unix())
 	le64(b[44:], secs) // atime
 	le64(b[52:], secs) // mtime

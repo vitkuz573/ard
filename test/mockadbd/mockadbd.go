@@ -161,7 +161,10 @@ func (c *Config) withDefaults() Config {
 	out := *c
 	if out.Banner == "" {
 		out.Banner = "device::ro.product.name=ard_mock;ro.product.model=Mock;ro.build.version.release=14;" +
-			"ro.build.type=user;features=cmd,stat_v2,shell_v2"
+			"ro.build.type=user;features=shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,apex,abb," +
+			"fixed_push_symlink_timestamp,abb_exec,remount_shell,track_app,sendrecv_v2," +
+			"sendrecv_v2_brotli,sendrecv_v2_lz4,sendrecv_v2_zstd,sendrecv_v2_dry_run_send," +
+			"openscreen_mdns,devicetracker_proto_format,devraw,app_info,server_status,track_mdns,push_sync"
 	}
 	if out.FS == nil {
 		out.FS = NewVFS()
