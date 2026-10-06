@@ -232,6 +232,54 @@ else
   bad "stdin did not round-trip (got '$OUT')"
 fi
 
+# ------------------------------------------------------------------- files
+
+step "adb push and adb pull carry a file byte for byte"
+
+# An operator's reason for wanting a gateway rather than a shell is usually a file: an APK to
+# install, a config to drop, a log to collect. So the transfer is checked on the bytes rather
+# than on adb's own report, which is printed before anything is known about what landed.
+#
+# Two sizes, because they are not the same case and only one of them is obvious. A file under
+# one sync frame travels as a single DATA frame and fits in one packet; a larger one is split,
+# and the device's frames come back 64 KiB at a time -- which is larger than the window this
+# gateway offers, so a relay that reads only what it advertised truncates the pull and says
+# nothing. A checksum on a 300 KB file is what catches that; a 14 byte file never would.
+
+PUSH_SRC="$WORK/pushed.bin"
+head -c 14 /dev/urandom > "$PUSH_SRC"
+PUSH_DST="/data/local/tmp/pushed-through-the-gateway.bin"
+if timeout 60 adb -P "$LOCALPORT" -s "$DEVICE" push "$PUSH_SRC" "$PUSH_DST" >"$WORK/push.log" 2>&1; then
+  ok "adb push reported success"
+else
+  bad "adb push failed"
+  sed 's/^/      /' "$WORK/push.log" | head -3
+fi
+
+PULL_DST="$WORK/pulled.bin"
+if timeout 60 adb -P "$LOCALPORT" -s "$DEVICE" pull "$PUSH_DST" "$PULL_DST" >"$WORK/pull.log" 2>&1 &&
+   cmp -s "$PUSH_SRC" "$PULL_DST"; then
+  ok "a small file survives push then pull unchanged"
+else
+  bad "a small file did not come back identical"
+  sed 's/^/      /' "$WORK/pull.log" | head -3
+  ls -l "$PULL_DST" 2>/dev/null | sed 's/^/      /'
+fi
+
+BIG_SRC="$WORK/pushed-big.bin"
+head -c 300000 /dev/urandom > "$BIG_SRC"
+BIG_DST="/data/local/tmp/pushed-big-through-the-gateway.bin"
+BIG_BACK="$WORK/pulled-big.bin"
+if timeout 120 adb -P "$LOCALPORT" -s "$DEVICE" push "$BIG_SRC" "$BIG_DST" >"$WORK/push-big.log" 2>&1 &&
+   timeout 120 adb -P "$LOCALPORT" -s "$DEVICE" pull "$BIG_DST" "$BIG_BACK" >"$WORK/pull-big.log" 2>&1 &&
+   cmp -s "$BIG_SRC" "$BIG_BACK"; then
+  ok "a file spanning many sync frames survives push then pull unchanged"
+else
+  bad "a large file did not come back identical"
+  sed 's/^/      /' "$WORK/push-big.log" "$WORK/pull-big.log" 2>/dev/null | head -6
+  ls -l "$BIG_BACK" 2>/dev/null | sed 's/^/      /'
+fi
+
 # ------------------------------------------------------------ authorization
 
 step "authorization is enforced on the gateway"
