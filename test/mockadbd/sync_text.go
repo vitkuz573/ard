@@ -133,6 +133,13 @@ func runSync2(cfg Config, s *stream) {
 			}
 			statV2(cfg, s, path, cmd)
 
+		case lsta1:
+			path, err := readLenString(s)
+			if err != nil {
+				return
+			}
+			statV1(cfg, s, path)
+
 		case lis2, list1:
 			path, err := readLenString(s)
 			if err != nil {
@@ -383,6 +390,29 @@ func statV2(cfg Config, s *stream, path string, id uint32) {
 		return
 	}
 	_ = writeStatV2(s, id, 0, n)
+}
+
+// statV1 answers STAT: the reply is the command word followed by three 4-byte little-endian
+// words -- mode, size and mtime -- so 16 bytes in total where STA2's reply is 72.
+//
+// It has to be one write. A client reads the sixteen bytes as one message, so a reply split
+// across two packets leaves the reader holding four bytes and waiting, which it does for as
+// long as the transfer takes to finish.
+//
+// A path that is not there is answered with the word and three zero words rather than a
+// FAIL. mode == 0 is how a client tests "not here", and that test has to have something to
+// read: a FAIL in this position is read as a stat reply whose message id is wrong, and the
+// transfer stops with a protocol fault naming a number the operator has no way to interpret.
+func statV1(cfg Config, s *stream, path string) {
+	var body [12]byte
+	if n, err := cfg.FS.Stat(path); err == nil {
+		le32(body[0:], statMode(n.Dir, n.Mode))
+		le32(body[4:], uint32(len(n.Data)))
+		le32(body[8:], uint32(n.ModTime.Unix()))
+	}
+	var head [4]byte
+	le32(head[:], lsta1)
+	_ = s.writeRaw(append(head[:], body[:]...))
 }
 
 func listV2(cfg Config, s *stream, path string) {
