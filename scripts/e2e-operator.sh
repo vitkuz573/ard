@@ -184,7 +184,7 @@ mkdir -p "$ADB_VENDOR_KEYS"
   done
 
   DEVICES="$(timeout 15 adb -P "$LOCALPORT" devices 2>/dev/null || true)"
-  printf "%s\n" "$DEVICES" | sed "s/^/      /"
+  printf '%s\n' "$DEVICES" | sed 's/^/      /'
 
   if printf "%s\n" "$DEVICES" | grep -q "^$DEVICE[[:space:]]*device"; then
     ok "adb sees the device through the operator port, by asking"
@@ -204,8 +204,6 @@ if [[ "$WHO" == "shell" ]]; then
   ok "adb shell whoami returned: $WHO"
 else
   bad "adb shell produced '$WHO', want 'shell'"
-  printf 'raw bytes: '
-  timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell whoami 2>/dev/null | od -An -c | head -2
 fi
 
 timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell false >/dev/null 2>&1 || rc=$?
@@ -242,42 +240,96 @@ step "authorization is enforced on the gateway"
 # A role without shell must not get the bridge, whatever the client asks for.
 "$WORK/bin/ard-ca" operator -dir "$PKI" -name bob >/dev/null 2>&1
 BADPORT=$(( LOCALPORT + 40 ))
-timeout 20 "$WORK/bin/ard-connect" \
+"$WORK/bin/ard-connect" \
   -gateway "127.0.0.1:$OPPORT" \
   -ca "$PKI/server/ca.crt" \
   -cert "$PKI/operators/leaves/bob.crt" \
   -key "$PKI/operators/leaves/bob.key" \
   -listen "127.0.0.1:$BADPORT" \
-  >"$WORK/connect-bob.log" 2>&1 || true
+  >"$WORK/connect-bob.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 60); do
+  grep -q "publishing the adb port" "$WORK/connect-bob.log" 2>/dev/null && break
+  sleep 0.25
+done
 
-# Bob holds logcat on this device and is deliberately not given shell.
-#
-# He must be told the device exists -- a denial with no explanation is impossible to act
-# on -- but he must not be handed an adb serial for it. Publishing one would let
-# `adb connect` succeed and every command fail, which reads as a broken device rather than
-# as policy.
-if timeout 25 "$WORK/bin/ard-connect" -gateway "127.0.0.1:$OPPORT" \
-     -ca "$PKI/server/ca.crt" \
-     -cert "$PKI/operators/leaves/bob.crt" \
-     -key "$PKI/operators/leaves/bob.key" \
-     -listen "127.0.0.1:$BADPORT" \
-     >"$WORK/connect-bob.log" 2>&1; then
-  bad "a logcat-only operator was given something to run"
+# Bob's client publishes a port, exactly as alice's does, and that is the design rather than a
+# gap: the client does not know which devices exist and deliberately does not ask. It cannot
+# decide who may drive what -- the gateway holds that policy -- so a client-side refusal would
+# mean the client had a copy of it, and two copies of an authorization policy is one too many.
+# The refusal therefore happens where the decision is made, at the transport request.
+if grep -q "publishing the adb port" "$WORK/connect-bob.log" 2>/dev/null; then
+  ok "bob's client publishes a port; it holds no device list to decide from"
 else
-  ok "a logcat-only operator is refused before any port is published"
+  bad "bob's client did not publish a port, so the checks below would prove nothing"
+  sed 's/^/      /' "$WORK/connect-bob.log" | head -5
+  exit 1
 fi
 
-if grep -qiE "can see .*but the .* role does not permit driving" "$WORK/connect-bob.log"; then
-  ok "the refusal names the device and the role, so it is actionable"
+adb kill-server >/dev/null 2>&1 || true
+export ADB_VENDOR_KEYS="$WORK/adbkeys"
+for _ in $(seq 1 40); do
+  timeout 15 adb -P "$BADPORT" devices >/dev/null 2>&1 && break
+  sleep 0.25
+done
+
+# Bob holds logcat on this device and is deliberately not given shell. So he must be told the
+# device exists -- a denial with no explanation is impossible to act on -- and he must not be
+# able to open a transport to it. The distinction is that the device is visible in the listing
+# and the refusal comes when he tries to use it, which is where the policy is.
+BOBDEVICES="$(timeout 15 adb -P "$BADPORT" devices 2>/dev/null || true)"
+printf "%s\n" "$BOBDEVICES" | sed 's/^/      /'
+
+if printf "%s\n" "$BOBDEVICES" | grep -q "^$DEVICE[[:space:]]*device"; then
+  ok "an entitled read-only operator is told the device exists"
+else
+  bad "the device is hidden from an operator whose role holds logcat on it"
+fi
+
+# Now the refusal. adb prints the gateway's FAIL message on stderr, so that is where the reason
+# has to appear: this is the operator's own terminal, and it is the only thing they will read.
+#
+# It used to be asserted against the operator client's own log, and that was checking a design
+# this no longer has -- the client used to be told the device list and refused before
+# publishing. It also passed for the wrong reason: the check ran the client under `timeout`, and
+# `timeout` kills a long-running process with exit 124, which the test read as a refusal. An
+# operator with shell hit exactly the same result. A check that cannot fail is not a check.
+BOBOUT="$(timeout 25 adb -P "$BADPORT" -s "$DEVICE" shell whoami 2>&1 || true)"
+printf '%s\n' "$BOBOUT" | sed 's/^/      /'
+
+# The message names a refusal, so the check is on the outcome -- a shell ran or it did not --
+# rather than on the presence of a string. An operator whose role grants shell would otherwise
+# satisfy a grep for "may not attach" if any other part of the output ever said it, and the
+# check would pass while the thing it exists to catch went unnoticed.
+if printf '%s\n' "$BOBOUT" | grep -q "^shell$"; then
+  bad "a logcat-only operator got a shell session"
+else
+  ok "a logcat-only operator is refused a shell session"
+fi
+
+# And no session came back that could be mistaken for one: the output has to be the refusal
+# alone, with nothing the device produced on it.
+if printf '%s\n' "$BOBOUT" | grep -q "may not attach"; then
+  ok "the gateway's reason reached the operator's own terminal"
+else
+  bad "the refusal did not reach adb's stderr, so the operator sees only a failure"
+fi
+
+# The refusal has to explain itself: it must name the device, the role and the permission that
+# is missing. Any one of the three alone leaves the reader guessing, and the operator's next
+# question is always "what do I need to ask for".
+if printf '%s\n' "$BOBOUT" | grep -q "$DEVICE" &&
+   printf '%s\n' "$BOBOUT" | grep -q "observer" &&
+   printf '%s\n' "$BOBOUT" | grep -q "shell"; then
+  ok "the refusal names the device, the role and the missing permission"
 else
   bad "the refusal does not explain itself"
-  sed 's/^/      /' "$WORK/connect-bob.log" | head -5
 fi
 
-# The gateway agreed, independently of what the client decided: it identified bob and
-# marked the device not bridgeable, so no attach was ever attempted. What must NOT appear
-# is a stream being opened for him -- a read-only operator getting device access would be
-# the whole failure this test exists to catch.
+# The gateway agreed, independently of what the client decided: it identified bob and marked
+# the device not bridgeable, so no attach was ever attempted. What must NOT appear is a stream
+# being opened for him -- a read-only operator getting device access would be the whole failure
+# this test exists to catch.
 if grep -q '"actor":"bob"' "$WORK/audit.log" 2>/dev/null; then
   ok "the gateway identified the read-only operator"
 else
@@ -290,12 +342,14 @@ else
   ok "no stream was opened for the read-only operator"
 fi
 
-# The gateway must have logged the refusal, because a silent deny is indistinguishable
-# from a broken client.
-if grep -q "attach_denied\|operator.connected" "$WORK/audit.log" 2>/dev/null; then
-  ok "the gateway audited the operator"
+# And the refusal itself has to be in the gateway's log, not only in the client's terminal: an
+# operator who cannot see the reason needs an administrator who can, and the administrator reads
+# this file.
+if grep -q "may not attach" "$WORK/server.log" 2>/dev/null; then
+  ok "the gateway logged the refusal and its reason"
 else
-  bad "no audit record for the operator"
+  bad "the gateway did not log why it refused the read-only operator"
+  grep -i bob "$WORK/server.log" | sed 's/^/      /' | head -3
 fi
 
 adb kill-server >/dev/null 2>&1 || true
@@ -311,11 +365,4 @@ fi
 printf '\033[31m%d of %d checks failed\033[0m\n' "$FAIL" "$((PASS+FAIL))"
 exit 1
 
-# Diagnostics: ARD_DEBUG_LOG=1 dumps both logs when something failed, which is the
-# difference between debugging and guessing.
-if [[ "${ARD_DEBUG_LOG:-0}" != "0" ]]; then
-  echo "--- server.log ---"
-  tail -30 "$WORK/server.log" 2>/dev/null
-  echo "--- proxy.log ---"
-  tail -10 "$WORK/proxy.log" 2>/dev/null
-fi
+
