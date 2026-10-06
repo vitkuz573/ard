@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -189,6 +190,56 @@ func TestHostFeaturesClaimsOnlyWhatItImplements(t *testing.T) {
 	}
 }
 
+// `adb get-state` asks the server rather than opening a transport. It was unimplemented and
+// failed with "unknown service" on every device, which reads as a broken gateway rather than as
+// a missing command. The exact replies, captured from the stock server:
+//
+//	host-serial:SERIAL:get-state  -> OKAY 0006 "device"    (attached)
+//	host-serial:other:get-state   -> OKAY 0007 "offline"   (entitled, not attached)
+//	host-serial:nope:get-state    -> FAIL 0017 "device 'nope' not found"
+func TestHostSerialGetStateAnswersFromTheRegistry(t *testing.T) {
+	s := New(fakeFilter{
+		allowed:   map[string]bool{"AAA": true, "BBB": true},
+		connected: map[string]bool{"AAA": true},
+	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, nil)
+
+	// AAA is attached, BBB is entitled but not attached. One message per case so a FAIL is
+	// distinguishable from a state, which is the whole point of the command.
+	for _, tc := range []struct{ service, want string }{
+		{"host-serial:AAA:get-state", "OKAY0006device"},
+		{"host-serial:BBB:get-state", "OKAY0007offline"},
+		{"host-serial:SECRET:get-state", "FAIL0019device 'SECRET' not found"},
+	} {
+		if got := serveOne(t, s, tc.service); got != tc.want {
+			t.Errorf("%s reply = %q (% x), want %q", tc.service, got, got, tc.want)
+		}
+	}
+}
+
+// An adb serial over TCP is host:port, so the serial contains a colon. Splitting on the first
+// colon truncates it and the device stops being found.
+func TestSerialWithAColonSurvivesHostSerialRequests(t *testing.T) {
+	s := New(fakeFilter{
+		allowed:   map[string]bool{"127.0.0.1:5555": true},
+		connected: map[string]bool{"127.0.0.1:5555": true},
+	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, nil)
+	if got := serveOne(t, s, "host-serial:127.0.0.1:5555:get-state"); got != "OKAY0006device" {
+		t.Errorf("reply = %q (% x), want \"OKAY0006device\"", got, got)
+	}
+}
+
+// An action this server does not implement is refused by name rather than falling through to
+// the generic unknown-service message, which would blame the request the operator never made.
+func TestUnknownHostSerialActionIsRefusedByName(t *testing.T) {
+	got := serveOne(t, testServer(), "host-serial:AAA:sync-something")
+	if !strings.HasPrefix(got, "FAIL") {
+		t.Fatalf("reply %q is not a FAIL", got)
+	}
+	if !strings.Contains(got, "sync-something") {
+		t.Errorf("FAIL %q does not name the action that was refused", got)
+	}
+}
+
 func TestHostDevicesListsOnlyEntitledSerials(t *testing.T) {
 	got := serveOne(t, testServer(), "host:devices")
 	if !strings.HasPrefix(got, "OKAY") {
@@ -232,14 +283,40 @@ func TestUnknownServiceFailsRatherThanHanging(t *testing.T) {
 	}
 }
 
-func TestFailReplyCarriesAMessage(t *testing.T) {
+// A refusal has to reach the operator as a sentence. The exact wire form is captured from the
+// stock server:
+//
+//	host:tport:serial:nope -> FAIL 0017 "device 'nope' not found"
+//
+// One four-digit length, then the message. A second length inside it is not a variant adb
+// tolerates: adb reads the four digits after FAIL as the message length, reads that many bytes
+// and prints them, so the digits of a misplaced length appear in the middle of the sentence an
+// operator is trying to read:
+//
+//	error: 0052operator "bob" may not attach to "dev-a": role "observer" lacks permission "shell"
+func TestFailReplyIsTheMessageAndNothingElse(t *testing.T) {
+	msg := fmt.Sprintf("device '%s' not found", "nope")
+	got := serveOne(t, testServer(), "host:tport:serial:nope")
+	want := "FAIL" + fmt.Sprintf("%04x", len(msg)) + msg
+	if got != want {
+		t.Errorf("reply = %q (% x), want %q (% x)", got, got, want, want)
+	}
+}
+
+// Whatever the reason, a refusal names the device it is about, so an operator can tell which of
+// their devices is the one that was stopped.
+func TestFailReplyNamesTheDevice(t *testing.T) {
 	got := serveOne(t, testServer(), "host:transport:SECRET")
-	// FAIL, total length, message length, message.
-	if len(got) < 12 {
+	// FAIL, four digits of length, then the message and nothing after it.
+	if len(got) < 8 {
 		t.Fatalf("FAIL reply too short to carry a message: %q", got)
 	}
-	if !strings.Contains(got, "SECRET") {
-		t.Errorf("FAIL %q does not name the device it refused, so an operator cannot tell why", got)
+	msg := got[8:]
+	if !strings.Contains(msg, "SECRET") {
+		t.Errorf("FAIL %q does not name the device it refused, so an operator cannot tell why", msg)
+	}
+	if n, err := strconv.ParseUint(got[4:8], 16, 32); err != nil || int(n) != len(msg) {
+		t.Errorf("FAIL length says %q for a %d byte message; adb would print the wrong bytes", got[4:8], len(msg))
 	}
 }
 

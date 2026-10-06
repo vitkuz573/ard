@@ -141,9 +141,6 @@ func (s *Server) Serve(c net.Conn) error {
 		return err
 	}
 	becameTransport, err := s.dispatch(c, req)
-	if err != nil {
-		s.debugf("adbserverproto: %q: %v", req, err)
-	}
 	if becameTransport {
 		// Hand over whatever the reader already holds, ahead of anything still in the
 		// socket, or those bytes are read by nobody.
@@ -160,9 +157,9 @@ func (s *Server) Serve(c net.Conn) error {
 // dispatch answers one request. It reports true when the connection has become a device
 // transport and the caller must stop speaking this protocol.
 func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
-	// Every request is logged, not just the ones that fail. A client that hangs sends
-	// nothing and gets nothing, and the only way to tell "it never asked" from "it asked
-	// and was refused" is a line saying which request arrived.
+	// Every request is logged, not just the ones that fail. adb opens one connection per
+	// request, so "it asked and was refused" and "it never asked" produce identical silence
+	// in a log that records only failures -- and the second is the interesting one.
 	s.debugf("adbserverproto: request %q", req)
 
 	switch {
@@ -207,17 +204,43 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 	case req == "host:devices", req == "host:devices-l":
 		return false, s.replyValue(c, s.deviceList())
 
-	case strings.HasPrefix(req, "host-serial:") && strings.HasSuffix(req, ":features"):
-		serial := serialBetween(req, "host-serial:", ":features")
-		if serial == "" || !s.filter.Allows(serial) {
-			return false, writeFail(c, fmt.Sprintf("unknown device %q", serial))
+	case strings.HasPrefix(req, "host-serial:"):
+		serial, action := splitSerialAction(req)
+		switch {
+		case action == "features":
+			if !s.allowed(serial) {
+				return false, writeFail(c, deviceNotFound(serial))
+			}
+			// The same list as host:features, which is what the stock server answers:
+			// measured, `host-serial:SERIAL:features` on a connected device returns the
+			// identical 253 bytes as `host:features`. adb asks this one per device while it
+			// builds its transport cache, so answering it with something else means the shell
+			// v2 upgrade is decided by whichever of the two adb happens to read first.
+			return false, s.replyValue(c, featureReply)
+
+		case action == "get-state":
+			// `adb get-state` asks the server what it thinks the device's state is, and does
+			// not open a transport to find out. Captured from the stock server:
+			//
+			//	host-serial:SERIAL:get-state -> OKAY 0006 "device"
+			//
+			// It is answered from the registry rather than by asking the device, because the
+			// registry is already the authority on liveness -- the same source the listing
+			// uses, so `adb get-state` and `adb devices` cannot disagree. This was missing and
+			// `adb get-state` failed with "unknown service" on every device, which reads as a
+			// broken gateway rather than as a missing command.
+			if !s.allowed(serial) {
+				return false, writeFail(c, deviceNotFound(serial))
+			}
+			state := "offline"
+			if s.filter != nil && s.filter.Connected(serial) {
+				state = "device"
+			}
+			return false, s.replyValue(c, state)
+
+		default:
+			return false, writeFail(c, fmt.Sprintf("unknown host service %s", quote(action)))
 		}
-		// The same list as host:features, which is what the stock server answers: measured,
-		// `host-serial:SERIAL:features` on a connected device returns the identical 253
-		// bytes as `host:features`. adb asks this one per device while it builds its
-		// transport cache, so answering it with something else means the shell v2 upgrade
-		// is decided by whichever of the two adb happens to read first.
-		return false, s.replyValue(c, featureReply)
 
 	case strings.HasPrefix(req, "host:tport:serial:"):
 		serial := strings.TrimPrefix(req, "host:tport:serial:")
@@ -226,7 +249,7 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 	case strings.HasPrefix(req, "host:transport:"):
 		serial := strings.TrimPrefix(req, "host:transport:")
 		if !s.allowed(serial) {
-			return false, writeFail(c, fmt.Sprintf("unknown device %q", serial))
+			return false, writeFail(c, deviceNotFound(serial))
 		}
 		// Answer OKAY and make this connection the transport, which is what a client that
 		// asked for this expects to follow.
@@ -244,8 +267,43 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 		return false, writeFail(c, "adb connect is not supported by this gateway")
 
 	default:
-		return false, writeFail(c, "unknown service "+quote(req))
+		// The stock server's wording, captured for an undefined request:
+		//
+		//	host:bogus -> FAIL 001c "unknown host service 'bogus'"
+		//
+		// Naming the request back is what makes this actionable. The message is the only
+		// thing adb prints, so a refusal that does not say which service was refused leaves
+		// the reader to guess.
+		return false, writeFail(c, "unknown host service "+quote(req))
 	}
+}
+
+// deviceNotFound is how the stock server refuses a serial, whatever asked for it. Captured:
+//
+//	host:tport:serial:nope   -> FAIL 0017 "device 'nope' not found"
+//	host:transport:nope      -> FAIL 0017 "device 'nope' not found"
+//	host-serial:nope:...     -> FAIL 0017 "device 'nope' not found"
+//
+// One message for all three, and the same for an operator who is not entitled to the device as
+// for one that does not exist. That is deliberate: a refusal that distinguished the two would
+// tell an operator probing for serials which of them exist. The registry has no reason to
+// publish that, and a FAIL is not the place to leak it.
+func deviceNotFound(serial string) string {
+	return fmt.Sprintf("device '%s' not found", serial)
+}
+
+// splitSerialAction splits "host-serial:SERIAL:ACTION" into its two halves.
+//
+// The serial is everything between the prefix and the last colon, because a serial may contain
+// a colon -- an adb serial over TCP is host:port -- and splitting on the first one would
+// truncate it.
+func splitSerialAction(req string) (serial, action string) {
+	rest := strings.TrimPrefix(req, "host-serial:")
+	i := strings.LastIndexByte(rest, ':')
+	if i < 0 {
+		return rest, ""
+	}
+	return rest[:i], rest[i+1:]
 }
 
 // beginTransport answers a tport request. On success the connection is the device's
@@ -267,26 +325,24 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 // A transport id of 1 is what the stock server hands out for a switched socket and adb echoes
 // whatever it is given, so the number itself does not have to be unique here.
 func (s *Server) beginTransport(c net.Conn, serial string, smartSocket bool) (bool, error) {
-	if serial == "" || !s.allowed(serial) {
-		return false, writeFail(c, fmt.Sprintf("unknown device %q", serial))
+	if !s.allowed(serial) {
+		return false, writeFail(c, deviceNotFound(serial))
 	}
-	s.debugf("adbserverproto: opening a transport to %q (smart socket: %t)", serial, smartSocket)
 	dev, err := s.open(serial)
 	if err != nil {
-		s.debugf("adbserverproto: open %q failed: %v", serial, err)
+		// Logged rather than only returned. The FAIL carries the reason to the operator, which
+		// is the audience that matters, but an operator who cannot see it needs someone who can
+		// -- and the gateway's log is where that person looks. Without this line a refusal is
+		// visible only to the client that was refused, and disappears with it.
+		s.debugf("adbserverproto: refusing a transport to %q: %v", serial, err)
 		return false, writeFail(c, err.Error())
 	}
-	s.debugf("adbserverproto: transport to %q is open, answering OKAY", serial)
 	// OKAY has to reach the client before the relay starts, or the two sides interleave
 	// CNXN with a reply and the device sees rubbish.
 	if err := s.writeTransportOKAY(c, smartSocket); err != nil {
 		dev.Close()
 		return false, err
 	}
-	// From here the connection is the transport: a half-close on the client side is how a
-	// device signals end of input, so copying until either side errors rather than to
-	// EOF is what keeps `adb shell cat` working.
-	s.debugf("adbserverproto: relaying to %q with %d buffered byte(s)", serial, len(s.relayPrefix))
 	if smartSocket {
 		// A switched transport is not a raw relay: the client sends a service request and
 		// expects the server to have opened the stream already. See serveHostService.
@@ -294,7 +350,6 @@ func (s *Server) beginTransport(c net.Conn, serial string, smartSocket bool) (bo
 	} else {
 		err = s.relay(c, dev, s.relayPrefix)
 	}
-	s.debugf("adbserverproto: relay to %q ended: %v", serial, err)
 	dev.Close()
 	if err != nil && err != io.EOF {
 		return true, err
@@ -334,13 +389,6 @@ func (s *Server) devices() []string {
 		return lister.Serials()
 	}
 	return nil
-}
-
-func serialBetween(s, prefix, suffix string) string {
-	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
-		return ""
-	}
-	return s[len(prefix) : len(s)-len(suffix)]
 }
 
 func quote(s string) string {
@@ -401,7 +449,6 @@ func (s *Server) writeTransportOKAY(w io.Writer, smartSocket bool) error {
 	if smartSocket {
 		reply = append(reply, 1, 0, 0, 0, 0, 0, 0, 0)
 	}
-	s.debugf("adbserverproto: transport reply %q (%d bytes)", reply, len(reply))
 	_, err := w.Write(reply)
 	return err
 }
@@ -422,13 +469,28 @@ func (s *Server) replyValue(w io.Writer, value string) error {
 
 // writeFail sends FAIL and a message. The message is what an operator sees, so it says what
 // went wrong rather than that something did.
+//
+// Captured from the stock server, for three refusals:
+//
+//	host:tport:serial:nope -> FAIL 0017 "device 'nope' not found"
+//	host:transport:nope    -> FAIL 0017 "device 'nope' not found"
+//	host:bogus             -> FAIL 001c "unknown host service 'bogus'"
+//
+// One four-digit length and then the message, with no length inside that. The inner length
+// this used to write is not a variant adb tolerates: it decodes the four digits after FAIL as
+// the message's length, reads that many bytes, and prints what it got -- which is why a
+// refusal reached the operator as
+//
+//	error: 0052operator "bob" may not attach to "dev-a": role "observer" lacks ...
+//
+// with the digits of the misplaced length welded to the front of the sentence. A refusal is
+// read by a person trying to work out why they were stopped, so it has to be the sentence.
 func writeFail(w io.Writer, msg string) error {
 	if len(msg) > 0xffff {
 		msg = msg[:0xffff]
 	}
-	buf := make([]byte, 0, 8+len(msg))
+	buf := make([]byte, 0, 4+len(msg))
 	buf = append(buf, failToken...)
-	buf = append(buf, []byte(fmt.Sprintf("%04x", 4+len(msg)))...)
 	buf = append(buf, []byte(fmt.Sprintf("%04x", len(msg)))...)
 	buf = append(buf, msg...)
 	_, err := w.Write(buf)
@@ -452,22 +514,6 @@ func (s *Server) relay(a, b net.Conn, prefix []byte) error {
 		errc <- err
 	}()
 	go func() {
-		// The first thing after OKAY decides everything, so it is logged by name. adb
-		// is supposed to send CNXN here; a client that sends nothing, or something else,
-		// is a fact worth having rather than a hang to reason about.
-		first := make([]byte, 64)
-		n, rerr := a.Read(first)
-		if n > 0 {
-			s.debugf("adbserverproto: client sent %d byte(s) after OKAY: %q", n, first[:n])
-			if _, werr := b.Write(first[:n]); werr != nil {
-				errc <- werr
-				return
-			}
-		}
-		if rerr != nil {
-			errc <- rerr
-			return
-		}
 		_, err := io.Copy(b, a)
 		errc <- err
 	}()
