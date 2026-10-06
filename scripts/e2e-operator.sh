@@ -191,6 +191,61 @@ mkdir -p "$ADB_VENDOR_KEYS"
     exit 1
   fi
 adb kill-server >/dev/null 2>&1 || true
+
+# ------------------------------------------------------------------ features
+
+step "adb is told what the device supports, from the device"
+
+# adb reads this before it decides anything, and it decides the spelling of every command it
+# sends. A server that answers from its own opinion puts the client on a path the device cannot
+# serve, and the failure surfaces much later as a protocol fault on the device rather than as a
+# refusal here. So the answer has to come from the device's own banner, and the check is that
+# the bytes adb received are the device's list rather than a plausible one.
+#
+# The request is written by hand rather than asked of adb, because there is no adb command that
+# prints it: this is the server protocol adb speaks on the operator's behalf.
+#
+# A connection per request, which is what adb does -- it opens a fresh connection for each host
+# service request -- and a second request on one connection is answered with silence and a
+# close. Asking both questions on one socket would measure that instead of the answers.
+FEATURES_RAW="$(timeout 15 python3 -c "
+import socket
+
+def ask(req):
+    s = socket.create_connection(('127.0.0.1', $LOCALPORT), 5)
+    s.settimeout(10)
+    try:
+        s.sendall(b'%04x' % len(req) + req)
+        tok = s.recv(4)
+        n = int(s.recv(4), 16)
+        body = b''
+        while len(body) < n:
+            body += s.recv(n - len(body))
+        print(tok.decode(), body.decode())
+    finally:
+        s.close()
+
+ask(b'host:features')
+ask(b'host-serial:$DEVICE:features')
+" 2>&1 || true)"
+printf '%s\n' "$FEATURES_RAW" | sed 's/^/      /'
+
+# The mock's banner lists ls_v2, which is what makes a directory push work, and it does not
+# list sendrecv_v2_brotli, which adb would then compress a large push with. Both halves are
+# checked: a list carrying everything would break a push, and a list carrying nothing would
+# break every command.
+if printf '%s\n' "$FEATURES_RAW" | grep -q "ls_v2"; then
+  ok "adb's feature answer carries what the device's own banner said"
+else
+  bad "adb's feature answer does not carry the device's own list"
+fi
+
+if printf '%s\n' "$FEATURES_RAW" | grep -q "sendrecv_v2_brotli"; then
+  bad "adb was told the device supports a compression the device does not implement"
+else
+  ok "adb is not told the device supports anything it does not"
+fi
+
 # The real assertion: the transport is transparent in both directions.
 #
 # Only commands mockadbd implements are used here. It answers whoami, get-state, cat,
@@ -278,6 +333,177 @@ else
   bad "a large file did not come back identical"
   sed 's/^/      /' "$WORK/push-big.log" "$WORK/pull-big.log" 2>/dev/null | head -6
   ls -l "$BIG_BACK" 2>/dev/null | sed 's/^/      /'
+fi
+
+# ------------------------------------------------------------ directories
+
+step "a directory survives push and pull through the gateway"
+
+# A directory is the case an operator actually has -- an APK, a config tree, a set of logs --
+# and it is not a bigger single file. adb asks the device what the directory contains before
+# it sends anything, so the whole path depends on the device's listing being answered in the
+# shape this adb build reads. A gateway that moves bytes but gets the listing wrong pushes a
+# single file with the directory's name and reports success.
+PUSHDIR="$WORK/dir-to-push"
+mkdir -p "$PUSHDIR/nested"
+printf 'first file'  > "$PUSHDIR/one.txt"
+printf 'second file' > "$PUSHDIR/nested/two.txt"
+# A file big enough to span more than one sync frame, so the pull inside the directory is not
+# passing because everything fits in a single packet.
+head -c 200000 /dev/urandom > "$PUSHDIR/nested/three.bin"
+
+DIRDST="/data/local/tmp/dir-through-the-gateway"
+if timeout 120 adb -P "$LOCALPORT" -s "$DEVICE" push "$PUSHDIR" "$DIRDST" >"$WORK/push-dir.log" 2>&1; then
+  ok "adb push reported success for a directory"
+else
+  bad "adb push failed for a directory"
+  sed 's/^/      /' "$WORK/push-dir.log" | head -3
+fi
+
+DIRBACK="$WORK/dir-pulled-back"
+rm -rf "$DIRBACK"
+if timeout 120 adb -P "$LOCALPORT" -s "$DEVICE" pull "$DIRDST" "$DIRBACK" >"$WORK/pull-dir.log" 2>&1; then
+  ok "adb pull reported success for a directory"
+else
+  bad "adb pull failed for a directory"
+  sed 's/^/      /' "$WORK/pull-dir.log" | head -3
+fi
+
+# Compared on the bytes and on the shape, because a pull that returns one file and reports
+# success is exactly what a broken listing looks like. adb prints "N files pulled" whatever it
+# actually did, so the count in its own output is not the assertion.
+if [[ "$(cat "$DIRBACK/one.txt" 2>/dev/null)" == "first file" ]] &&
+   [[ "$(cat "$DIRBACK/nested/two.txt" 2>/dev/null)" == "second file" ]] &&
+   cmp -s "$PUSHDIR/nested/three.bin" "$DIRBACK/nested/three.bin"; then
+  ok "every file in the directory came back, including a nested one spanning many frames"
+else
+  bad "the directory did not come back intact"
+  find "$DIRBACK" -type f 2>/dev/null | sort | sed 's/^/      /'
+fi
+
+# ----------------------------------------------------------- port forwarding
+
+step "adb forward and adb reverse carry bytes to the other end"
+
+# Both directions are checked on the bytes, for the same reason as the files above: each of
+# these commands reports success when it has bound a port and nothing more. What has to work
+# is what happens when something connects to a bound port.
+#
+# The asymmetry is the point of the two checks. `adb forward` binds a port on the machine
+# running the adb binary's server -- here, the gateway -- and reaches the device through it.
+# `adb reverse` binds a port on the device and reaches the gateway through it. So each needs
+# an echo server on the far side, and a forward and a reverse that both "succeeded" while
+# carrying nothing are the failure this section exists to catch.
+
+# One echo server per direction. The device's own loopback is where a forward lands, and the
+# gateway's loopback is where a reverse lands; on this one machine they are the same address,
+# which is why the two checks are separate rather than one check that reuses a result.
+cat > "$WORK/echo.py" <<'PYEOF'
+import socket, sys, threading
+port = int(sys.argv[1])
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(8)
+print("listening", port, flush=True)
+def handle(c):
+    try:
+        while True:
+            b = c.recv(4096)
+            if not b:
+                break
+            c.sendall(b"echo:" + b)
+    except OSError:
+        pass
+    finally:
+        c.close()
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+
+FWD_PORT=$(( 37000 + RANDOM % 1000 ))
+python3 "$WORK/echo.py" "$FWD_PORT" >"$WORK/echo-fwd.log" 2>&1 &
+PIDS+=($!)
+REV_PORT=$(( 38500 + RANDOM % 1000 ))
+python3 "$WORK/echo.py" "$REV_PORT" >"$WORK/echo-rev.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 40); do
+  [[ -s "$WORK/echo-fwd.log" && -s "$WORK/echo-rev.log" ]] && break
+  sleep 0.25
+done
+
+# adb forward: bind here, land on the device.
+FWD_LOCAL=$(( 40000 + RANDOM % 1000 ))
+if timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward "tcp:$FWD_LOCAL" "tcp:$FWD_PORT" 2>&1; then
+  ok "adb forward bound a port on the gateway"
+else
+  bad "adb forward failed"
+fi
+
+# The listing is adb's own report that the forward exists, and it is checked separately from the
+# round trip: a forward that is bound but leads nowhere lists correctly and carries nothing.
+FWDLIST="$(timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward --list 2>&1 || true)"
+printf '%s\n' "$FWDLIST" | sed 's/^/      /'
+if printf '%s\n' "$FWDLIST" | grep -q "tcp:$FWD_LOCAL" && printf '%s\n' "$FWDLIST" | grep -q "tcp:$FWD_PORT"; then
+  ok "adb forward --list reports the bound port and where it leads"
+else
+  bad "adb forward --list does not report the forward"
+fi
+
+FWD_OUT="$(timeout 30 python3 -c "
+import socket
+c = socket.create_connection(('127.0.0.1', $FWD_LOCAL), 5)
+c.sendall(b'through-the-forward')
+c.settimeout(10)
+print(c.recv(256).decode(), end='')
+c.close()
+" 2>&1 || true)"
+printf '%s\n' "$FWD_OUT" | sed 's/^/      /'
+if [[ "$FWD_OUT" == "echo:through-the-forward" ]]; then
+  ok "a connection to the forwarded port reached the device and came back"
+else
+  bad "the forwarded port carried nothing"
+fi
+
+# adb reverse: bind on the device, land on the gateway.
+REV_REMOTE=$(( 41500 + RANDOM % 1000 ))
+if timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" reverse "tcp:$REV_REMOTE" "tcp:$REV_PORT" 2>&1; then
+  ok "adb reverse bound a port on the device"
+else
+  bad "adb reverse failed"
+fi
+
+REV_OUT="$(timeout 30 python3 -c "
+import socket
+c = socket.create_connection(('127.0.0.1', $REV_REMOTE), 5)
+c.sendall(b'through-the-reverse')
+c.settimeout(10)
+print(c.recv(256).decode(), end='')
+c.close()
+" 2>&1 || true)"
+printf '%s\n' "$REV_OUT" | sed 's/^/      /'
+if [[ "$REV_OUT" == "echo:through-the-reverse" ]]; then
+  ok "a connection to the reversed port reached the gateway and came back"
+else
+  bad "the reversed port carried nothing"
+fi
+
+# Both are released, and the removal is what proves the ports were this gateway's rather than
+# something left behind by a previous run of this script.
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward --remove "tcp:$FWD_LOCAL" >/dev/null 2>&1 || true
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" reverse --remove "tcp:$REV_REMOTE" >/dev/null 2>&1 || true
+if python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('127.0.0.1', $FWD_LOCAL), 2).close()
+except OSError:
+    sys.exit(0)
+sys.exit(1)
+"; then
+  ok "the forward was released and its port is no longer accepting"
+else
+  bad "the forward's port is still bound after --remove"
 fi
 
 # ------------------------------------------------------------ authorization
