@@ -56,7 +56,7 @@ func testGateway(t *testing.T) *gateway {
 		t.Fatalf("load policy: %v", err)
 	}
 
-	reg, err := registry.New([]string{deviceA, deviceC}, 15000, nil)
+	reg, err := registry.New([]string{deviceA, deviceC}, nil)
 	if err != nil {
 		t.Fatalf("registry: %v", err)
 	}

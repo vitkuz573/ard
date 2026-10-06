@@ -2,12 +2,14 @@
 //
 // Topology, and why it is shaped this way:
 //
-//	ard-agent (device)  --dials out-->  ard-server (gateway)  <--dials in--  ard-proxy
+//	ard-agent (device)  --dials out-->  ard-server (gateway)  <--dials in--  ard-connect
 //
 // The device always initiates. It sits behind NAT in practice, often behind
 // carrier-grade NAT, so nothing on the gateway can reach it. That single fact
 // determines the design: the gateway holds one inbound connection per device and
 // multiplexes operator streams over it rather than connecting out per request.
+// The operator side dials in on a separate listener and is not multiplexed by this
+// package: it speaks adb's own protocol, and each of its connections is one of its own.
 //
 // One TLS connection per device carries every stream, so a device with twenty
 // concurrent operator sessions still costs one TCP connection and one certificate
@@ -177,28 +179,4 @@ func encodeMeta(meta any) (json.RawMessage, error) {
 		return nil, err
 	}
 	return json.RawMessage(b), nil
-}
-
-// Pump copies bidirectionally and returns once both directions finish.
-//
-// Waiting for both matters: returning on the first would truncate the stream while
-// the other side is still flushing, which for ADB means losing the tail of output
-// or the last bytes of a push.
-func Pump(a, b io.ReadWriteCloser) error {
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(a, b)
-		if cw, ok := a.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(b, a)
-		if cw, ok := b.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-		errc <- err
-	}()
-	return <-errc
 }

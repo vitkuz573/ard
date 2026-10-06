@@ -242,7 +242,7 @@ func (g *gateway) handleOperator(ctx context.Context, raw net.Conn, tlsCfg *tls.
 	return nil
 }
 
-// serveControl serves ard-proxy over a unix socket.
+// serveControl serves the enrolment control socket.
 //
 // This is deliberately not exposed on TCP. A loopback TCP port is reachable by
 // every local process, whereas socket permissions confine it to the gateway group.
@@ -274,12 +274,6 @@ func (g *gateway) handleControl(ctx context.Context, conn net.Conn) {
 	// the actor recorded in the audit log is the component name rather than a
 	// connection identity.
 	switch req.Op {
-	case "list":
-		// The proxy needs ports even for devices that are enrolled but offline, so
-		// it can hold the mapping stable instead of renumbering on every reconnect.
-		_ = writeJSON(conn, listResponse{Devices: g.reg.List()})
-	case "attach":
-		g.controlAttach(ctx, conn, req)
 	case "enrol.claim":
 		if !g.requireRootControl(conn, req.Op) {
 			_ = writeJSON(conn, enrol.Claimed{Error: "enrol: this operation requires uid 0"})
@@ -293,34 +287,8 @@ func (g *gateway) handleControl(ctx context.Context, conn net.Conn) {
 		}
 		g.enrolControlDeliver(conn, req)
 	default:
-		_ = writeJSON(conn, attachResponse{Error: fmt.Sprintf("unknown op %q", req.Op)})
+		_ = writeJSON(conn, controlError{Error: fmt.Sprintf("unknown op %q", req.Op)})
 	}
-}
-
-func (g *gateway) controlAttach(ctx context.Context, conn net.Conn, req controlRequest) {
-	streamID := newStreamID()
-	stream, err := g.reg.Open(req.Device, streamID, hs.KindADB)
-	if err != nil {
-		_ = writeJSON(conn, attachResponse{Error: err.Error()})
-		g.audit.Record(audit.Event{
-			Kind: "stream.refused", Actor: "ard-proxy", Device: req.Device,
-			Detail: err.Error(),
-		})
-		return
-	}
-	if err := writeJSON(conn, attachResponse{Device: req.Device}); err != nil {
-		_ = stream.Close()
-		return
-	}
-	g.audit.Record(audit.Event{
-		Kind: "stream.open", Actor: "ard-proxy", Device: req.Device, Stream: streamID,
-	})
-	_ = conn.SetDeadline(time.Time{})
-	_ = pump(conn, stream)
-	_ = stream.Close()
-	g.audit.Record(audit.Event{
-		Kind: "stream.close", Actor: "ard-proxy", Device: req.Device, Stream: streamID,
-	})
 }
 
 func writeJSON(w io.Writer, v any) error {
@@ -330,14 +298,4 @@ func writeJSON(w io.Writer, v any) error {
 	}
 	_, err = w.Write(append(b, '\n'))
 	return err
-}
-
-// pump copies in both directions until either side finishes.
-func pump(a, b io.ReadWriteCloser) error {
-	errc := make(chan error, 2)
-	go func() { _, err := io.Copy(a, b); errc <- err }()
-	go func() { _, err := io.Copy(b, a); errc <- err }()
-	// Both directions are awaited: returning on the first would truncate the stream
-	// while the other side is still flushing.
-	return <-errc
 }

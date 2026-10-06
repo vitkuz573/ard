@@ -1,9 +1,6 @@
 package main
 
-import "github.com/vitkuz573/ard/internal/registry"
-
-// Control-socket request and response shapes, shared by the control listener and the
-// enrolment path.
+// Control-socket request and response shapes.
 //
 // These belong to the unix control socket, not to the operator leg: the operator leg
 // speaks adb's own protocol and has no JSON frames of its own. Keeping the shapes here
@@ -12,12 +9,12 @@ import "github.com/vitkuz573/ard/internal/registry"
 
 // controlRequest is one request on the unix socket.
 //
-// Length-prefixed JSON followed, for attach, by raw stream bytes. Framing is
-// explicit rather than a stream multiplexer because there is exactly one client
-// and one request type; a mux here would be structure without a reason.
+// Every op on this socket is an enrolment operation, and each requires peer uid 0. The
+// stream an operator opens goes through the operator listener and registry.Open, never
+// through here: a local caller must not be able to reach a device by asking the gateway
+// directly, because the local caller is trusted only with enrolment.
 type controlRequest struct {
-	Op     string `json:"op"`
-	Device string `json:"device,omitempty"`
+	Op string `json:"op"`
 
 	// Enrolment fields. Code identifies a pending request; CertPEM and CAPEM carry the
 	// signed certificate back. They travel in the same request rather than a second
@@ -28,13 +25,10 @@ type controlRequest struct {
 	CAPEM   []byte `json:"ca_pem,omitempty"`
 }
 
-// listResponse describes every known device, online or not.
-type listResponse struct {
-	Devices []registry.Device `json:"devices"`
-}
-
-// attachResponse reports which device a stream landed on.
-type attachResponse struct {
-	Device string `json:"device"`
-	Error  string `json:"error,omitempty"`
+// controlError is the reply to a request the gateway will not serve.
+//
+// Every error reply on this socket carries the same single field, so an unknown op and a
+// refused one read the same way to whoever sent it.
+type controlError struct {
+	Error string `json:"error"`
 }

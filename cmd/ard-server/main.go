@@ -53,7 +53,6 @@ type config struct {
 	pkiDir         string
 	allowedDevices string
 	operatorsFile  string
-	loopbackBase   int
 	auditPath      string
 }
 
@@ -63,11 +62,10 @@ func run() error {
 	flag.StringVar(&cfg.operatorListen, "listen-operators", ":7100", "operator listener (TLS, operator certificates only)")
 	flag.StringVar(&cfg.enrolListen, "listen-enrol", ":7200", "enrolment listener (TLS, no client certificate: devices have none yet)")
 	flag.DurationVar(&cfg.enrolTTL, "enrol-ttl", 15*time.Minute, "how long a certificate request waits for operator approval")
-	flag.StringVar(&cfg.controlSocket, "control-socket", "/run/ard/control.sock", "unix socket for ard-proxy")
+	flag.StringVar(&cfg.controlSocket, "control-socket", "/run/ard/control.sock", "unix socket for enrolment, mode 0660 and requiring peer uid 0")
 	flag.StringVar(&cfg.pkiDir, "pki", "/etc/ard/pki", "directory produced by ard-ca")
 	flag.StringVar(&cfg.allowedDevices, "devices", "", "comma-separated device UUIDs permitted to connect (required)")
 	flag.StringVar(&cfg.operatorsFile, "operators", "/etc/ard/operators.yaml", "operator roles and device grants")
-	flag.IntVar(&cfg.loopbackBase, "loopback-base", 15000, "first loopback port used to present devices to the stock adb server")
 	flag.StringVar(&cfg.auditPath, "audit", "/var/log/ard/audit.log", "append-only audit log")
 	flag.Parse()
 
@@ -95,7 +93,7 @@ func run() error {
 		return fmt.Errorf("authorization: %w", err)
 	}
 
-	reg, err := registry.New(allowed, cfg.loopbackBase, func(d *registry.Device, event string) {
+	reg, err := registry.New(allowed, func(d *registry.Device, event string) {
 		log.Printf("device %s (%s) %s; streams=%d from %s",
 			d.UUID, d.Name, event, d.Streams, d.RemoteAddr)
 		auditor.Record(audit.Event{
@@ -199,9 +197,9 @@ func run() error {
 		gw.serveEnrol(ctx, enrolLn, enrolServerTLS(serverTLS))
 	}()
 
-	// ard-proxy attaches over a unix socket rather than TCP: loopback TCP would be
-	// reachable by any local process, while socket permissions can confine it to
-	// the gateway's own group.
+	// The control socket is for enrolment, and it is a unix socket rather than TCP
+	// because loopback TCP would be reachable by any local process, while socket
+	// permissions can confine it to the gateway's own group.
 	if err := os.MkdirAll(filepath.Dir(cfg.controlSocket), 0o750); err != nil {
 		return fmt.Errorf("control socket dir: %w", err)
 	}

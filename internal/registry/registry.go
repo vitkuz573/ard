@@ -37,13 +37,7 @@ type Device struct {
 	LastSeen    time.Time `json:"last_seen"`
 	// RemoteAddr is recorded for the audit log. It is not an identifier.
 	RemoteAddr string `json:"remote_addr"`
-	// LoopbackPort is the local TCP port that represents this device to the stock
-	// adb server. It is assigned from the allowlist order rather than from
-	// connection order, so a serial stays the same across reconnects and reboots;
-	// a port that shifted on every reconnect would invalidate every operator's
-	// saved device identifier.
-	LoopbackPort int `json:"loopback_port"`
-	Streams      int `json:"streams"`
+	Streams    int    `json:"streams"`
 }
 
 // Registry is the gateway's device table.
@@ -57,8 +51,6 @@ type Registry struct {
 	onChange func(*Device, string)
 	// now is injectable so tests do not depend on wall-clock time.
 	now func() time.Time
-	// ports maps device UUID to its stable loopback port.
-	ports map[string]int
 }
 
 type entry struct {
@@ -68,7 +60,6 @@ type entry struct {
 	agent string
 	state State
 	open  func(streamID, kind string) (io.ReadWriteCloser, error)
-	port  int
 	conn  func() error
 	// streams counts live streams, so the registry can report load and refuse
 	// work for a device that is already saturated.
@@ -82,46 +73,26 @@ type entry struct {
 //
 // An empty allowlist is a configuration error rather than "allow everything":
 // defaulting open would turn a missing config file into full access.
-func New(allowed []string, basePort int, onChange func(*Device, string)) (*Registry, error) {
+func New(allowed []string, onChange func(*Device, string)) (*Registry, error) {
 	if len(allowed) == 0 {
 		return nil, fmt.Errorf("registry: no devices allowed; refusing to start with an empty allowlist")
 	}
-	if basePort <= 0 || basePort > 60000 {
-		return nil, fmt.Errorf("registry: loopback base port %d is out of range", basePort)
-	}
-	if basePort+len(allowed) > 65535 {
-		return nil, fmt.Errorf("registry: %d devices from port %d overflow the port range",
-			len(allowed), basePort)
-	}
 	set := make(map[string]bool, len(allowed))
-	ports := make(map[string]int, len(allowed))
-	for i, id := range allowed {
+	for _, id := range allowed {
 		if id == "" {
 			return nil, fmt.Errorf("registry: empty device UUID in allowlist")
 		}
 		if set[id] {
-			// Two entries for one device would assign two ports and make the serial
-			// ambiguous.
 			return nil, fmt.Errorf("registry: device %q appears twice in the allowlist", id)
 		}
 		set[id] = true
-		ports[id] = basePort + i
 	}
 	return &Registry{
 		devices:  map[string]*entry{},
 		allowed:  set,
-		ports:    ports,
 		onChange: onChange,
 		now:      time.Now,
 	}, nil
-}
-
-// LoopbackPort reports the stable local port for a device.
-func (r *Registry) LoopbackPort(uuid string) (int, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	p, ok := r.ports[uuid]
-	return p, ok
 }
 
 // Allowed reports whether a device may connect.
@@ -149,10 +120,6 @@ func (r *Registry) Add(uuid, name, agent, remoteAddr string,
 		uuid: uuid, name: name, agent: agent, state: StateOnline,
 		open: open, conn: conn, connectedAt: now, lastSeen: now,
 		remoteAddr: remoteAddr,
-		// Carry the assigned port onto the entry: the snapshot the gateway serves
-		// is built from entries, not from the allowlist, so a device that forgot
-		// this would be reported with no port and the proxy would never bind.
-		port: r.ports[uuid],
 	}
 	r.devices[uuid] = e
 	r.mu.Unlock()
@@ -252,20 +219,18 @@ func (r *Registry) Get(uuid string) (*Device, bool) {
 // a device is enrolled but not currently connected.
 func (r *Registry) List() []Device {
 	r.mu.RLock()
-	out := make([]Device, 0, len(r.devices))
+	defer r.mu.RUnlock()
+	out := make([]Device, 0, len(r.allowed))
 	for _, e := range r.devices {
 		out = append(out, *snapshot(e))
 	}
-	r.mu.RUnlock()
 
 	// Present enrolled-but-absent devices too.
-	r.mu.RLock()
 	for uuid := range r.allowed {
 		if _, online := r.devices[uuid]; !online {
-			out = append(out, Device{UUID: uuid, State: StateOffline, LoopbackPort: r.ports[uuid]})
+			out = append(out, Device{UUID: uuid, State: StateOffline})
 		}
 	}
-	r.mu.RUnlock()
 
 	sort.Slice(out, func(i, j int) bool { return out[i].UUID < out[j].UUID })
 	return out
@@ -275,15 +240,14 @@ func snapshot(e *entry) *Device {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return &Device{
-		UUID:         e.uuid,
-		Name:         e.name,
-		State:        e.state,
-		Agent:        e.agent,
-		ConnectedAt:  e.connectedAt,
-		LastSeen:     e.lastSeen,
-		RemoteAddr:   e.remoteAddr,
-		LoopbackPort: e.port,
-		Streams:      e.streams,
+		UUID:        e.uuid,
+		Name:        e.name,
+		State:       e.state,
+		Agent:       e.agent,
+		ConnectedAt: e.connectedAt,
+		LastSeen:    e.lastSeen,
+		RemoteAddr:  e.remoteAddr,
+		Streams:     e.streams,
 	}
 }
 
