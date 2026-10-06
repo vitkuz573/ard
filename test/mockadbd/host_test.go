@@ -2,6 +2,7 @@ package mockadbd_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -84,9 +85,23 @@ func le(b []byte, v uint32) {
 
 func (h *host) readPacket() hostPacket {
 	h.t.Helper()
+	p, err := h.tryReadPacket()
+	if err != nil {
+		h.t.Fatalf("read packet: %v", err)
+	}
+	return p
+}
+
+// tryReadPacket reads one packet and reports the error rather than failing the test.
+//
+// A caller that is waiting for a reply to settle needs to tell "the device has stopped
+// talking" from "the device said something I did not expect": the first ends a read and
+// the second is a fact to look at. A deadline is the only way to see the first, so this
+// is the form that takes one.
+func (h *host) tryReadPacket() (hostPacket, error) {
 	var hdr [24]byte
 	if _, err := io.ReadFull(h.rd, hdr[:]); err != nil {
-		h.t.Fatalf("read header: %v", err)
+		return hostPacket{}, fmt.Errorf("read header: %w", err)
 	}
 	p := hostPacket{
 		cmd:  le32(hdr[0:4]),
@@ -95,15 +110,16 @@ func (h *host) readPacket() hostPacket {
 	}
 	n := le32(hdr[12:16])
 	if got := le32(hdr[20:24]); got != h.magic(p.cmd) {
-		h.t.Fatalf("magic mismatch for cmd 0x%08x: got 0x%08x want 0x%08x", p.cmd, got, h.magic(p.cmd))
+		return hostPacket{}, fmt.Errorf("magic mismatch for cmd 0x%08x: got 0x%08x want 0x%08x",
+			p.cmd, got, h.magic(p.cmd))
 	}
 	if n > 0 {
 		p.data = make([]byte, n)
 		if _, err := io.ReadFull(h.rd, p.data); err != nil {
-			h.t.Fatalf("read payload: %v", err)
+			return hostPacket{}, fmt.Errorf("read payload: %w", err)
 		}
 	}
-	return p
+	return p, nil
 }
 
 func le32(b []byte) uint32 {

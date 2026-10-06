@@ -128,12 +128,19 @@ func runSync2(cfg Config, s *stream) {
 			}
 			statV1(cfg, s, path)
 
-		case lis2, list1:
+		case lis2, lst2:
 			path, err := readLenString(s)
 			if err != nil {
 				return
 			}
 			listV2(cfg, s, path)
+
+		case list1:
+			path, err := readLenString(s)
+			if err != nil {
+				return
+			}
+			listV1(cfg, s, path)
 
 		case snd2, send1:
 			path, err := readLenString(s)
@@ -422,17 +429,84 @@ func listV2(cfg Config, s *stream, path string) {
 		le32(b[28:], 0)
 		le32(b[32:], 0)
 		le64(b[36:], uint64(len(e.Data)))
-		le64(b[44:], uint64(e.ModTime.UnixNano()))
-		le64(b[52:], uint64(e.ModTime.UnixNano()))
-		le64(b[60:], uint64(e.ModTime.UnixNano()))
+		// Seconds, like the stat reply above and unlike what a nanosecond reading of
+		// the field would suggest. These three are time_t on the wire: a real adbd
+		// fills them from st_mtim.tv_sec. Nanoseconds read as seconds is a date in
+		// the year 2554, and a client comparing that against the local file's mtime
+		// never finds them equal, so it re-pulls files it already has.
+		secs := uint64(e.ModTime.Unix())
+		le64(b[44:], secs)
+		le64(b[52:], secs)
+		le64(b[60:], secs)
 		le32(b[68:], uint32(len(e.Name)))
 		if err := s.writeRaw(append(b[:], e.Name...)); err != nil {
 			return
 		}
 	}
-	// DONE carries 16 bytes, not an empty payload.
+	// DONE carries a full v2 stat body, not an empty payload, and the width is not
+	// free. Measured against the stock client, one byte at a time: DONE with 72
+	// trailing zeros ends the listing and the files come back; 0, 4, 8, 16, 20,
+	// 68 and 71 leave the client blocked in a read that never completes, and 73
+	// desynchronises the next reply.
+	//
+	// 72 is the width of the entry the client reads: the 68-byte stat body plus the
+	// 4-byte name length. So the terminator is one entry's worth of shape with no
+	// name in it, and the client reads it with the same read it uses for an entry.
+	// A DONE carrying only the 16 bytes a v1 DONE carries leaves the client 56
+	// bytes short, and it waits for them rather than reporting anything -- which is
+	// what makes a directory pull hang instead of failing.
 	_ = putWord(s, doneW)
-	_ = s.writeRaw(make([]byte, 16))
+	_ = s.writeRaw(make([]byte, statV2Len+4))
+}
+
+// listV1 answers a v1 LIST.
+//
+// The reply word is DENT and not DNT2, and the name is NUL-terminated rather than
+// preceded by its length. Measured, from the reads a stock client makes on the
+// reply to LIST /dir:
+//
+//	DENT <mode u32> <size u32> <mtime u64> "a\0"
+//	DENT <mode u32> <size u32> <mtime u64> "b\0"
+//	DONE <12 zero bytes>
+//
+// A DNT2 here is read as a DENT whose mode is the entry's whole 72-byte body
+// shifted, so the directory bit lands somewhere else and the client decides the
+// path is not a directory and stops: `adb pull <dir>` reports nothing and exits,
+// having produced no error either.
+//
+// The mtime is 64 bits wide while the two fields before it are 32. That asymmetry
+// is why a DENT cannot be assembled out of 4-byte words, and it is measured rather
+// than assumed: the client reads DENT as 4 bytes, the body as 16, and then the
+// name up to its NUL.
+func listV1(cfg Config, s *stream, path string) {
+	entries, err := cfg.FS.ReadDir(path)
+	if err != nil {
+		failMsg(s, "%s: no such directory", path)
+		return
+	}
+	for _, e := range entries {
+		if err := putWord(s, dent1); err != nil {
+			return
+		}
+		// mode 4 bytes, size 4, mtime 8. The mtime is the odd one out: it is a
+		// 64-bit field even though everything around it is 32 bits, so a body built
+		// from 4-byte words puts the name four bytes early and every entry after the
+		// first is read at the wrong offset.
+		//
+		// Measured, from the sizes of the reads a stock client makes on the reply to
+		// LIST: 4 bytes for DENT, then 16 for the body, then the name to its NUL.
+		var b [16]byte
+		le32(b[0:], statMode(e.Dir, e.Mode))
+		le32(b[4:], uint32(len(e.Data)))
+		le64(b[8:], uint64(e.ModTime.Unix()))
+		// The name and its NUL go out with the body: one entry is one write, which is
+		// what a client reading a fixed-width body then a C string wants.
+		if err := s.writeRaw(append(append(b[:], e.Name...), 0)); err != nil {
+			return
+		}
+	}
+	_ = putWord(s, doneW)
+	_ = s.writeRaw(make([]byte, 12))
 }
 
 // splitSendV1 parses the v1 push form, "path,mode".
@@ -566,8 +640,17 @@ func recvFile(cfg Config, s *stream, path string) {
 			return
 		}
 	}
+	// The pull's DONE is a different width from the listing's, and the two are not
+	// interchangeable. Measured against the stock client: DONE with 4 trailing zeros
+	// ends the transfer of every file in a directory; 0 leaves the client blocked,
+	// and 5 through 11 block it too, while 12 and above make it read the next file's
+	// reply as part of this one's and report the second file as missing.
+	//
+	// 4 is the width of the sync protocol's own reply header -- a command word and a
+	// length -- so a pull's DONE is that header with a zero length. The listing's
+	// DONE is a stat body instead, which is why it is 72 bytes and this is 4.
 	_ = putWord(s, doneW)
-	_ = s.writeRaw(make([]byte, 16))
+	_ = s.writeRaw(make([]byte, 4))
 }
 
 // hexPreview renders bytes compactly for a trace line.
