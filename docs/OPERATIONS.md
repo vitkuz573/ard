@@ -123,17 +123,15 @@ something other than what was signed:
 The CA key is root-only and `ard-ca enrol` needs it, so this runs as root over SSH. It is
 the only signing path: the gateway holds no CA key and cannot issue anything.
 
-`ARD_DEVICES` in `/etc/ard/ard-server.env` is the device allowlist, and it still
-deserves **append-only** handling — but for a different reason than it used to. Its
-order no longer carries meaning: adb asks the gateway which devices exist and is told
-the UUID, so there is no port to renumber. Reordering the list does not change anyone's
-serial. Appending is still right because the deploy preserves the list across runs and
-only ever adds to it, so a rewrite that drops a device disconnects it.
+`ARD_DEVICES` in `/etc/ard/ard-server.env` is the device allowlist. Handle it
+**append-only**: the deploy preserves the list across runs and only ever adds to it, so a
+rewrite that drops a device disconnects it. The order of the list carries no meaning — adb
+asks the gateway which devices exist and is told the UUID, so reordering the list does not
+change anyone's serial.
 
 The `adb` serial an operator uses is the device UUID, and it does not change when the
 device reconnects, is re-enrolled, or moves address. If an operator reports that their
-serial is gone, the device is not in `ARD_DEVICES` or their role has no grant for it —
-not that a port moved.
+serial is gone, the device is not in `ARD_DEVICES` or their role has no grant for it.
 
 ### PKI permissions on the gateway
 

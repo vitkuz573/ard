@@ -14,13 +14,11 @@
 //
 // # What it deliberately does not do
 //
-// It does not know which devices exist, and it does not care. That is the whole change from
-// the version this replaces: the old client was told the device list in a JSON greeting and
-// then bound a loopback port per device, so the gateway had to keep a port table whose
-// entries had to stay stable across reconnects, and the operator had to learn serials before
-// any of this worked. adb already has a protocol for asking which devices exist and for
-// switching onto one of them, so this client hands the connection straight through and the
-// gateway answers those questions. One port, no list, no serials, nothing to keep in step.
+// It does not know which devices exist, and it does not care. adb already has a protocol for
+// asking which devices exist and for switching onto one of them, so this client hands the
+// connection straight through and the gateway answers those questions. One port, no list, no
+// serials, nothing for the operator to learn beforehand, and nothing to keep in step when a
+// device reconnects.
 //
 // Usage
 //

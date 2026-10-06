@@ -44,9 +44,8 @@ type operatorFilter struct {
 	remote string
 }
 
-// Allows is asked on every listing and every transport request, and answers from the same
-// policy the old bridge consulted. A serial this operator's role does not cover is refused
-// by name, not merely left out of the listing: a client can ask for anything, so hiding is
+// Allows is asked on every listing and every transport request, and answers from the
+// operator's own policy. A serial this operator's role does not cover is refused by name, not merely left out of the listing: a client can ask for anything, so hiding is
 // not enough on its own.
 func (f operatorFilter) Allows(serial string) bool {
 	if serial == "" {

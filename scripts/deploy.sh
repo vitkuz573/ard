@@ -210,9 +210,7 @@ if [[ -f /etc/ard/ard-server.env ]]; then
 fi
 # The device allowlist is preserved across deploys and only ever appended to.
 #
-# Resetting it would silently disconnect every enrolled device on a routine
-# redeploy. Its order no longer carries meaning either: a device used to be given a
-# loopback port from its position here, and now adb is told which devices exist.
+# Resetting it would silently disconnect every enrolled device on a routine redeploy.
 existing=""
 if [[ -f /etc/ard/ard-server.env ]]; then
   existing="$(grep '^ARD_DEVICES=' /etc/ard/ard-server.env | cut -d= -f2- || true)"

@@ -3,9 +3,9 @@ package main
 // Tests for the adb server protocol adapter.
 //
 // These use the real acl.Policy and the real registry rather than fakes, because the whole
-// point of the adapter is that an operator's visible set is computed by the same code that
-// authorized the old bridge. A test with a stub filter would pass while that equivalence
-// quietly broke, which is the failure this file exists to prevent.
+// point of the adapter is that an operator's visible set is computed by the real policy
+// code. A test with a stub filter would pass while that equivalence quietly broke, which is
+// the failure this file exists to prevent.
 
 import (
 	"bufio"

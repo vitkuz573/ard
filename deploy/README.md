@@ -51,7 +51,6 @@ then add the UUID to `ARD_DEVICES` in `/etc/ard/ard-server.env` and grant it in
 `scripts/deploy.sh --rotate-device <uuid>` does the PKI half of this and preserves
 the existing list.
 
-The order of `ARD_DEVICES` no longer means anything: `adb` asks the gateway which
-devices exist and is answered with UUIDs, so there is no per-device port to
-renumber. Appending is still the right habit — the deploy preserves the list and only
-adds to it — but reordering does not invalidate any saved serial.
+The order of `ARD_DEVICES` carries no meaning: `adb` asks the gateway which devices
+exist and is answered with UUIDs. Appending is still the right habit — the deploy preserves
+the list and only adds to it — and reordering does not invalidate any saved serial.

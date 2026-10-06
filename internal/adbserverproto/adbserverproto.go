@@ -6,12 +6,8 @@
 // This project gives an operator a stock adb binary against a phone on the internet. adb
 // cannot do TLS, so a helper has to terminate TLS on the operator's own machine -- that is
 // unavoidable, not a preference. The question is what that helper has to know, and the
-// obvious answer is "everything": bind a loopback port per device, hand the operator a list
-// of serials, and splice raw bytes through each one. That answer costs a port table, a rule
-// for keeping ports stable when devices come and go, and operator-side knowledge of serials.
-//
-// It is also unnecessary. adb already speaks a protocol for finding out what devices exist
-// and for switching onto one of them. A helper that answers that protocol -- over a tunnel,
+// answer is nothing: adb already speaks a protocol for finding out what devices exist and
+// for switching onto one of them. A helper that answers that protocol -- over a tunnel,
 // with the device list filtered -- lets stock adb do everything it does with a local device:
 // adb devices, adb -s SERIAL shell, adb connect, and its own transport switching.
 //
@@ -71,8 +67,8 @@ const (
 //   - adb writes its stdin as raw bytes and never writes kIdCloseStdin, so a device waiting
 //     for the end of input waits forever and `adb shell cat` hangs.
 //
-// Both were chased as transport bugs before this reply was measured. The transport was fine
-// in both cases; the client had simply been told the server does not speak v2.
+// The transport is fine in both cases; a client told the server does not speak v2 is a client
+// that gets neither of these.
 const featureReply = "shell_v2"
 
 // maxRequest caps a request. adb's own services are small; anything larger is a client that
@@ -254,10 +250,6 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 		// Answer OKAY and make this connection the transport, which is what a client that
 		// asked for this expects to follow.
 		//
-		// It used to be refused with "use host:tport instead", which is advice, not
-		// behaviour, and it broke the client: adb asks for host:transport before it asks
-		// for host:tport, so a refusal here meant the tport request never arrived at all.
-		// No stream was ever opened and `adb shell` hung with no output and no error.
 		return s.beginTransport(c, serial, false)
 
 	case strings.HasPrefix(req, "host:connect:"):
@@ -476,10 +468,10 @@ func (s *Server) replyValue(w io.Writer, value string) error {
 //	host:transport:nope    -> FAIL 0017 "device 'nope' not found"
 //	host:bogus             -> FAIL 001c "unknown host service 'bogus'"
 //
-// One four-digit length and then the message, with no length inside that. The inner length
-// this used to write is not a variant adb tolerates: it decodes the four digits after FAIL as
-// the message's length, reads that many bytes, and prints what it got -- which is why a
-// refusal reached the operator as
+// One four-digit length and then the message, with no length inside that. An inner length is
+// not a variant adb tolerates: it decodes the four digits after FAIL as the message's length,
+// reads that many bytes, and prints what it got -- which is why a refusal can reach the
+// operator as
 //
 //	error: 0052operator "bob" may not attach to "dev-a": role "observer" lacks ...
 //

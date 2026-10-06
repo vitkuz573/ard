@@ -224,11 +224,9 @@ func (p *Policy) Roles() []string {
 
 // CanSee reports whether an operator may touch a device at all, whatever the action.
 //
-// The device list sent in the greeting used to be filtered with a single hard-coded
-// permission, which meant a read-only operator saw nothing at all even on devices they
-// legitimately hold logcat for. They could not drive anything, but they could see that
-// their access exists -- and being able to see is what makes a denial explicable instead
-// of mysterious.
+// A read-only operator sees a device they legitimately hold logcat for. They cannot drive
+// anything, but they can see that their access exists -- and being able to see is what makes
+// a denial explicable instead of mysterious.
 func (p *Policy) CanSee(operator, device string) bool {
 	for kind := range KindToPermission {
 		if p.Authorize(operator, device, kind).Allowed {

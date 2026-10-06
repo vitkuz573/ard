@@ -226,12 +226,9 @@ func (g *gateway) handleOperator(ctx context.Context, raw net.Conn, tlsCfg *tls.
 
 	// The operator leg speaks adb's own server protocol and nothing else.
 	//
-	// It used to send a JSON device list and then take one JSON request per connection,
-	// with the client binding a loopback port per device it had been told about. That put
-	// a device list on the operator's machine and a port table on the gateway, and neither
-	// was needed: adb already asks "which devices exist" and "switch to this one", so the
-	// gateway answers those questions and adb discovers the rest. Filtering happens in the
-	// adapter against the same policy that used to authorize the bridge.
+	// adb asks "which devices exist" and "switch to this one", so the gateway answers those
+	// questions and adb discovers the rest. Filtering happens in the adapter against the
+	// operator's own policy.
 	_ = conn.SetDeadline(time.Time{})
 	g.audit.Record(audit.Event{
 		Kind: "operator.adb_protocol", Actor: name, Remote: remote, Detail: role.Name,

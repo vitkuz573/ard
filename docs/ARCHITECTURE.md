@@ -97,8 +97,8 @@ These are structural, not features. They constrain every component.
 The operator leg is one TCP port, and what runs on it is the stock `adb` binary.
 `ard-connect` publishes a single local port (default `127.0.0.1:15000`); `adb -P` that
 port speaks adb's own server protocol to the gateway over mutual TLS, and the gateway
-answers the device-discovery and transport-switching requests itself. There is no
-per-device port, no separate bridge process, and no device list to copy.
+answers the device-discovery and transport-switching requests itself. The operator learns
+nothing about devices from the transport and needs no serials in advance.
 
 The gateway has three TCP listeners and one unix socket, and the split between them is
 made by the certificate root each one trusts, not by application code:
@@ -346,10 +346,6 @@ which of them exist.
    it between the operator and adbd would mean reimplementing the multiplexing the
    adb protocol already provides. Dead code here is a rejected approach, not an
    unfinished one.
-3. ~~**`adb connect 127.0.0.1:<port>`.**~~ **Obsolete.** There is no longer a per-device
-   port for adb to connect to. `adb -P` talks to `ard-connect`'s single published port,
-   and the gateway refuses `host:connect:` with a reason, since opening a TCP device is
-   not its business.
 
 ## 7b. The device agent is an APK
 

@@ -4,12 +4,10 @@
 #   mock adbd ──▶ ard-agent ──mTLS──▶ ard-server ──▶ ard-connect ──▶ stock adb
 #                                                  (operator's own machine)
 #
-# What this proves, and why it needs its own script: the gateway could identify an
-# operator and then hang doing nothing, and the only working route to a device was running
-# adb on the gateway host over its loopback port. That route needs SSH on the VPS, which is
-# exactly what makes a multi-operator product impossible -- SSH is all-or-nothing, is not
-# scoped per device, cannot be revoked for one person alone, and hands over root on the
-# machine holding the CA keys.
+# What this proves, and why it needs its own script: a gateway that identifies an operator and
+# then hangs doing nothing looks exactly like a product that works. Reaching a device must not
+# require SSH on the VPS -- SSH is all-or-nothing, is not scoped per device, cannot be revoked
+# for one person alone, and hands over root on the machine holding the CA keys.
 #
 # So the assertion here is deliberately narrow and load-bearing: from a machine that is
 # not the gateway, with the gateway reachable only over TLS, stock adb drives a device.
@@ -289,11 +287,9 @@ fi
 # Now the refusal. adb prints the gateway's FAIL message on stderr, so that is where the reason
 # has to appear: this is the operator's own terminal, and it is the only thing they will read.
 #
-# It used to be asserted against the operator client's own log, and that was checking a design
-# this no longer has -- the client used to be told the device list and refused before
-# publishing. It also passed for the wrong reason: the check ran the client under `timeout`, and
-# `timeout` kills a long-running process with exit 124, which the test read as a refusal. An
-# operator with shell hit exactly the same result. A check that cannot fail is not a check.
+# It ran the client under `timeout` and read the exit code, and `timeout` kills a long-running
+# process with exit 124 -- the same thing an operator with shell gets. The check is on the
+# message in the output above and on the outcome below, never on the client's exit code alone.
 BOBOUT="$(timeout 25 adb -P "$BADPORT" -s "$DEVICE" shell whoami 2>&1 || true)"
 printf '%s\n' "$BOBOUT" | sed 's/^/      /'
 
