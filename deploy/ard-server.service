@@ -33,7 +33,6 @@ ExecStart=/opt/ard/bin/ard-server \
   -pki              ${ARD_PKI_DIR} \
   -devices          ${ARD_DEVICES} \
   -operators        ${ARD_OPERATORS_FILE} \
-  -loopback-base    ${ARD_LOOPBACK_BASE} \
   -audit            ${ARD_AUDIT_LOG}
 Restart=always
 RestartSec=3s

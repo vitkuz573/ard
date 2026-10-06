@@ -65,7 +65,7 @@ ssh_() { ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"; }
 step "cross-compiling"
 DIST="$ROOT/dist/$TARGET_OS"
 mkdir -p "$DIST"
-BINARIES=(ard-server ard-proxy ard-agent ard-ca ard-connect)
+BINARIES=(ard-server ard-agent ard-ca ard-connect)
 for b in "${BINARIES[@]}"; do
   [[ -d "cmd/$b" ]] || continue
   CGO_ENABLED=0 GOOS="${TARGET_OS%/*}" GOARCH="${TARGET_OS#*/}" \
@@ -91,8 +91,8 @@ SCP_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o PasswordAuthentication=no
           -o ConnectTimeout=20 -P "${ARD_PROD_SSH_PORT:-22}")
 scp "${SCP_OPTS[@]}" "$DIST"/* "$REMOTE:$STAGE/bin/"
 scp "${SCP_OPTS[@]}" \
-  deploy/ard-server.service deploy/ard-proxy.service \
-  deploy/ard-server.env deploy/ard-proxy.env deploy/operators.yaml \
+  deploy/ard-server.service \
+  deploy/ard-server.env deploy/operators.yaml \
   deploy/nftables.conf deploy/firewall-verify.sh \
   "$REMOTE:$STAGE/"
 ok "uploaded to $STAGE"
@@ -106,7 +106,7 @@ set -euo pipefail
 S=/root/ard-staging
 FIRST_DEVICE="${1:-}"
 ROTATE_DEVICE="${2:-}"
-BINARIES=(ard-server ard-proxy ard-agent ard-ca ard-connect)
+BINARIES=(ard-server ard-agent ard-ca ard-connect)
 
 echo "  -- installing binaries into /opt/ard/bin"
 install -d -o root -g ard -m 0750 /opt/ard/bin /opt/ard/docs
@@ -174,7 +174,6 @@ if [[ -f /etc/ard/operators.yaml ]]; then
 else
   install -m 0640 -o root -g ard "$S/operators.yaml" /etc/ard/operators.yaml
 fi
-install -m 0640 -o root -g ard "$S/ard-proxy.env" /etc/ard/ard-proxy.env
 
 # Build the server env by merging the shipped template with whatever the host already
 # has.
@@ -212,8 +211,8 @@ fi
 # The device allowlist is preserved across deploys and only ever appended to.
 #
 # Resetting it would silently disconnect every enrolled device on a routine
-# redeploy, and because loopback ports are assigned from this list's order, it
-# would also renumber every operator's saved serial.
+# redeploy. Its order no longer carries meaning either: a device used to be given a
+# loopback port from its position here, and now adb is told which devices exist.
 existing=""
 if [[ -f /etc/ard/ard-server.env ]]; then
   existing="$(grep '^ARD_DEVICES=' /etc/ard/ard-server.env | cut -d= -f2- || true)"
@@ -264,12 +263,11 @@ systemctl enable ard-firewall-verify.service >/dev/null 2>&1 || true
 
 echo "  -- systemd units"
 install -m 0644 -o root -g root "$S/ard-server.service" /etc/systemd/system/ard-server.service
-install -m 0644 -o root -g root "$S/ard-proxy.service"  /etc/systemd/system/ard-proxy.service
 systemctl daemon-reload
 
 echo "  -- starting"
-systemctl enable ard-server ard-proxy >/dev/null 2>&1
-systemctl restart ard-server ard-proxy
+systemctl enable ard-server >/dev/null 2>&1
+systemctl restart ard-server
 REMOTE
 ok "installed"
 
@@ -326,7 +324,6 @@ verify_eventually() {
 # PKI permissions, audit log -- do not, and re-running them on every attempt would only
 # make a failure slower to report.
 verify_eventually "ard-server running"     "systemctl is-active ard-server" "active"
-verify_eventually "ard-proxy running"      "systemctl is-active ard-proxy"  "active"
 verify "firewall enforcing drop"   "nft list chain inet ard input | grep -o 'policy [a-z]*'" "policy drop"
 verify "gateway ports in firewall" "nft list chain inet ard input | grep -c 'dport @ard_ports'" "1"
 verify "no raw adb port exposed"   "nft list ruleset | grep -cE '5555|dport @adb'" "0"
@@ -377,7 +374,7 @@ $GREEN gateway deployed$OFF
   host        ${ARD_PROD_USER:-root}@${ARD_PROD_HOST} ($(ssh_ hostname))
   devices     $DEVICE_LINE
   device port :7000    operators :7100
-  adb serial  127.0.0.1:15000 for the first device, 15001 for the second, and so on
+  adb serial  the device UUID, reported by adb against the operator's own port
 
 $YELLOW next$OFF
   1. Install the agent on the device:  adb install -r android/ard-agent.apk
@@ -389,7 +386,11 @@ $YELLOW next$OFF
 
      ard-connect -gateway <host>:7100 -ca server-ca.crt \
                  -cert operator.crt -key operator.key
-     adb connect 127.0.0.1:15000 && adb -s 127.0.0.1:15000 shell
+     adb -P 15000 devices
+     adb -P 15000 -s <device-uuid> shell
+
+  ard-connect prints the port it published; adb asks it which devices the operator may
+  reach, so there is no list to copy and no serial to remember between machines.
 
   The device generates its own key pair and never sends it anywhere. This script only
   relays the request to whoever holds the CA, and the certificate goes back the same
