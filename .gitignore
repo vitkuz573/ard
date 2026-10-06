@@ -5,15 +5,13 @@
 # boundary -- it does not apply to files that are already tracked, and history
 # keeps copies of anything that was ever committed.
 
-# Compiled binaries. Every one that `go build ./...` can produce at the repository root is
-# listed, so that a stray `go build -o ard-connect .` does not become a committed artefact.
-/ard-agent
-/ard-server
-/ard-ca
-/ard-connect
+# Compiled binaries. Patterns, not a list of names: a build that leaves its output at the
+# module root under a variant name is still a build output, and once one of these was
+# committed by hand-listing the others, the list was already out of date.
+/ard-*
 /ardctl
-/probe
-/mockadbd
+/probe*
+/mockadbd*
 /bin/
 /dist/
 
