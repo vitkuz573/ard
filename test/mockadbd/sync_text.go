@@ -1,43 +1,31 @@
 package mockadbd
 
-// The text-framed sync protocol, as a current adb actually speaks it.
+// The sync service: `adb push` and `adb pull`.
 //
-// The legacy binary protocol in sync.go is correct for what it implements and older clients
-// use it. This file exists because `adb push` and `adb pull` do not go there.
-//
-// Layout, from file_sync_protocol.h:
+// Layout, from file_sync_protocol.h, and every element confirmed against a stock adb:
 //
 //   - A command is four ASCII characters read as a little-endian word, via MKID. STA2 is
-//     therefore 0x32415453, which is what the trace showed before the protocol was known.
-//   - A request is id, then a 4-byte path length, then exactly that many bytes of path.
-//     The path is not NUL-terminated; the length makes a terminator redundant.
-//   - There is no envelope. A reply begins with its own id word. An earlier attempt here
-//     invented an "RSP2" prefix, and adb then blocked instead of failing, because it read
-//     that word as the code.
+//     therefore 0x32415453, which is the word that opens a push.
+//   - A request is id, then a 4-byte path length, then exactly that many bytes of path. The
+//     path is not NUL-terminated; the length makes a terminator redundant. This holds for
+//     every spelling, including the ones without a version suffix: a client sends
+//     `STAT` + length + path and `SEND` + length + "path,mode" exactly as it sends STA2.
+//   - There is no envelope. A reply begins with its own id word, which is why a reply
+//     written as anything else is read as the reply's code and stops the transfer.
 //   - The v2 commands are two requests: SND2 carries the path, then a second message with
 //     the same id carries mode and flags. RCV2 carries the path, then flags.
-//
-// STATUS: the reply is complete and correct against the specification, and adb still does
-// not proceed. The trace shows the whole exchange, and it is one command to reproduce
-// rather than an investigation:
-//
-//	MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
-//
-// Two things stopped adb after that reply, and neither was in what this file writes. Both
-// are recorded in sync_interop_test.go, which is where the traces and the reasoning live:
-//
-//   - A WRTE went unacknowledged. adb's server does not read the client again until the
-//     device acks what it forwarded, so the exchange above was the last one that happened.
-//   - SND2 repeats its own id before the mode and the flags, and the banner advertised
-//     compression that nothing here implements.
+//   - The version is chosen per message and not by the service name: adb opens "sync:" and
+//     then decides per command from the features it was given for this device, so the
+//     service answers both the versioned and the unversioned spelling of each command.
 //
 // The v2 stat body is 68 bytes, laid out IQQIIIIQqqq:
 //
 //	error u32, dev u64, ino u64, mode u32, nlink u32, uid u32, gid u32,
 //	size u64, atime i64, mtime i64, ctime i64
 //
-// A DNT2 directory entry is the same 72 bytes with a name length at offset 68, followed by
-// the name.
+// so STA2's reply is 72 bytes in total. Its unversioned counterpart is 16: the word and
+// mode, size and mtime, with a zero mode meaning the path is not there. A DNT2 directory
+// entry is the same 72 bytes with a name length at offset 68, followed by the name.
 
 import (
 	"encoding/binary"

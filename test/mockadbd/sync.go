@@ -10,36 +10,23 @@ import (
 	"time"
 )
 
-// The sync service: `adb push` and `adb pull`.
+// The sync service's integer command ids, plus the two pieces of framing that the
+// text-framed service in sync_text.go shares with them.
 //
-// STATUS: this implements the LEGACY binary sync protocol. It is correct for that
-// protocol and is exercised by the unit tests below, but `adb push` and `adb pull` do not
-// work against it with a current adb.
+// A command on this wire is four literal characters, read as a little-endian word through
+// MKID, so what arrives from a client is STA2, LST2, SND2, RCV2 and the rest -- not the
+// integers named below. sync_text.go is the service the dispatcher opens, and it answers
+// every spelling of a request, because which one a client uses is decided by the feature
+// list it was given for the device rather than by the device: a client told stat_v2 sends
+// STA2 and SND2, and a client told nothing sends STAT and SEND, and both spellings are
+// answered from the same filesystem.
 //
-// Modern adb (34 and later) uses a text-framed successor, and the evidence is in the
-// trace rather than in the documentation. With MOCKADBD_TRACE on, the first bytes a real
-// adb sends arrive as:
-//
-//	runSync request id=843142227 (0x32415453) raw="\x1a"
-//
-// 0x32415453 is ASCII "STA2". The commands in that protocol are four literal characters --
-// STA2, LST2, SND2, RCV2, QUIT -- rather than the little-endian integers this file parses,
-// and adb reports the mismatch as `protocol fault: failed to read stat response`.
-//
-// Guessing the protocol from the header comment rather than from a trace is what produced
-// that confusion: the classic ids are documented, and they are simply not what adb sends
-// any more. So the legacy path is kept -- it is still what older clients use, and it is
-// the reference the successor has to agree with -- and the text protocol is the next thing
-// to write. Until then a test that pushes through this file will fail, and that is the
-// correct outcome rather than a silent partial transfer.
-//
-// The wire shape implemented here, for the record: a 4-byte little-endian command id, then
-// a NUL-terminated path. File contents arrive as DATA frames each followed by their own
-// length, terminated by DONE.
-//
-// Wire shape, host to device: a 4-byte little-endian command id, then a NUL-terminated
-// path. Device to host: the same framing, except a file's contents arrive as a series of
-// DATA frames each followed by its own length, terminated by DONE.
+// What lives here is what both spellings need. syncChunk is how much of a file travels in
+// one DATA frame; adbd uses 64 KiB, and matching it means a relay tested against this device
+// sees the frame sizes it will see in the field and a reassembly bug cannot hide behind an
+// unusually large frame. statMode folds the file type into the mode word the way stat(2)
+// does, because a client decides whether to recurse by testing that bit and a directory
+// reported without it is pulled as an empty file.
 
 const (
 	syncStat   uint32 = 1 // path -> mode, size, mtime
