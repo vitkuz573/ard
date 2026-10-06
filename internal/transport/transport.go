@@ -62,6 +62,10 @@ type Session struct {
 	Device string
 	// Name is the label the agent reported, for operator interfaces only.
 	Name string
+	// Features is the feature list the device's own adbd reported. It is the
+	// device's claim about itself, carried here so the gateway can answer adb's
+	// feature question from the device rather than from its own opinion.
+	Features string
 
 	mux  *yamux.Session
 	conn net.Conn
@@ -72,7 +76,12 @@ type Session struct {
 // The caller must have completed the ARD handshake and checked the peer against
 // the allowlist first. Wrapping an unauthorised connection would hand out a usable
 // session, so this constructor trusts its caller completely.
-func New(conn net.Conn, device, name string) (*Session, error) {
+//
+// features is the list the device's adbd reported in its CNXN banner, carried
+// verbatim from the handshake. The session does not parse it and does not check it:
+// a device that advertised nothing is a device that supports nothing, and quietly
+// substituting a list would put a client on a path the device cannot serve.
+func New(conn net.Conn, device, name, features string) (*Session, error) {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = keepalive
@@ -84,7 +93,7 @@ func New(conn net.Conn, device, name string) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: start mux: %w", err)
 	}
-	return &Session{Device: device, Name: name, mux: mux, conn: conn}, nil
+	return &Session{Device: device, Name: name, Features: features, mux: mux, conn: conn}, nil
 }
 
 // Open reserves a stream and writes the route header.

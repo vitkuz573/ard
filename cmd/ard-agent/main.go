@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/vitkuz573/ard/internal/adbdloc"
+	"github.com/vitkuz573/ard/internal/adbserverproto"
 	"github.com/vitkuz573/ard/internal/hs"
 	"github.com/vitkuz573/ard/internal/tlsx"
 	"github.com/vitkuz573/ard/internal/transport"
@@ -264,21 +265,41 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	// A completed TLS handshake is not authorization: under TLS 1.3 the peer
 	// verifies our certificate after we consider the handshake done, and the
 	// rejection arrives later. The WELCOME reply is the actual decision.
-	welcome, err := hs.ClientHandshake(conn, hs.Hello{
-		Device: cfg.deviceID,
-		Name:   cfg.deviceName,
-		Agent:  version,
-	})
-	if err != nil {
-		return err
-	}
-	log.Printf("connected, session %s", welcome.Session)
 
 	// The first resolve scanned the ephemeral range successfully, so subsequent
 	// streams in this session skip the scan and only try the known address.
 	cached := true
+	// The resolver is per session, and remembers nothing: each call re-checks the
+	// cached address and re-scans if it is dead.
+	resolve := func(c context.Context, hint string) (string, error) {
+		if hint == "" {
+			hint = cfg.adbdAddr
+		}
+		return adbdloc.Resolvable(c, hint, adbdloc.Options{SkipDynamic: cached})
+	}
 
-	session, err := transport.New(conn, cfg.deviceID, cfg.deviceName)
+	// What this device can do is adbd's to say, so ask it before saying anything to
+	// the gateway. The question is one CNXN exchange and then a close: the gateway
+	// has to answer an operator's adb about this device's features before any stream
+	// exists, so a device that reported them on first use would leave that question
+	// unanswerable until somebody had already asked it.
+	features, err := readDeviceFeatures(ctx, resolve)
+	if err != nil {
+		return fmt.Errorf("read adbd's feature list: %w", err)
+	}
+
+	welcome, err := hs.ClientHandshake(conn, hs.Hello{
+		Device:   cfg.deviceID,
+		Name:     cfg.deviceName,
+		Agent:    version,
+		Features: features,
+	})
+	if err != nil {
+		return err
+	}
+	log.Printf("connected, session %s, device features %s", welcome.Session, features)
+
+	session, err := transport.New(conn, cfg.deviceID, cfg.deviceName, features)
 	if err != nil {
 		return err
 	}
@@ -295,17 +316,48 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	}()
 
 	log.Printf("serving")
-	// The resolver is per session, and remembers nothing: each call re-checks the
-	// cached address and re-scans if it is dead.
-	resolve := func(c context.Context, hint string) (string, error) {
-		if hint == "" {
-			hint = cfg.adbdAddr
-		}
-		return adbdloc.Resolvable(c, hint, adbdloc.Options{SkipDynamic: cached})
-	}
 	return session.Accept(ctx, func(route hs.Route, stream net.Conn) error {
 		return handleStream(ctx, route, stream, resolve)
 	})
+}
+
+// readDeviceFeatures asks this device's adbd what it supports and returns the feature list.
+//
+// It is a separate connection on purpose: the answer describes adbd, not the gateway, and
+// the connection to adbd this session already holds is not up yet. The exchange is a
+// CNXN in each direction and then a close, which is the whole of the handshake from the
+// point of view of somebody who wants the banner and not a session.
+func readDeviceFeatures(ctx context.Context, resolve func(context.Context, string) (string, error)) (string, error) {
+	addr, err := resolve(ctx, "")
+	if err != nil {
+		return "", err
+	}
+	d := &net.Dialer{Timeout: 20 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("dial adbd at %s: %w", addr, err)
+	}
+	defer conn.Close()
+
+	// A deadline covers the exchange. Without one a device that accepts the connection
+	// and then says nothing leaves this blocked, and the agent's reconnect loop never
+	// runs because it never gets to report anything.
+	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		return "", err
+	}
+	banner, err := adbserverproto.ReadDeviceBanner(conn)
+	if err != nil {
+		return "", err
+	}
+	features := adbserverproto.BannerFeatures(banner)
+	if features == "" {
+		// A device whose banner names no features supports nothing this gateway could
+		// negotiate, and continuing would hand an operator's adb an empty list to act on.
+		// Saying so here is what makes the difference between a device that needs
+		// replacing and a gateway that quietly speaks less than the device can.
+		return "", fmt.Errorf("adbd's banner names no features: %q", banner)
+	}
+	return features, nil
 }
 
 // handleStream pipes one operator stream to adbd.

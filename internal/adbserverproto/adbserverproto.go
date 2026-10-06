@@ -42,35 +42,6 @@ const (
 	failToken    = "FAIL"
 )
 
-// featureReply is the answer to host:features, and the reply that decides whether adb speaks
-// the shell v2 protocol at all.
-//
-// Measured against the stock server on a machine with a device attached:
-//
-//	host:features            -> OKAY 00f5 "shell_v2,cmd,stat_v2,ls_v2,fixed_push_mkdir,apex,
-//	                                        abb,fixed_push_symlink_timestamp,abb_exec,
-//	                                        remount_shell,track_app,sendrecv_v2,
-//	                                        sendrecv_v2_dry_run_send,openscreen_mdns,
-//	                                        devicetracker_proto_format,devraw,app_info,
-//	                                        server_status,track_mdns,push_sync"
-//	host-serial:X:features   -> the identical 253 bytes
-//	no device attached       -> FAIL 0016 "ano devices/emulators found"
-//
-// Only shell_v2 is claimed here, and the reason is not caution about the protocol: the rest
-// of the stock list is derived from the devices the server happens to have attached, and
-// naming a feature this gateway cannot honour is how a client commits to a path that cannot
-// work. shell_v2 is the one that has to be right, and the cost of leaving it out is measured
-// in two broken commands that both look like the device's fault:
-//
-//   - adb sends "shell:false" instead of "shell,v2,TERM=...,raw:false", so the device runs
-//     the v1 protocol, sends no exit status frame, and `adb shell false` reports success.
-//   - adb writes its stdin as raw bytes and never writes kIdCloseStdin, so a device waiting
-//     for the end of input waits forever and `adb shell cat` hangs.
-//
-// The transport is fine in both cases; a client told the server does not speak v2 is a client
-// that gets neither of these.
-const featureReply = "shell_v2"
-
 // maxRequest caps a request. adb's own services are small; anything larger is a client that
 // is confused or hostile, and reading it would mean allocating on its say-so.
 const maxRequest = 4096
@@ -169,33 +140,41 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 		return false, s.replyValue(c, versionReply)
 
 	case req == "host:features":
-		// The list of features this server supports, and it is the most load-bearing reply
-		// in the protocol. Measured, because getting it wrong fails quietly:
+		// What the client may ask this server's devices to do, which the stock server
+		// derives from the devices it has attached and hands over verbatim. Measured
+		// against a stock server with one device whose banner carried a known list:
 		//
-		//	stock server: OKAY 00f5 "shell_v2,cmd,stat_v2,...,push_sync"   (245 bytes)
-		//	this server:  OKAY 0000 ""                                     (an empty list)
+		//	host:features                -> OKAY 0027 "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
+		//	host-serial:SERIAL:features  -> OKAY 0027, the identical 39 bytes
+		//	no device attached           -> FAIL 001a "no devices/emulators found"
+		//	two devices attached         -> FAIL 001d "more than one device/emulator"
 		//
-		// With an empty list adb still runs every command, still prints output, and still
-		// exits zero. What it stops doing is upgrading the shell service: `adb shell whoami`
-		// then sends the service request as the bare "shell:whoami" instead of
-		// "shell,v2,TERM=xterm-256color,raw:whoami", its stdin goes over as raw bytes
-		// instead of shell v2 frames, and no exit status frame is ever produced or read.
-		// Two failures come out of that and neither points here: `adb shell false` reports
-		// success because a device only sends the exit status under v2, and `adb shell cat`
-		// hangs forever because nothing ever says that input has ended.
+		// Verbatim, trailing comma and all. That is not a detail of the capture: a client
+		// splits the value on commas and an empty trailing field is a field, so a list
+		// rebuilt here could differ from the device's in exactly the place that would be
+		// invisible until a command chose a path because of it.
 		//
-		// The client does the upgrading, not this server. That is worth stating because the
-		// opposite is easy to assume and was assumed here: the stock server rewrites
-		// nothing on the way to the device -- a raw client that sends "shell:false" gets
-		// "shell:false" in the OPEN, measured -- it only advertises shell_v2, and the
-		// client then does the rewrite itself, pty and all.
+		// The client does the upgrading, not this server. Worth stating because the
+		// opposite is easy to assume: the stock server rewrites nothing on the way to the
+		// device -- a raw client that sends "shell:false" gets "shell:false" in the OPEN,
+		// measured -- it only advertises what the device has, and the client then does the
+		// rewrite itself, pty and all.
 		//
-		// Only shell_v2 is advertised. The stock list is derived from the devices attached
-		// to it, and the rest of it names protocols this gateway does not implement;
-		// advertising a feature that cannot be honoured is how a client ends up on a path
-		// that cannot work, the same mistake a device banner makes when it claims
-		// compression it cannot decompress.
-		return false, s.replyValue(c, featureReply)
+		// The two refusals are the measured answers, and a union is not what stands in for
+		// them. A union of two devices' lists is a list neither device has: offer it and a
+		// client is entitled to send stat_v2 to a device that never said it could, and the
+		// failure that produces is a protocol fault on the device rather than a refusal
+		// here. The per-serial question still gets an answer, and adb asks those per device
+		// while it builds its transport cache -- measured: with two devices attached and
+		// host:features refusing, `adb shell` still opened "shell,v2,TERM=xterm-256color,raw:".
+		switch visible := s.devices(); len(visible) {
+		case 1:
+			return false, s.replyValue(c, s.features(visible[0]))
+		case 0:
+			return false, writeFail(c, "no devices/emulators found")
+		default:
+			return false, writeFail(c, "more than one device/emulator")
+		}
 
 	case req == "host:devices", req == "host:devices-l":
 		return false, s.replyValue(c, s.deviceList())
@@ -207,12 +186,12 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 			if !s.allowed(serial) {
 				return false, writeFail(c, deviceNotFound(serial))
 			}
-			// The same list as host:features, which is what the stock server answers:
-			// measured, `host-serial:SERIAL:features` on a connected device returns the
-			// identical 253 bytes as `host:features`. adb asks this one per device while it
-			// builds its transport cache, so answering it with something else means the shell
-			// v2 upgrade is decided by whichever of the two adb happens to read first.
-			return false, s.replyValue(c, featureReply)
+			// Per device, and this is the request that decides the shell v2 upgrade: adb
+			// asks it per device while it builds its transport cache, so it is answered
+			// from that device's own banner rather than from a list about the server. The
+			// stock server answers it with the same bytes it gives host:features, which
+			// is what makes the two interchangeable there.
+			return false, s.replyValue(c, s.features(serial))
 
 		case action == "get-state":
 			// `adb get-state` asks the server what it thinks the device's state is, and does
@@ -381,6 +360,33 @@ func (s *Server) devices() []string {
 		return lister.Serials()
 	}
 	return nil
+}
+
+// Features is the device's own feature list, asked for by a callback.
+//
+// It is separate from Filter and optional, like Serials: what a device supports is a
+// property of the device, the gateway has it from the device's own banner, and a client
+// that has no opinion about it must not have one invented.
+type Features interface {
+	// Features returns the device's feature list verbatim, or the empty string when
+	// the device is not attached.
+	Features(serial string) string
+}
+
+// features is the device's feature list, for one serial.
+//
+// The filter supplies it and the gateway's registry holds it, because both are facts about
+// a device rather than about this server: adb picks the spelling of every command it sends
+// from that list, so a server that answered from its own opinion would put a client on a
+// path the device cannot serve.
+func (s *Server) features(serial string) string {
+	if s == nil || s.filter == nil {
+		return ""
+	}
+	if source, ok := s.filter.(Features); ok {
+		return source.Features(serial)
+	}
+	return ""
 }
 
 func quote(s string) string {

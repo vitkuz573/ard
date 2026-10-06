@@ -38,6 +38,11 @@ type Device struct {
 	// RemoteAddr is recorded for the audit log. It is not an identifier.
 	RemoteAddr string `json:"remote_addr"`
 	Streams    int    `json:"streams"`
+	// Features is the feature list the device's adbd reported in its CNXN banner,
+	// verbatim. It belongs to this entry rather than to the gateway because it
+	// changes with the device: a reboot can bring a different adbd, and a list left
+	// over from the previous session would describe software that is no longer there.
+	Features string `json:"features"`
 }
 
 // Registry is the gateway's device table.
@@ -54,13 +59,14 @@ type Registry struct {
 }
 
 type entry struct {
-	mu    sync.Mutex
-	uuid  string
-	name  string
-	agent string
-	state State
-	open  func(streamID, kind string) (io.ReadWriteCloser, error)
-	conn  func() error
+	mu       sync.Mutex
+	uuid     string
+	name     string
+	agent    string
+	features string
+	state    State
+	open     func(streamID, kind string) (io.ReadWriteCloser, error)
+	conn     func() error
 	// streams counts live streams, so the registry can report load and refuse
 	// work for a device that is already saturated.
 	streams     int
@@ -104,7 +110,7 @@ func (r *Registry) Allowed(uuid string) bool {
 
 // Add registers a connected device. It returns an error if the device is already
 // connected, which would mean two agents claiming one identity.
-func (r *Registry) Add(uuid, name, agent, remoteAddr string,
+func (r *Registry) Add(uuid, name, agent, remoteAddr, features string,
 	open func(streamID, kind string) (io.ReadWriteCloser, error),
 	conn func() error) error {
 	if !r.Allowed(uuid) {
@@ -117,7 +123,7 @@ func (r *Registry) Add(uuid, name, agent, remoteAddr string,
 	}
 	now := r.now()
 	e := &entry{
-		uuid: uuid, name: name, agent: agent, state: StateOnline,
+		uuid: uuid, name: name, agent: agent, features: features, state: StateOnline,
 		open: open, conn: conn, connectedAt: now, lastSeen: now,
 		remoteAddr: remoteAddr,
 	}
@@ -248,6 +254,7 @@ func snapshot(e *entry) *Device {
 		LastSeen:    e.lastSeen,
 		RemoteAddr:  e.remoteAddr,
 		Streams:     e.streams,
+		Features:    e.features,
 	}
 }
 

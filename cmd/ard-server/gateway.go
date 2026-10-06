@@ -109,7 +109,7 @@ func (g *gateway) handleDevice(ctx context.Context, raw net.Conn, tlsCfg *tls.Co
 		return fmt.Errorf("device %q is not enrolled", hello.Device)
 	}
 
-	device, err := transport.New(conn, hello.Device, hello.Name)
+	device, err := transport.New(conn, hello.Device, hello.Name, hello.Features)
 	if err != nil {
 		return err
 	}
@@ -121,7 +121,7 @@ func (g *gateway) handleDevice(ctx context.Context, raw net.Conn, tlsCfg *tls.Co
 		return nil
 	}
 
-	if err := g.reg.Add(hello.Device, hello.Name, hello.Agent, remote,
+	if err := g.reg.Add(hello.Device, hello.Name, hello.Agent, remote, hello.Features,
 		func(streamID, kind string) (io.ReadWriteCloser, error) {
 			return device.Open(ctx, kind, streamID, nil)
 		},

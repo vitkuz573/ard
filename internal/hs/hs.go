@@ -45,6 +45,14 @@ type Hello struct {
 	Device string `json:"device"`
 	Name   string `json:"name"`
 	Agent  string `json:"agent"`
+	// Features is the feature list from the device's own CNXN banner, verbatim.
+	//
+	// It travels here rather than being looked up later because the gateway has to
+	// answer a feature question before any stream exists: adb asks what a device
+	// supports while it is still deciding whether to switch onto it. A device that
+	// reported its features on first use would leave that question unanswerable
+	// until an operator had already asked one.
+	Features string `json:"features,omitempty"`
 }
 
 // Welcome is the gateway's answer. A non-empty Error means the device was refused.

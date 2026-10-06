@@ -66,6 +66,29 @@ func (f operatorFilter) Connected(serial string) bool {
 	return ok
 }
 
+// Features is what the device's own adbd said it supports, handed to adb verbatim.
+//
+// It comes from the registry because the agent put it there after reading the device's
+// banner, and it is passed through unchanged for two reasons. adb chooses the spelling of
+// every command it sends from this list, so a list rebuilt here could differ from the
+// device's in a way nothing reports until a command chooses a path because of it. And a
+// list invented here would be a claim about the device made by something that has not
+// spoken to it, which is how a client ends up sending STA2 to an adbd that only knows STAT.
+//
+// A device that is not attached has no features to report, and the empty string is that:
+// the registry entry is gone, and a client asking about a device that is not there is
+// refused before it gets this far.
+func (f operatorFilter) Features(serial string) string {
+	if serial == "" {
+		return ""
+	}
+	d, ok := f.gw.reg.Get(serial)
+	if !ok {
+		return ""
+	}
+	return d.Features
+}
+
 // Serials is what host:devices renders. It walks the registry so the states are the
 // registry's, and filters through Allows so a device outside the operator's role cannot
 // appear even by name.
@@ -166,6 +189,11 @@ var errNoDeadline = fmt.Errorf("ard: deadlines are not supported on a multiplexe
 // Compile-time proof the filter really is wired to the policy, so a future change to either
 // signature breaks the build rather than quietly widening access.
 var _ adbserverproto.Filter = operatorFilter{}
+
+// The feature list is a second, separate interface on purpose: what a device supports is a
+// fact about the device, and a Filter that had to answer it would be asking every
+// implementation of Filter for something only a gateway with a registry has.
+var _ adbserverproto.Features = operatorFilter{}
 
 // registry is referenced so the import documents what the adapter depends on.
 var _ = registry.Device{}

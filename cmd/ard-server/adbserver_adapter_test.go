@@ -31,6 +31,10 @@ const (
 	deviceC = "33333333-cccc-cccc-cccc-cccccccccccc"
 )
 
+// testDeviceFeatures is a feature list as a device's banner would carry it: the device
+// wrote a trailing comma, and that comma is part of what adb is handed.
+const testDeviceFeatures = "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
+
 const policyYAML = `
 roles:
   - name: maintainer
@@ -65,7 +69,8 @@ func testGateway(t *testing.T) *gateway {
 	openFn := func(string, string) (io.ReadWriteCloser, error) {
 		return nil, fmt.Errorf("no agent session in this test")
 	}
-	if err := reg.Add(deviceA, "pixel", "agent-1", "127.0.0.1:1", openFn, func() error { return nil }); err != nil {
+	if err := reg.Add(deviceA, "pixel", "agent-1", "127.0.0.1:1", testDeviceFeatures,
+		openFn, func() error { return nil }); err != nil {
 		t.Fatalf("register device: %v", err)
 	}
 

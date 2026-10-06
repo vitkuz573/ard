@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 type fakeFilter struct {
 	allowed   map[string]bool
 	connected map[string]bool
+	// features is each device's own list, as its banner carried it.
+	features map[string]string
 }
 
 func (f fakeFilter) Allows(s string) bool { return f.allowed[s] }
@@ -29,8 +32,14 @@ func (f fakeFilter) Serials() []string {
 	for s := range f.allowed {
 		out = append(out, s)
 	}
+	sort.Strings(out)
 	return out
 }
+func (f fakeFilter) Features(s string) string { return f.features[s] }
+
+// silentFilter is a filter with no opinion about features at all, which is what a Filter
+// implementation that is not a gateway looks like.
+type silentFilter struct{ fakeFilter }
 
 // pipe is a net.Conn pair for tests: one end is what adb would hold, the other is what the
 // caller sees when the server opens a device.
@@ -172,21 +181,68 @@ func TestOnlyOneRequestIsAnsweredPerConnection(t *testing.T) {
 // bytes, so no exit status frame is produced and nothing ever says that input has ended.
 //
 //	reply = OKAY + "0008" + "shell_v2"
-func TestHostFeaturesClaimsShellV2(t *testing.T) {
+//
+// Both feature replies are the device's own bytes, and the two bytes of a length prefix in
+// front of them.
+//
+// The captures, from a stock adb server with one device attached whose banner carried
+// "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,":
+//
+//	host:features               -> OKAY 0027 "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
+//	host-serial:SERIAL:features -> OKAY 0027, the identical 39 bytes
+//
+// The trailing comma is in the capture because the device's own banner ends that way, and it
+// is passed on rather than tidied up: adb splits the value on commas, so the empty field
+// after the last one is a field the device sent, and dropping it would make the reply differ
+// from the device in a place nothing reports.
+func TestFeatureRepliesAreTheDeviceListVerbatim(t *testing.T) {
+	const deviceList = "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
+	s := New(fakeFilter{
+		allowed:   map[string]bool{"AAA": true},
+		connected: map[string]bool{"AAA": true},
+		features:  map[string]string{"AAA": deviceList},
+	}, nil, nil)
+
+	const want = "OKAY0027shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
 	for _, service := range []string{"host:features", "host-serial:AAA:features"} {
-		got := serveOne(t, testServer(), service)
-		if want := "OKAY0008shell_v2"; got != want {
+		got := serveOne(t, s, service)
+		if got != want {
 			t.Errorf("%s reply = %q (% x), want %q", service, got, got, want)
 		}
 	}
 }
 
-// A feature list naming something this gateway cannot honour is worse than a short one,
-// because adb then takes the client path for it. So the claim stays at one entry unless a
-// second one is implemented and tested.
-func TestHostFeaturesClaimsOnlyWhatItImplements(t *testing.T) {
-	if strings.Contains(featureReply, ",") {
-		t.Errorf("featureReply = %q claims more than one feature; each needs a test of its own", featureReply)
+// host:features has one answer only when there is one device to answer about, and the stock
+// server says so rather than picking one. Measured, on that same stock server:
+//
+//	no device attached   -> FAIL 001a "no devices/emulators found"
+//	two devices attached -> FAIL 001d "more than one device/emulator"
+//
+// A union would be the wrong substitute: it is a list neither device has, and a client
+// holding it is entitled to send stat_v2 to a device that never said it could. The cost of
+// refusing is measured too -- with two devices attached and this reply failing, `adb shell`
+// still opened "shell,v2,TERM=xterm-256color,raw:", because adb asks the per-serial question
+// while it builds its transport cache and that one is answered.
+func TestHostFeaturesRefusesRatherThanGuessBetweenDevices(t *testing.T) {
+	none := New(silentFilter{fakeFilter{}}, nil, nil)
+	if got := serveOne(t, none, "host:features"); got != "FAIL001ano devices/emulators found" {
+		t.Errorf("with no devices: %q, want FAIL001ano devices/emulators found", got)
+	}
+
+	two := New(fakeFilter{allowed: map[string]bool{"AAA": true, "BBB": true}}, nil, nil)
+	if got := serveOne(t, two, "host:features"); got != "FAIL001dmore than one device/emulator" {
+		t.Errorf("with two devices: %q, want FAIL001dmore than one device/emulator", got)
+	}
+}
+
+// A feature list is the device's claim, not this server's, so a filter that cannot supply
+// one produces an empty reply rather than a substitute. There is no substitute to reach for:
+// any list invented here would be a claim about a device made by something that has not
+// spoken to it.
+func TestFeatureReplyIsEmptyWhenTheFilterHasNoFeatures(t *testing.T) {
+	s := New(silentFilter{fakeFilter{allowed: map[string]bool{"AAA": true}}}, nil, nil)
+	if got := serveOne(t, s, "host-serial:AAA:features"); got != "OKAY0000" {
+		t.Errorf("reply = %q, want OKAY0000", got)
 	}
 }
 
