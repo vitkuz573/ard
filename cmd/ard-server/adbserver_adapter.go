@@ -31,14 +31,16 @@ import (
 	"time"
 
 	"github.com/vitkuz573/ard/internal/adbserverproto"
+	"github.com/vitkuz573/ard/internal/audit"
 	"github.com/vitkuz573/ard/internal/registry"
 )
 
 // operatorFilter presents one operator's entitlements to the adb server protocol.
 type operatorFilter struct {
-	gw   *gateway
-	op   string
-	role string
+	gw     *gateway
+	op     string
+	role   string
+	remote string
 }
 
 // Allows is asked on every listing and every transport request, and answers from the same
@@ -90,10 +92,15 @@ func (f operatorFilter) Open(serial string) (net.Conn, error) {
 	if d := f.gw.authz.Authorize(f.op, serial, "operator-bridge"); !d.Allowed {
 		return nil, fmt.Errorf("operator %q may not attach to %q: %s", f.op, serial, d.Reason)
 	}
-	stream, err := f.gw.reg.Open(serial, "", "operator-bridge")
+	streamID := newStreamID()
+	stream, err := f.gw.reg.Open(serial, streamID, "operator-bridge")
 	if err != nil {
 		return nil, err
 	}
+	f.gw.audit.Record(audit.Event{
+		Kind: "stream.open", Actor: f.op, Device: serial,
+		Stream: streamID, Remote: f.remote, Detail: "adb server protocol",
+	})
 	return &registryStream{rw: stream}, nil
 }
 
@@ -106,7 +113,7 @@ func (f operatorFilter) Open(serial string) (net.Conn, error) {
 // different protocol on the same authenticated port, and a second port would mean a second
 // TLS policy to keep in step with the first.
 func (g *gateway) serveAdbServer(conn net.Conn, operator, role string) {
-	filter := operatorFilter{gw: g, op: operator, role: role}
+	filter := operatorFilter{gw: g, op: operator, role: role, remote: conn.RemoteAddr().String()}
 	srv := adbserverproto.New(filter, filter.Open, func(format string, args ...any) {
 		g.logger.Printf("operator adb session (%s/%s): %s", operator, role, fmt.Sprintf(format, args...))
 	})

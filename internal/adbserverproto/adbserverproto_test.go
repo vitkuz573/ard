@@ -120,21 +120,48 @@ func testServer() *Server {
 	}, nil)
 }
 
-func TestHostVersionAndFeaturesReplyOKAYWithValue(t *testing.T) {
-	for _, service := range []string{"host:version", "host:features"} {
-		got := serveOne(t, testServer(), service)
-		if !strings.HasPrefix(got, "OKAY") {
-			t.Fatalf("%s: reply %q does not start with OKAY", service, got)
-		}
-		// OKAY, then a four-digit length, then the payload.
-		if len(got) < 8 {
-			t.Fatalf("%s: reply too short to carry a length: %q", service, got)
-		}
-		declared := got[4:8]
-		payload := got[8:]
-		if fmt.Sprintf("%04x", len(payload)) != declared {
-			t.Errorf("%s: declared length %q, payload is %d bytes", service, declared, len(payload))
-		}
+// host:version is answered with exactly twelve bytes, captured from the stock adb server:
+// OKAY, a four-digit length of 0004, and the four characters 0029. No version banner is
+// appended. That exactness is the point -- a reply of the right shape but the wrong contents
+// is what made adb stop talking to this port while every other test still passed.
+func TestHostVersionRepliesExactlyAsTheStockServerDoes(t *testing.T) {
+	if got := serveOne(t, testServer(), "host:version"); got != "OKAY00040029" {
+		t.Errorf("host:version reply = %q (% x), want \"OKAY00040029\"", got, got)
+	}
+}
+
+// A second request on the same connection is answered with silence, then the caller closes.
+// A real adb server does exactly this, and adb opens a fresh connection per request.
+func TestOnlyOneRequestIsAnsweredPerConnection(t *testing.T) {
+	p := newPipe()
+	defer p.a.Close()
+	defer p.b.Close()
+	go testServer().Serve(p.b)
+
+	if _, err := p.a.Write(request("host:version")); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	buf := make([]byte, 64)
+	p.a.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := p.a.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read first reply: %v", err)
+	}
+	if string(buf[:n]) != "OKAY00040029" {
+		t.Fatalf("first reply = %q", buf[:n])
+	}
+
+	// The pipe is synchronous, so a write with nobody reading blocks rather than failing.
+	// The deadline is what turns "blocks forever" into "nothing happened", which is the
+	// outcome being asserted.
+	_ = p.a.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := p.a.Write(request("host:version")); err != nil {
+		// The peer closed, which is also the expected outcome.
+		return
+	}
+	p.a.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if n, _ := p.a.Read(buf); n > 0 {
+		t.Errorf("a second request was answered with %q, want nothing", buf[:n])
 	}
 }
 
@@ -304,10 +331,6 @@ func TestNilFilterEntitlesNothing(t *testing.T) {
 // accepted, so revocation takes effect on the next request instead of whenever the client
 // happens to reconnect.
 func TestRevocationTakesEffectOnAnOpenConnection(t *testing.T) {
-	p := newPipe()
-	defer p.a.Close()
-	defer p.b.Close()
-
 	var mu sync.Mutex
 	allowed := true
 	s := New(filterFunc(func(string) bool {
@@ -318,17 +341,21 @@ func TestRevocationTakesEffectOnAnOpenConnection(t *testing.T) {
 		return nil, fmt.Errorf("not needed for this assertion")
 	}, nil)
 
-	go s.Serve(p.b)
-
+	// One request per connection, because that is the protocol: adb opens a fresh
+	// connection for each host service request. Revocation still has to take effect
+	// between two requests rather than being remembered from the first connection.
 	ask := func() string {
-		// host-serial:<serial>:features checks entitlement and then answers, without
-		// opening anything, which is what makes it a clean probe of the filter alone.
-		if _, err := p.a.Write(request("host-serial:AAA:features")); err != nil {
+		pp := newPipe()
+		c, srv := pp.a, pp.b
+		go s.Serve(srv)
+		defer c.Close()
+		defer srv.Close()
+		if _, err := c.Write(request("host-serial:AAA:features")); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		buf := make([]byte, 256)
-		p.a.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, _ := p.a.Read(buf)
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, _ := c.Read(buf)
 		return string(buf[:n])
 	}
 

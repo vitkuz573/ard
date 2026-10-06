@@ -173,11 +173,11 @@ mkdir -p "$ADB_VENDOR_KEYS"
   # devices exist rather than being handed a list. No adb connect, no serial in advance --
   # that is the point of the change.
   for _ in $(seq 1 40); do
-    adb -P "$LOCALPORT" devices >/dev/null 2>&1 && break
+    timeout 15 adb -P "$LOCALPORT" devices >/dev/null 2>&1 && break
     sleep 0.25
   done
 
-  DEVICES="$(adb -P "$LOCALPORT" devices 2>/dev/null || true)"
+  DEVICES="$(timeout 15 adb -P "$LOCALPORT" devices 2>/dev/null || true)"
   printf "%s\n" "$DEVICES" | sed "s/^/      /"
 
   if printf "%s\n" "$DEVICES" | grep -q "^$DEVICE[[:space:]]*device"; then

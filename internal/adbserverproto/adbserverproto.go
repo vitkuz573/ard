@@ -38,10 +38,10 @@ import (
 	"strings"
 )
 
-// Service version strings. adb asks for the protocol version first and compares it against
-// what it knows; answering with the same one the stock server answers keeps it moving.
+// Service replies. adb asks for the protocol version first and compares it against what it
+// knows, so the payload is exactly the four characters a real adb server sends.
 const (
-	versionReply = "0029host::version=41"
+	versionReply = "0029"
 	okayToken    = "OKAY"
 	failToken    = "FAIL"
 )
@@ -73,6 +73,11 @@ type Server struct {
 	// logf is optional and receives one line per unexpected condition. It is nil in
 	// tests and never required in production.
 	logf func(format string, args ...any)
+
+	// relayPrefix is whatever the request reader had already buffered when the connection
+	// turned into a device transport. It is consumed by the relay before anything is read
+	// from the socket; without it those bytes belong to nobody.
+	relayPrefix []byte
 }
 
 // New returns a Server. logf may be nil.
@@ -86,30 +91,41 @@ func (s *Server) debugf(format string, args ...any) {
 	}
 }
 
-// Serve answers requests on c until the client goes away or asks for a transport, in which
-// case the connection becomes that transport and this call relays it to completion.
+// Serve answers one request on c and returns.
 //
-// Serving one connection per call is deliberate: adb opens a fresh connection per host
-// service request, so a listener hands each of them straight here.
+// One request per connection is what a real adb server does: adb opens a fresh connection for
+// every host service request, and a second request on the same connection is answered with
+// silence and then a close. Measured against the stock server, not assumed.
+//
+// The buffered reader matters more than it looks. adb sends the tport request and the start
+// of the device's CNXN in the same segment, so reading the request through a bufio.Reader
+// pulls those following bytes into its buffer. Whoever takes the connection next has to be
+// given them explicitly, or the device never sees the CNXN and answers nothing -- which looks
+// exactly like a broken tunnel and is invisible in a trace that starts after the relay.
 func (s *Server) Serve(c net.Conn) error {
 	br := bufio.NewReader(c)
-	for {
-		req, err := readRequest(br)
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		done, err := s.dispatch(c, req)
-		if err != nil {
-			s.debugf("adbserverproto: %q: %v", req, err)
-			return err
-		}
-		if done {
+	req, err := readRequest(br)
+	if err != nil {
+		if err == io.EOF {
 			return nil
 		}
+		return err
 	}
+	becameTransport, err := s.dispatch(c, req)
+	if err != nil {
+		s.debugf("adbserverproto: %q: %v", req, err)
+	}
+	if becameTransport {
+		// Hand over whatever the reader already holds, ahead of anything still in the
+		// socket, or those bytes are read by nobody.
+		if n := br.Buffered(); n > 0 {
+			held := make([]byte, n)
+			if _, rerr := io.ReadFull(br, held); rerr == nil {
+				s.relayPrefix = held
+			}
+		}
+	}
+	return err
 }
 
 // dispatch answers one request. It reports true when the connection has become a device
@@ -117,17 +133,21 @@ func (s *Server) Serve(c net.Conn) error {
 func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 	switch {
 	case req == "host:version":
+		// The payload is four characters and nothing else: a real adb server answers
+		// OKAY 0004 0029, where 0004 is this field's length and 0029 is the protocol
+		// version. It does not append a version banner, and guessing that it did is what
+		// made adb stop talking to this port -- it read a length that matched the banner
+		// rather than the version, concluded nothing sensible, and then tried to start a
+		// server of its own on a port already taken.
 		return false, s.replyValue(c, versionReply)
 
 	case req == "host:features":
-		// A feature list, not a version string. adb asks this separately from host:version
-		// and parses the answer as a comma-separated list; handing it the version reply
-		// made it treat a server it did not understand as one it should not talk to.
-		//
-		// Empty is honest. Everything this server does is decided by which services it
-		// answers, and advertising features it does not implement is how a client ends up
-		// on a path that cannot work -- the same mistake a device banner makes when it
-		// claims compression it cannot decompress.
+		// A comma-separated list, or empty. adb asks this separately from host:version
+		// and parses the answer as a list; a real server answers FAIL when it has no
+		// devices to describe, and empty is the closest honest answer when there is
+		// nothing to offer. Advertising features that are not implemented is how a client
+		// ends up on a path that cannot work -- the same mistake a device banner makes
+		// when it claims compression it cannot decompress.
 		return false, s.replyValue(c, "")
 
 	case req == "host:devices", req == "host:devices-l":
@@ -191,7 +211,7 @@ func (s *Server) beginTransport(c net.Conn, serial string) (bool, error) {
 	// From here the connection is the transport: a half-close on the client side is how a
 	// device signals end of input, so copying until either side errors rather than to
 	// EOF is what keeps `adb shell cat` working.
-	err = relay(c, dev)
+	err = relay(c, dev, s.relayPrefix)
 	dev.Close()
 	if err != nil && err != io.EOF {
 		return true, err
@@ -318,9 +338,21 @@ func writeFail(w io.Writer, msg string) error {
 }
 
 // relay copies in both directions until either side stops.
-func relay(a, b net.Conn) error {
+//
+// prefix is written to b before the socket is read, because those bytes were taken from the
+// socket already when the request was parsed.
+func relay(a, b net.Conn, prefix []byte) error {
 	errc := make(chan error, 2)
-	go func() { _, err := io.Copy(a, b); errc <- err }()
+	go func() {
+		if len(prefix) > 0 {
+			if _, err := b.Write(prefix); err != nil {
+				errc <- err
+				return
+			}
+		}
+		_, err := io.Copy(a, b)
+		errc <- err
+	}()
 	go func() { _, err := io.Copy(b, a); errc <- err }()
 	// One direction finishing first is the normal case -- the device hangs up and the
 	// client's socket is still open -- so the first result decides and the second goroutine

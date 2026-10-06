@@ -236,13 +236,12 @@ func TestReplyFramingIsExact(t *testing.T) {
 	if _, err := io.ReadFull(br, payload); err != nil {
 		t.Fatalf("read payload: %v", err)
 	}
-	// The payload starts with its own four-digit length followed by the version line. That
-	// looks like a doubled prefix and is not: a stock adb server answers host:version with
-	// "0029host::version=41", where 0029 is the length of the rest of that string and is
-	// part of the version format rather than of the reply envelope. Stripping it would make
-	// adb print an empty version.
-	if want := "0029host::version=41"; string(payload) != want {
-		t.Errorf("payload %q, want exactly %q", payload, want)
+	// The exact bytes, captured from the stock adb server: OKAY, a four-digit length of
+	// 0004, and the four characters 0029. No version banner is appended. Asserting this
+	// literally is the point: a reply of the right shape but the wrong contents is what
+	// stopped adb talking to this port at all, while every other assertion here passed.
+	if got := "OKAY" + string(tok) + string(payload); got != "OKAY00040029" {
+		t.Errorf("reply %q, want %q", got, "OKAY00040029")
 	}
 	client.Close()
 }
