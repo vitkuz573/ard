@@ -11,20 +11,22 @@ adb ──> 127.0.0.1:15000 ──> ard-connect ──mTLS──> ard-server
 ```
 
 `ard-connect` runs on the operator's machine and needs nothing else: no SSH, no
-account on the gateway. That is not a convenience. The gateway runs the real `adb
-server` and binds each device to a loopback port, so the alternative was an operator
-logging into the VPS over SSH to use it — which hands out all-or-nothing root on the
-machine that holds the CA private keys, cannot be scoped per device, and cannot be
-revoked for one person without disturbing the rest.
+account on the gateway. That is not a convenience. The gateway publishes one port and
+speaks adb's own server protocol on it, so the alternative was an operator logging into
+the VPS over SSH to use it — which hands out all-or-nothing root on the machine that
+holds the CA private keys, cannot be scoped per device, and cannot be revoked for one
+person without disturbing the rest.
 
 The device dials out. It sits behind NAT, usually carrier-grade NAT, so the
 gateway can never connect to it. Every stream an operator opens is multiplexed
 over the one inbound connection the device made.
 
-Because the **real** `adb` binary is what talks to the device, nothing about ADB is
-reimplemented: `shell`, `push`, `pull`, `install`, `logcat`, `forward` and `reverse`
-all come from `adb` itself, so upstream features arrive without anyone writing them
-again.
+`adb` itself decides what to do on the device, so an upstream ADB feature arrives
+without anyone writing it again — the gateway's job ends at switching `adb` onto a
+device and relaying the bytes. That is not quite "nothing is reimplemented": the
+gateway does answer adb's server protocol (`internal/adbserverproto`) and does the
+host side of the `CNXN`/`OPEN` exchange with the device. It does not implement any
+ADB service.
 
 A local helper on the operator's machine is unavoidable rather than incidental. `adb`
 speaks plaintext TCP to `host:port` and cannot do TLS at all, and the gateway accepts
@@ -48,16 +50,20 @@ ard-connect -gateway gw.example:7100 \
             -ca server-ca.crt -cert operator.crt -key operator.key
 ```
 
-It prints one local port per device your role permits, then:
+It prints the local port it published, then point `adb` at that port:
 
 ```sh
-adb connect 127.0.0.1:15000
-adb -s 127.0.0.1:15000 shell
+adb -P 15000 devices
+adb -P 15000 -s <device-uuid> shell
 ```
 
-Devices your role may see but not drive are listed without a port, and say so. Roles,
-permissions and per-device grants live in `deploy/operators.yaml`, and every attach is
-authorized on the gateway — the client is never trusted about what it may reach.
+`adb` asks the gateway which devices exist rather than being handed a list, so there is
+no `adb connect` and no serial to remember between machines — the serial is the device
+UUID. A device your role may see but not drive appears in the listing and is refused
+when you try to drive it, with the reason on your own terminal. Roles, permissions and
+per-device grants live in `deploy/operators.yaml`, and every attach is authorized on
+the gateway — the client is never trusted about what it may reach, and holds no device
+list of its own.
 
 ## Deploy to a device
 
