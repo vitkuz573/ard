@@ -224,82 +224,22 @@ func (g *gateway) handleOperator(ctx context.Context, raw net.Conn, tlsCfg *tls.
 	g.logger.Printf("operator %s connected from %s (role %s, %d grants)",
 		name, remote, role.Name, len(role.Grants))
 
-	// Send the device list the operator is entitled to see. Filtering here rather
-	// than in the client keeps the authorization decision on the server, where it
-	// cannot be bypassed by a modified client.
+	// The operator leg speaks adb's own server protocol and nothing else.
+	//
+	// It used to send a JSON device list and then take one JSON request per connection,
+	// with the client binding a loopback port per device it had been told about. That put
+	// a device list on the operator's machine and a port table on the gateway, and neither
+	// was needed: adb already asks "which devices exist" and "switch to this one", so the
+	// gateway answers those questions and adb discovers the rest. Filtering happens in the
+	// adapter against the same policy that used to authorize the bridge.
 	_ = conn.SetDeadline(time.Time{})
-	visible := make([]operatorDevice, 0)
-	for _, d := range g.reg.List() {
-		if !g.authz.CanSee(name, d.UUID) {
-			continue
-		}
-		visible = append(visible, operatorDevice{
-			Device:     d,
-			Bridgeable: g.authz.Authorize(name, d.UUID, "operator-bridge").Allowed,
-		})
-	}
-	if err := writeJSON(conn, operatorGreeting{
-		Operator: name,
-		Role:     role.Name,
-		Devices:  visible,
-	}); err != nil {
-		return err
-	}
-
-	// Hand the connection to the stream handler, which authorizes the requested device
-	// and pipes it through. This used to just wait for the operator to disconnect, which
-	// left the operator port able to identify people and nothing more -- the whole reason
-	// an operator had to be given SSH on the gateway instead.
-	g.serveOperatorStreams(ctx, conn, name, role.Name)
+	g.audit.Record(audit.Event{
+		Kind: "operator.adb_protocol", Actor: name, Remote: remote, Detail: role.Name,
+	})
+	g.logger.Printf("operator %s from %s speaking the adb server protocol (role %s, %d grants)",
+		name, remote, role.Name, len(role.Grants))
+	g.serveAdbServer(conn, name, role.Name)
 	return nil
-}
-
-// operatorGreeting is the first frame on the operator leg.
-type operatorGreeting struct {
-	Operator string           `json:"operator"`
-	Role     string           `json:"role"`
-	Devices  []operatorDevice `json:"devices"`
-}
-
-// operatorDevice is one device as the operator is allowed to know about it.
-//
-// Bridgeable is included so the client does not advertise an adb serial the gateway will
-// then refuse. Without it, a client that published every visible device would let
-// `adb connect` succeed locally and fail on first use, which looks like a broken device
-// rather than a policy decision -- and the decision belongs on the server, so the server
-// is what states it.
-type operatorDevice struct {
-	registry.Device
-	Bridgeable bool `json:"bridgeable"`
-}
-
-// controlRequest is one request on the unix socket.
-//
-// Length-prefixed JSON followed, for attach, by raw stream bytes. Framing is
-// explicit rather than a stream multiplexer because there is exactly one client
-// and one request type; a mux here would be structure without a reason.
-type controlRequest struct {
-	Op     string `json:"op"`
-	Device string `json:"device,omitempty"`
-
-	// Enrolment fields. Code identifies a pending request; CertPEM and CAPEM carry the
-	// signed certificate back. They travel in the same request rather than a second
-	// frame so the uid check in requireRootControl can happen before any of them is
-	// looked at.
-	Code    string `json:"code,omitempty"`
-	CertPEM []byte `json:"cert_pem,omitempty"`
-	CAPEM   []byte `json:"ca_pem,omitempty"`
-}
-
-// listResponse describes every known device, online or not.
-type listResponse struct {
-	Devices []registry.Device `json:"devices"`
-}
-
-// attachResponse reports which device a stream landed on.
-type attachResponse struct {
-	Device string `json:"device"`
-	Error  string `json:"error,omitempty"`
 }
 
 // serveControl serves ard-proxy over a unix socket.
