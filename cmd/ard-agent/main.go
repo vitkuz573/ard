@@ -370,17 +370,19 @@ func handleStream(ctx context.Context, route hs.Route, stream net.Conn, resolve 
 
 	done := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(activity.writerTo(upstream), stream)
+		n, err := io.Copy(activity.writerTo(upstream), stream)
 		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
+		log.Printf("stream %s: operator to device copied %d byte(s), err=%v", streamIDOf(route), n, err)
 		done <- err
 	}()
 	go func() {
-		_, err := io.Copy(activity.writerTo(stream), upstream)
+		n, err := io.Copy(activity.writerTo(stream), upstream)
 		if cw, ok := stream.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		}
+		log.Printf("stream %s: device to operator copied %d byte(s), err=%v", streamIDOf(route), n, err)
 		done <- err
 	}()
 

@@ -32,6 +32,12 @@ OPERATOR="alice"
 
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  # ARD_KEEP_WORK=1 leaves the logs behind. A failure that removes its own evidence is a
+  # failure that has to be guessed at, and this script has already wasted hours on that.
+  if [[ "${ARD_KEEP_WORK:-0}" != "0" ]]; then
+    echo "work dir kept: $WORK" >&2
+    return
+  fi
   rm -rf "$WORK"
 }
 PIDS=()
@@ -198,6 +204,8 @@ if [[ "$WHO" == "shell" ]]; then
   ok "adb shell whoami returned: $WHO"
 else
   bad "adb shell produced '$WHO', want 'shell'"
+  printf 'raw bytes: '
+  timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell whoami 2>/dev/null | od -An -c | head -2
 fi
 
 timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell false >/dev/null 2>&1 || rc=$?
@@ -302,3 +310,12 @@ if [[ $FAIL -eq 0 ]]; then
 fi
 printf '\033[31m%d of %d checks failed\033[0m\n' "$FAIL" "$((PASS+FAIL))"
 exit 1
+
+# Diagnostics: ARD_DEBUG_LOG=1 dumps both logs when something failed, which is the
+# difference between debugging and guessing.
+if [[ "${ARD_DEBUG_LOG:-0}" != "0" ]]; then
+  echo "--- server.log ---"
+  tail -30 "$WORK/server.log" 2>/dev/null
+  echo "--- proxy.log ---"
+  tail -10 "$WORK/proxy.log" 2>/dev/null
+fi

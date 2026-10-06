@@ -165,6 +165,30 @@ func TestOnlyOneRequestIsAnsweredPerConnection(t *testing.T) {
 	}
 }
 
+// shell_v2 is the one feature this gateway must claim, and the cost of not claiming it is
+// two broken commands that both look like the device's fault. Measured: with an empty
+// feature list the adb client sends the bare service "shell:false" and its stdin as raw
+// bytes, so no exit status frame is produced and nothing ever says that input has ended.
+//
+//	reply = OKAY + "0008" + "shell_v2"
+func TestHostFeaturesClaimsShellV2(t *testing.T) {
+	for _, service := range []string{"host:features", "host-serial:AAA:features"} {
+		got := serveOne(t, testServer(), service)
+		if want := "OKAY0008shell_v2"; got != want {
+			t.Errorf("%s reply = %q (% x), want %q", service, got, got, want)
+		}
+	}
+}
+
+// A feature list naming something this gateway cannot honour is worse than a short one,
+// because adb then takes the client path for it. So the claim stays at one entry unless a
+// second one is implemented and tested.
+func TestHostFeaturesClaimsOnlyWhatItImplements(t *testing.T) {
+	if strings.Contains(featureReply, ",") {
+		t.Errorf("featureReply = %q claims more than one feature; each needs a test of its own", featureReply)
+	}
+}
+
 func TestHostDevicesListsOnlyEntitledSerials(t *testing.T) {
 	got := serveOne(t, testServer(), "host:devices")
 	if !strings.HasPrefix(got, "OKAY") {
@@ -219,9 +243,15 @@ func TestFailReplyCarriesAMessage(t *testing.T) {
 	}
 }
 
-// After OKAY on tport the connection must become the device's transport: bytes written by
-// the client have to arrive at the device, and the device's bytes have to arrive back.
-func TestTportTurnsTheConnectionIntoADeviceTransport(t *testing.T) {
+// host:transport is the raw form: after OKAY the connection carries the ADB transport itself,
+// so the client sends CNXN and the bytes belong to the device with nothing in between.
+//
+// This is asserted on host:transport rather than host:tport because the two are not the same
+// protocol, and a test on tport that wrote a CNXN straight after the OKAY would be asserting a
+// conversation no adb client has. On tport the client sends a service request instead, and this
+// server does the CNXN and OPEN with the device -- see TestShellV2ExitStatusReachesTheClientUnaltered
+// for those exact bytes.
+func TestHostTransportBecomesARawDeviceTransport(t *testing.T) {
 	// Two separate pairs. The first is the connection adb holds and the server serves; the
 	// second is the device, with the server holding one end and the test the other. Sharing
 	// one pair would connect the client's own writes straight back to itself.
@@ -244,7 +274,7 @@ func TestTportTurnsTheConnectionIntoADeviceTransport(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(server) }()
 
-	if _, err := client.Write(request("host:tport:serial:AAA")); err != nil {
+	if _, err := client.Write(request("host:transport:AAA")); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
 
@@ -257,14 +287,15 @@ func TestTportTurnsTheConnectionIntoADeviceTransport(t *testing.T) {
 		t.Fatal("the device was never opened")
 	}
 
-	// Read the OKAY, then the relay takes over.
+	// host:transport is answered with a bare four-byte OKAY -- captured from the stock
+	// server, and the whole difference from tport, which appends a 64-bit transport id.
 	head := make([]byte, 4)
 	client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.ReadFull(client, head); err != nil {
 		t.Fatalf("read OKAY: %v", err)
 	}
 	if string(head) != "OKAY" {
-		t.Fatalf("first four bytes %q, want OKAY", head)
+		t.Fatalf("host:transport reply %q (% x), want \"OKAY\"", head, head)
 	}
 
 	// Client to device: this is the CNXN the real adb would send here.
@@ -377,3 +408,320 @@ type filterFunc func(string) bool
 
 func (f filterFunc) Allows(s string) bool  { return f(s) }
 func (f filterFunc) Connected(string) bool { return false }
+
+// The bytes the device sees for a shell command, and the bytes the client sees back, asserted
+// as exact captures rather than as "the shape is right". Every byte here was taken off a live
+// exchange between the stock adb server, a device and the real adb client:
+//
+//	host -> device  OPEN arg0=<host id> arg1=0 len=0x27 "shell,v2,TERM=xterm-256color,raw:false\0"
+//	device -> host  OKAY arg0=0x1e(argument is the device's stream id) arg1=<host id>
+//	device -> host  WRTE arg0=<device id> arg1=<host id> len=6 03 01 00 00 00 01
+//	host -> device  OKAY arg0=<device id> arg1=<host id>
+//	device -> host  CLSE arg0=<device id> arg1=<host id>
+//	host -> device  CLSE arg0=<device id> arg1=<host id>
+//
+// The three things this asserts that a shape check would not have caught: the device's stream
+// id has to be read out of the OKAY reply and used as arg0 of every later packet, the WRTE
+// has to be acknowledged, and the client has to receive the six payload bytes untouched --
+// `03 01 00 00 00 01` is the shell v2 exit frame, id 3, length 1, status 1, and it is how
+// `adb shell false` comes back as a failure.
+func TestShellV2ExitStatusReachesTheClientUnaltered(t *testing.T) {
+	ad := newPipe()
+	dev := newPipe()
+	client, server := ad.a, ad.b
+	device := dev.b
+	defer client.Close()
+	defer server.Close()
+	defer dev.a.Close()
+	defer device.Close()
+
+	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
+		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+	go s.Serve(server)
+
+	// The device side: answer the handshake, then send the exact six payload bytes the
+	// capture shows, then close the stream.
+	const deviceID = 0x1e
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		br := bufio.NewReader(device)
+		if err := expectPacket(device, br, cmdCNXN, cnxnArg0, adbMaxData); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := writeTo(device, encodePacket(cmdCNXN, cnxnArg0, adbMaxData, []byte("device::"))); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := expectPacket(device, br, cmdOKAY, cnxnArg0, adbMaxData); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		open, err := readPacket(br)
+		if err != nil {
+			t.Errorf("device: read OPEN: %v", err)
+			return
+		}
+		if want := "shell,v2,TERM=xterm-256color,raw:false\x00"; string(open.payload) != want {
+			t.Errorf("device: OPEN payload %q, want %q", open.payload, want)
+		}
+		if open.arg1 != 0 {
+			t.Errorf("device: OPEN arg1 = %d, want 0", open.arg1)
+		}
+		if err := writeTo(device, encodePacket(cmdOKAY, deviceID, open.arg0, nil)); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		// net.Pipe is unbuffered, so the order here has to alternate with the host's or the
+		// two goroutines deadlock on each other's writes. The host's order is measured and
+		// fixed: ack the WRTE, then send the CLSE once it has seen the device's own.
+		if err := writeTo(device, encodePacket(cmdWRTE, deviceID, open.arg0, []byte{0x03, 0x01, 0x00, 0x00, 0x00, 0x01})); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := expectPacket(device, br, cmdOKAY, deviceID, open.arg0); err != nil {
+			t.Errorf("device: the WRTE was not acknowledged: %v", err)
+			return
+		}
+		if err := writeTo(device, encodePacket(cmdCLSE, deviceID, open.arg0, nil)); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := expectPacket(device, br, cmdCLSE, deviceID, open.arg0); err != nil {
+			t.Errorf("device: the close was not answered with a close: %v", err)
+		}
+	}()
+
+	if _, err := client.Write(request("host:tport:serial:AAA")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	head := make([]byte, 12)
+	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(client, head); err != nil {
+		t.Fatalf("read tport reply: %v", err)
+	}
+	if _, err := client.Write(request("shell,v2,TERM=xterm-256color,raw:false")); err != nil {
+		t.Fatalf("write service request: %v", err)
+	}
+
+	// A switched transport answers with a bare OKAY and then hands over a raw stream, so
+	// everything after it is the stream itself.
+	ack := make([]byte, 4)
+	if _, err := io.ReadFull(client, ack); err != nil {
+		t.Fatalf("read stream acknowledgement: %v", err)
+	}
+	if string(ack) != "OKAY" {
+		t.Fatalf("stream acknowledgement %q, want \"OKAY\"", ack)
+	}
+
+	// Exactly the six bytes from the capture, no framing added and none removed.
+	payload := make([]byte, 6)
+	if _, err := io.ReadFull(client, payload); err != nil {
+		t.Fatalf("read the device's payload: %v", err)
+	}
+	want := []byte{0x03, 0x01, 0x00, 0x00, 0x00, 0x01}
+	if !bytes.Equal(payload, want) {
+		t.Errorf("client received % x, want % x", payload, want)
+	}
+
+	<-done
+}
+
+// The client's input has to reach the device addressed to the stream the device named, and
+// the end of it has to arrive as a CLSE.
+//
+// Measured against the stock server with `adb shell cat` and a five-byte file:
+//
+//	host -> device  WRTE arg0=0x76 arg1=0x1f len=5 00 05 00 00 00 "hello"   <- the v2 stdin frame
+//	device -> host  OKAY arg0=0x1f arg1=0x76
+//	... and on the client's half-close:
+//	host -> device  CLSE arg0=0x76 arg1=0x1f
+//
+// arg0 is the device's stream id and arg1 is the host's. Written the other way round -- arg0
+// the host's own id and arg1 zero, as this did before -- the device resolves no stream from
+// arg1 and drops the payload without saying so: `adb shell cat` reads no input and blocks
+// forever. That is the failure this test was written for.
+func TestClientInputReachesTheDeviceStreamTheDeviceNamed(t *testing.T) {
+	// A real TCP socket on the client side, not net.Pipe. The assertion is about a
+	// half-close, which net.Pipe has no way to express: it can only be closed outright,
+	// which would end the output direction too and make the case indistinguishable from
+	// the client going away. adb's own connection is a socket too, so this is closer to
+	// what happens than the pipe was.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	type accepted struct {
+		conn net.Conn
+		err  error
+	}
+	acceptc := make(chan accepted, 1)
+	go func() {
+		c, err := ln.Accept()
+		acceptc <- accepted{c, err}
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	got := <-acceptc
+	if got.err != nil {
+		t.Fatalf("accept: %v", got.err)
+	}
+	server := got.conn
+	defer server.Close()
+
+	dev := newPipe()
+	device := dev.b
+	defer dev.a.Close()
+	defer device.Close()
+
+	const deviceID = 0x1f
+	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
+		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+	go s.Serve(server)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		br := bufio.NewReader(device)
+		if err := expectPacket(device, br, cmdCNXN, cnxnArg0, adbMaxData); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := writeTo(device, encodePacket(cmdCNXN, cnxnArg0, adbMaxData, []byte("device::"))); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		if err := expectPacket(device, br, cmdOKAY, cnxnArg0, adbMaxData); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		open, err := readPacket(br)
+		if err != nil {
+			t.Errorf("device: read OPEN: %v", err)
+			return
+		}
+		if err := writeTo(device, encodePacket(cmdOKAY, deviceID, open.arg0, nil)); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		// The stdin frame is the client's own: id 0, a four-byte little-endian length, then
+		// the bytes. The gateway does not build it and must not disturb it.
+		first, err := readPacket(br)
+		if err != nil {
+			t.Errorf("device: read WRTE: %v", err)
+			return
+		}
+		wantFrame := append([]byte{0x00, 0x05, 0x00, 0x00, 0x00}, []byte("hello")...)
+		if first.arg0 != deviceID || first.arg1 != open.arg0 {
+			t.Errorf("WRTE arg0=%d arg1=%d, want arg0=%d arg1=%d", first.arg0, first.arg1, deviceID, open.arg0)
+		}
+		if !bytes.Equal(first.payload, wantFrame) {
+			t.Errorf("device received % x, want % x", first.payload, wantFrame)
+		}
+		if err := writeTo(device, encodePacket(cmdOKAY, deviceID, open.arg0, nil)); err != nil {
+			t.Errorf("device: %v", err)
+			return
+		}
+		// The end of the client's input. Read on the same buffered reader as everything else,
+		// because a second reader on the same conn would miss whatever this one had already
+		// taken in and the assertion would be about nothing.
+		if err := expectPacket(device, br, cmdCLSE, deviceID, open.arg0); err != nil {
+			t.Errorf("device: the end of the client's input did not arrive as a CLSE: %v", err)
+		}
+	}()
+
+	if _, err := client.Write(request("host:tport:serial:AAA")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	head := make([]byte, 12)
+	client.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(client, head); err != nil {
+		t.Fatalf("read tport reply: %v", err)
+	}
+	if _, err := client.Write(request("shell,v2,TERM=xterm-256color,raw:cat")); err != nil {
+		t.Fatalf("write service request: %v", err)
+	}
+	// The bare OKAY comes before the stream. It is read here rather than folded into the
+	// payload assertion because it is part of the handshake, not part of what the device
+	// said -- a test that skipped it would read four bytes of handshake as stream data and
+	// blame the relay.
+	ack := make([]byte, 4)
+	if _, err := io.ReadFull(client, ack); err != nil {
+		t.Fatalf("read stream acknowledgement: %v", err)
+	}
+	if string(ack) != "OKAY" {
+		t.Fatalf("stream acknowledgement %q, want \"OKAY\"", ack)
+	}
+	if _, err := client.Write([]byte{0x00, 0x05, 0x00, 0x00, 0x00, 'h', 'e', 'l', 'l', 'o'}); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	// Half-close: the client's input is over and its output is still expected. This is
+	// what adb's shell client does when stdin reaches its end, and it is the event the
+	// CLSE exists for.
+	if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("half-close: %v", err)
+	}
+
+	<-done
+}
+
+// expectPacket reads one packet and checks its command and its two ids, which is the whole
+// content of most of the assertions here.
+func expectPacket(c net.Conn, br *bufio.Reader, command string, arg0, arg1 uint32) error {
+	p, err := readPacket(br)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", command, err)
+	}
+	if p.command != command {
+		return fmt.Errorf("packet is %s, want %s (arg0=%d arg1=%d len=%d)", p.command, command, p.arg0, p.arg1, len(p.payload))
+	}
+	if p.arg0 != arg0 || p.arg1 != arg1 {
+		return fmt.Errorf("%s arg0=%d arg1=%d, want arg0=%d arg1=%d", command, p.arg0, p.arg1, arg0, arg1)
+	}
+	return nil
+}
+
+// writeTo writes one packet. net.Pipe is synchronous, so a write blocks until the reader takes
+// it, which is what keeps these two goroutines in step.
+func writeTo(c net.Conn, p []byte) error {
+	if _, err := c.Write(p); err != nil {
+		return fmt.Errorf("write packet: %w", err)
+	}
+	return nil
+}
+
+// host:transport is answered with a bare four-byte OKAY and nothing else. The stock server
+// does exactly that, and the distinction from tport is eight bytes of transport id: treating
+// the two as the same reply left adb waiting for an id that never came.
+func TestHostTransportRepliesWithBareOKAY(t *testing.T) {
+	// The device has to open, because a failure to open is answered with FAIL and the
+	// reply being measured is the one that follows a successful open.
+	dev := newPipe()
+	defer dev.a.Close()
+	defer dev.b.Close()
+	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
+		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+
+	p := newPipe()
+	defer p.a.Close()
+	defer p.b.Close()
+	go s.Serve(p.b)
+
+	if _, err := p.a.Write(request("host:transport:AAA")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	head := make([]byte, 4)
+	p.a.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(p.a, head); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if string(head) != "OKAY" {
+		t.Errorf("host:transport reply = %q (% x), want \"OKAY\"", head, head)
+	}
+}

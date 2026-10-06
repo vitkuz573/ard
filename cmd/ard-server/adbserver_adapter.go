@@ -32,6 +32,7 @@ import (
 
 	"github.com/vitkuz573/ard/internal/adbserverproto"
 	"github.com/vitkuz573/ard/internal/audit"
+	"github.com/vitkuz573/ard/internal/hs"
 	"github.com/vitkuz573/ard/internal/registry"
 )
 
@@ -93,7 +94,13 @@ func (f operatorFilter) Open(serial string) (net.Conn, error) {
 		return nil, fmt.Errorf("operator %q may not attach to %q: %s", f.op, serial, d.Reason)
 	}
 	streamID := newStreamID()
-	stream, err := f.gw.reg.Open(serial, streamID, "operator-bridge")
+	// The kind is "adb", not "operator-bridge". Those two are different things and the
+	// difference is not cosmetic: "operator-bridge" is the name the ACL file gives this
+	// permission check, while "adb" is the stream kind the agent dispatches on. Passing the
+	// permission name opened a stream of a kind nothing on the device handles, so the
+	// connection was accepted and then nothing was ever read from it -- the shell request
+	// produced no output and no error, which is the worst of both.
+	stream, err := f.gw.reg.Open(serial, streamID, hs.KindADB)
 	if err != nil {
 		return nil, err
 	}
