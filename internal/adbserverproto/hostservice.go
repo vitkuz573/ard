@@ -249,14 +249,19 @@ func (s *Server) pumpHostStream(c net.Conn, dev net.Conn, cbr *bufio.Reader, dbr
 }
 
 // readPacket reads one ADB message.
+//
+// The payload cap is adbMaxPacket, measured from what a stock adb client reads rather than
+// from the window this server offers: a device puts a whole sync DATA frame in one packet,
+// and 64 KiB of frame is a size a real device produces and a real adb accepts. Refusing it
+// truncates the pull of any file larger than one frame, and reports nothing on either end.
 func readPacket(br *bufio.Reader) (packet, error) {
 	head := make([]byte, adbHeaderLen)
 	if _, err := io.ReadFull(br, head); err != nil {
 		return packet{}, err
 	}
 	n := uint32At(head[12:16])
-	if n > adbMaxData {
-		return packet{}, fmt.Errorf("packet claims %d bytes, over the %d byte limit", n, adbMaxData)
+	if n > adbMaxPacket {
+		return packet{}, fmt.Errorf("packet claims %d bytes, over the %d byte limit", n, adbMaxPacket)
 	}
 	p := packet{
 		command: strings.TrimRight(string(head[0:4]), "\x00"),

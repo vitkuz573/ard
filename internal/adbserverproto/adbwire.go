@@ -26,6 +26,24 @@ const (
 	adbHeaderLen = 24
 	adbMaxData   = 4096
 
+	// adbMaxPacket is the largest payload readPacket will accept from a device.
+	//
+	// It is not the same number as adbMaxData, and the difference is measured rather than
+	// chosen. adbMaxData is what this server advertises in its own CNXN as the window it
+	// offers; adbMaxPacket is what it will read. A device is free to send more than it was
+	// offered -- a stock adbd sends a sync DATA frame whole, and a frame is 64 KiB of file
+	// content -- and a relay that refuses those bytes breaks a transfer that adb itself
+	// would have completed. The reference is the adb binary on the other side of this
+	// gateway: pulling a 3 MB file from a device that put each DATA frame in one packet
+	// fails with
+	//
+	//	adb: error: msg.data.size too large: 3000000 (max 65536)
+	//
+	// so 65536 is what a real adb client reads. Anything above that is a device that has
+	// lost the plot, and the cap is still worth having: it is the difference between a
+	// refused packet and an allocation sized by a length field.
+	adbMaxPacket = 65536
+
 	// Command bytes.
 	cmdCNXN = "CNXN"
 	cmdOPEN = "OPEN"
