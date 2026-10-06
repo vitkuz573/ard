@@ -8,7 +8,6 @@
 # Compiled binaries.
 /ard-agent
 /ard-server
-/ard-proxy
 /ard-ca
 /ardctl
 /bin/

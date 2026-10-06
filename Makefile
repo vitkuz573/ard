@@ -3,7 +3,7 @@
 # The gateway has no Go toolchain, so everything deploys as a static cross-build.
 
 GOOS_TARGET := linux/amd64
-BINARIES    := ard-server ard-proxy ard-agent ard-tap ard-ca
+BINARIES    := ard-server ard-connect ard-agent ard-ca
 
 .PHONY: all build test race vet fmt clean dist pki-demo
 
