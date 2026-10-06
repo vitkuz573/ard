@@ -26,6 +26,11 @@ import (
 // usage or lookup failure, 2 for a misuse, 127 for an unknown command.
 
 // shellRunner holds per-session state.
+//
+// One runner serves a whole session, which is what makes `cd` in one line visible to the
+// next: a real `sh` keeps one working directory for the life of the process, and a runner
+// rebuilt per command would make an interactive session behave like a pile of unrelated
+// `adb shell` invocations.
 type shellRunner struct {
 	fs    *VFS
 	props *Properties
@@ -33,6 +38,15 @@ type shellRunner struct {
 	env   map[string]string
 	// now is injectable so timestamps in output are assertable.
 	now func() time.Time
+
+	// exited records that a line asked to end the session, and exitCode is the status to
+	// report for it. A session loop that runs a line at a time cannot get this from run()'s
+	// return value: `exit` with no argument means "the status of the last command", which is
+	// a different answer from any status of its own.
+	exited   bool
+	exitCode int
+	// last is the status of the most recent command, which is what a bare `exit` reports.
+	last int
 }
 
 // newShellRunnerFor builds a session's shell over a filesystem.
@@ -46,6 +60,19 @@ func newShellRunnerFor(fs *VFS) *shellRunner {
 	}
 }
 
+// prompt is what an interactive session prints before each line.
+//
+// The shape is a real Android shell's: hostname, colon, working directory, space, dollar, space
+// -- captured from a device as "<hostname>:/ $ ". The working directory is live, so a `cd` is
+// visible in the very next prompt.
+//
+// The hostname is a constant rather than the system's, because this simulator has no hostname
+// and printing the host's would be claiming a detail it does not have while making every test
+// that saw a prompt depend on the machine it ran on.
+func (r *shellRunner) prompt() string {
+	return r.env["HOST"] + ":" + r.cwd + " $ "
+}
+
 func defaultShellEnv() map[string]string {
 	return map[string]string{
 		"ANDROID_DATA":     "/data",
@@ -56,6 +83,8 @@ func defaultShellEnv() map[string]string {
 		"SHELL":            "/system/bin/sh",
 		"TMPDIR":           "/data/local/tmp",
 		"PWD":              "/",
+		// HOST backs the interactive prompt. See prompt() for why it is a constant.
+		"HOST": "localhost",
 	}
 }
 
@@ -70,7 +99,19 @@ func (r *shellRunner) abs(p string) string {
 	return strings.TrimRight(r.cwd, "/") + "/" + p
 }
 
+// run executes one command line and returns its status.
+//
+// Every command records its status in r.last, because a bare `exit` reports the status of
+// the command before it. That is set here rather than at the call sites: a caller that
+// forgets loses the status silently, and the mistake shows up as an `exit` reporting 0
+// after a failure.
 func (r *shellRunner) run(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	code := r.dispatch(argv, stdin, stdout, stderr)
+	r.last = code
+	return code
+}
+
+func (r *shellRunner) dispatch(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(argv) == 0 {
 		fmt.Fprintln(stderr, "shell: empty command")
 		return 1
@@ -142,7 +183,7 @@ func (r *shellRunner) run(argv []string, stdin io.Reader, stdout, stderr io.Writ
 	case "false", "fail":
 		return 1
 	case "exit":
-		return 0
+		return r.cmdExit(args, stderr)
 	default:
 		// 127 is what a real shell reports, and code depends on distinguishing "no such
 		// command" from "the command failed".
@@ -498,6 +539,42 @@ func (r *shellRunner) cmdGetprop(args []string, stdout io.Writer) int {
 		}
 		fmt.Fprintln(stdout, v)
 		return 0
+	}
+}
+
+// cmdExit ends the session.
+//
+// Three cases, and all three are observable on a device, so all three are here:
+//
+//   - `exit` alone exits with the status of the last command, which is why
+//     `false; exit` reports 1 rather than 0. For a one-shot `adb shell 'exit'` there is no
+//     last command and the status is 0.
+//   - `exit N` exits with N, truncated to a byte because that is the only thing the shell
+//     protocol has room for. `exit 300` is 44, matching what a device reports.
+//   - `exit abc` is a usage error: a message on stderr and status 1. Silently exiting 0
+//     there would hide a typo in a script that goes on to assert on the status.
+func (r *shellRunner) cmdExit(args []string, stderr io.Writer) int {
+	r.exited = true
+	r.exitCode = r.last
+	switch len(args) {
+	case 0:
+		return r.last
+	case 1:
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			fmt.Fprintf(stderr, "exit: bad number: %s\n", args[0])
+			r.exitCode = 1
+			return 1
+		}
+		// One byte. The v2 exit frame holds a single byte, so a status above 255 truncates
+		// here rather than being reported in full and then mangled on the way out. A device
+		// behaves the same way; `exit 300` gives 44.
+		r.exitCode = n & 0xFF
+		return r.exitCode
+	default:
+		fmt.Fprintf(stderr, "exit: usage: exit [N]\n")
+		r.exitCode = 2
+		return 2
 	}
 }
 

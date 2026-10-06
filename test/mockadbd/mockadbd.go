@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -315,28 +316,37 @@ func (l *Listener) serve(nc net.Conn) error {
 				return err
 			}
 		case CmdOKAY:
-			// An OKAY from the host acknowledges a packet the device sent. On a non-v2
-			// stream it carries no data of its own and it does not mean the host closed
-			// its end, so it is not handed to deliver -- deliver reads an empty payload as
-			// end of stream, which is right for WRTE and wrong here. The first ack adb
-			// sends is for the stat reply, so every sync stream used to be declared
-			// finished the moment it answered a query, and the next command was never
-			// read.
+			// An OKAY acknowledges a packet the device sent. It is not input, and an
+			// empty one in particular is not end of input.
 			//
-			// Shell v2 keeps the old behaviour, empty payload included, because its
-			// commands depend on it: with the ack treated as inert, `adb shell cat` waited
-			// for an end of input that never came and the interop test failed in the full
-			// suite about one run in three while passing alone. That dependency is real
-			// and undocumented, so it is stated here rather than discovered again.
-			stream := c.lookup(m.Arg1)
-			if len(m.Data) > 0 || (stream != nil && stream.v2) {
+			// Shell v2 used to treat an empty-payload OKAY as end of input, on the grounds
+			// that `adb shell cat` otherwise waited for an input end that never came. That
+			// was the wrong conclusion drawn from a symptom with another cause, and it
+			// breaks exactly the feature it was meant to protect: an interactive session
+			// has the device ack its prompt before the host has typed anything, so the very
+			// first ack ended input and the session lasted one line.
+			//
+			// End of input under v2 is kIdCloseStdin, which adb does send -- captured on the
+			// wire as the frame after the last stdin frame, frequently in the same packet.
+			if len(m.Data) > 0 {
 				c.deliver(m.Arg1, m.Data)
 			}
 		case CmdWRTE:
-			// Acknowledge before delivering. The protocol is ack-based in both
-			// directions, and a host that gets no ack for its write waits for its send
-			// window to reopen, which is why a push showed a long silence before the
-			// transfer began.
+			// Acknowledge before delivering. The protocol is ack-based in both directions,
+			// and a host that gets no ack for its write waits for its send window to reopen,
+			// which is why a push showed a long silence before the transfer began.
+			//
+			// OKAY(our-id, their-id): the reverse of what OPEN's reply sends, because an ack
+			// is addressed back the way the packet came. Getting the pair the wrong way round
+			// is not an error the host reports -- it simply never acks this ack, so the window
+			// does not reopen, and the host stops sending. That is the failure this shape
+			// prevents, and it looks exactly like a hung shell: the first commands arrive and
+			// then nothing does.
+			if s := c.lookup(m.Arg1); s != nil {
+				if err := c.write(Message{Cmd: CmdOKAY, Arg0: s.id, Arg1: s.hostID}); err != nil {
+					return err
+				}
+			}
 			c.deliver(m.Arg1, m.Data)
 		case CmdCLSE:
 			// The host closing its side ends input but must not tear the stream
@@ -481,7 +491,7 @@ func loadADBPublicKey(path string) (*rsa.PublicKey, error) {
 
 // handleOpen services an OPEN request. arg0 is the host-assigned local id.
 func (c *conn) handleOpen(cfg Config, m Message) error {
-	service, arg, v2, err := parseServiceSpec(string(m.Data))
+	service, arg, opts, err := parseServiceSpec(string(m.Data))
 	if err != nil {
 		return err
 	}
@@ -493,12 +503,16 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 		conn:   c,
 		id:     id,
 		hostID: m.Arg0,
-		v2:     v2,
+		v2:     opts.v2,
 		faults: cfg.Faults,
 		in:     make(chan []byte, 64),
 		done:   make(chan struct{}),
 		eofCh:  make(chan struct{}),
 		buf:    new(bytes.Buffer),
+		// A stream with nothing behind it -- a sync stream, or any session that is not
+		// attached to a terminal -- ignores window size frames. Receiving one must not
+		// require a handler, so the safe default is set before the service is dispatched.
+		onWindowSize: onWindowSizeDefault,
 	}
 	c.streams[id] = s
 	c.mu.Unlock()
@@ -510,19 +524,24 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 		return err
 	}
 
-	cfg.debug("open service=%q arg=%q -> stream id=%d", service, arg, id)
+	cfg.debug("open service=%q arg=%q v2=%t pty=%t TERM=%q -> stream id=%d",
+		service, arg, opts.v2, opts.pty, opts.term, id)
 	if cfg.FS == nil {
 		cfg.FS = NewVFS()
 	}
 	if cfg.Shell == nil {
+		// A fresh runner per command, which is right for a one-shot `adb shell COMMAND` and
+		// is why `cd` does not carry between two such invocations -- as on a device, where
+		// each is a separate process. An interactive session does not go through here; it
+		// builds one runner of its own and keeps it, which is the opposite and also correct.
 		cfg.Shell = func(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return newShellRunnerFor(cfg.FS).run(argv, stdin, stdout, stderr)
 		}
 	}
-	tracef("OPEN service=%q arg=%q", service, arg)
+	tracef("OPEN service=%q arg=%q v2=%t pty=%t TERM=%q", service, arg, opts.v2, opts.pty, opts.term)
 	switch service {
 	case "shell", "shell,v2", "shell,raw":
-		go runShell(cfg, arg, s)
+		go runShell(cfg, arg, s, opts)
 	// "sync", not "sync:" -- the trailing colon is not what adb sends, and guessing it
 	// from the documentation rather than from a trace cost a debugging round.
 	case "sync", "sync:", "sync:v1", "sync:,version=1":
@@ -554,7 +573,7 @@ func (c *conn) deliver(id uint32, data []byte) {
 		return
 	}
 	if !s.v2 {
-		s.in <- data
+		s.send(data)
 		return
 	}
 	// Under shell v2 the host frames stdin exactly as it frames output, so the
@@ -582,7 +601,7 @@ func (c *conn) deliver(id uint32, data []byte) {
 		case v2Stdin:
 			tracef("stdin frame id=%d len=%d", frameID, len(payload))
 			if len(payload) > 0 {
-				s.in <- payload
+				s.send(payload)
 			}
 			// Top the stdin window back up as data is consumed.
 			//
@@ -599,9 +618,15 @@ func (c *conn) deliver(id uint32, data []byte) {
 			// The host signals end of stdin with this frame, not an empty WRTE.
 			tracef("closeStdin id=%d len=%d", frameID, len(payload))
 			s.setEOF()
-			return
+			// Keep going rather than returning: a host can pack a window size change
+			// behind the close, and an interactive session that stops decoding at
+			// closeStdin would leave it in s.partial forever.
+			continue
 		case v2WindowSizeChg:
-			// Advisory only: the mock has no PTY to resize.
+			// The host resized its terminal. Only a session with a real pty behind it
+			// can act on this, and only if the window size frame is one it understands;
+			// both are decided in onWindowSize.
+			s.onWindowSize(payload)
 		}
 	}
 }
@@ -693,6 +718,70 @@ type stream struct {
 	eof     bool
 	closed  sync.Once
 	err     error
+
+	// onWindowSize is called with the payload of a kIdWindowSizeChange frame.
+	//
+	// It is a field rather than a direct call into the pty because most streams have no
+	// terminal: a sync stream receives window size frames too, and there is nothing for
+	// one to mean. Nil is the answer for those, and it is checked rather than assumed.
+	onWindowSize func(payload []byte)
+}
+
+// send queues input for a reader, and returns when the stream is closed.
+//
+// The select is the whole reason this is a method rather than a bare `s.in <- payload`.
+// deliver runs on the connection's read loop, so a channel send that blocks there blocks
+// the transport: no more packets are read, so no OKAY goes out, so the host's send window
+// never reopens, and the connection is wedged for good. A stream whose reader has gone away
+// -- a client that disconnected mid-session, or a command that exited while stdin was
+// still arriving -- otherwise fills the 64-slot channel and pins the read loop there
+// permanently.
+func (s *stream) send(payload []byte) {
+	select {
+	case s.in <- payload:
+	case <-s.done:
+	}
+}
+
+// onWindowSizeDefault ignores a window size change.
+//
+// Streams with no terminal behind them use this, which is most of them.
+func onWindowSizeDefault([]byte) {}
+
+// parseWindowSize decodes a kIdWindowSizeChange payload into rows and columns.
+//
+// The payload is text, not a struct winsize. Captured from a live adb driving this mock: a
+// frame id of 5 whose payload was the 11 bytes "45x132,0x0\x00" -- rows, 'x', columns,
+// comma, pixel width, 'x', pixel height, NUL. With no size set on the host terminal the
+// same frame carried "0x0,0x0\x00", and a real device reports `stty size` as "0 0" in
+// exactly that case, which is the confirmation that this is the right reading rather than a
+// plausible one.
+//
+// Only the rows and columns are used. The pixel dimensions are parsed past and discarded:
+// there is no pixel geometry on a pty here to apply them to.
+//
+// A payload this function does not understand is refused rather than guessed at. Reading
+// its first characters as digits would resize a terminal to a number that came from
+// nowhere, and a misframed payload is far more likely than a strange size.
+func parseWindowSize(payload []byte) (rows, cols uint16, ok bool) {
+	text := strings.TrimRight(string(payload), "\x00")
+	// The pixel half is separated by a comma; the rows/cols half by an 'x'. Splitting the
+	// comma off first means the 'x' being searched for is unambiguously the one between
+	// rows and columns, whichever order the fields appear in.
+	size, _, _ := strings.Cut(text, ",")
+	rowText, colText, found := strings.Cut(size, "x")
+	if !found {
+		return 0, 0, false
+	}
+	rowN, err := strconv.ParseUint(rowText, 10, 16)
+	if err != nil {
+		return 0, 0, false
+	}
+	colN, err := strconv.ParseUint(colText, 10, 16)
+	if err != nil {
+		return 0, 0, false
+	}
+	return uint16(rowN), uint16(colN), true
 }
 
 func (s *stream) Read(p []byte) (int, error) {
@@ -740,9 +829,29 @@ func (s *stream) Read(p []byte) (int, error) {
 		case <-s.eofCh:
 			// Loop back so anything queued is drained before EOF is reported.
 		case <-s.done:
-			// The peer closed the stream, which also ends input.
+			// The stream is gone, which ends input. Returning is the point of this case: the
+			// loop back re-enters a select whose done channel is closed and whose other cases
+			// are not ready, so it spins at full speed forever. A reader parked here when a
+			// command returned and the stream was closed never leaves, which is one goroutine
+			// and one core per `adb shell` invocation.
+			return 0, s.readError()
 		}
 	}
+}
+
+// readError is what a reader sees once the stream is closed.
+//
+// io.EOF rather than an error, because a stream the device closed is the ordinary way a
+// session ends and a caller reading to the end should see the ordinary end. The distinction
+// that matters is only that it is not nil: nil is a zero-byte read, and returning that from
+// this position would send a caller into a loop.
+func (s *stream) readError() error {
+	s.bufMu.Lock()
+	defer s.bufMu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	return io.EOF
 }
 
 func (s *stream) Write(p []byte) (int, error) {
@@ -886,10 +995,47 @@ func (s *stream) close(cause error) {
 // runShell executes a shell service request. Real adbd spawns /system/bin/sh;
 // the mock interprets a few commands so tests can assert on observable behaviour
 // rather than only on transport framing.
-func runShell(cfg Config, arg string, s *stream) {
+//
+// Two shapes, chosen by whether the service request carried a command:
+//
+//   - `adb shell COMMAND` runs that one command and closes.
+//   - `adb shell` with no command opens a session: line after line off stdin until end of
+//     input, one runner across all of them, and the status of the last command reported at
+//     the end. That is what a real device does, and it is the reason `cd` in one line is
+//     visible to the next.
+func runShell(cfg Config, arg string, s *stream, opts serviceOpts) {
 	argv := splitArgv(arg)
 
+	// Config.Shell is a per-command hook and is deliberately not used for a session: a
+	// session needs one runner across its lines so state carries, which a function taking
+	// argv cannot express. An interactive session with a custom Shell runs the built-in
+	// interpreter instead, and that is stated rather than left to be discovered.
+	var code int
+	if len(argv) == 0 {
+		code = runInteractive(cfg.FS, s, opts)
+	} else {
+		code = runOneShot(cfg, argv, s)
+	}
+
+	// The exit status only exists in the v2 protocol. Under the original shell
+	// protocol the host infers success from CLSE, so sending an exit frame there
+	// would put a stray byte on the client's stdout.
+	if s.v2 {
+		_ = s.writeFrame(v2Exit, []byte{byte(code)})
+	}
+	s.close(nil)
+}
+
+// runOneShot runs a single command and sends whatever it wrote.
+//
+// Output is collected and sent as one frame at the end rather than streamed, because a
+// command's output is bounded by what the command itself prints and a session is the place
+// where partial output has to be visible while the session is still running.
+func runOneShot(cfg Config, argv []string, s *stream) int {
 	pr, pw := io.Pipe()
+	// The copy goroutine has to end. A stream whose reader has gone away -- the command
+	// returned and CLSE has been sent -- would otherwise leave this blocked on a read
+	// forever, holding a pipe and a goroutine per `adb shell` invocation.
 	go func() {
 		_, _ = io.Copy(pw, s)
 		_ = pw.Close()
@@ -900,37 +1046,63 @@ func runShell(cfg Config, arg string, s *stream) {
 	if out.Len() > 0 {
 		_ = s.writeFrame(v2Stdout, []byte(out.String()))
 	}
-	// The exit status only exists in the v2 protocol. Under the original shell
-	// protocol the host infers success from CLSE, so sending an exit frame there
-	// would put a stray byte on the client's stdout.
-	if s.v2 {
-		_ = s.writeFrame(v2Exit, []byte{byte(code)})
-	}
-	s.close(nil)
+	return code
 }
 
-// defaultShell answers a small, fixed command set.
-func parseServiceSpec(raw string) (service, arg string, v2 bool, err error) {
+// serviceOpts is what the comma-separated part of a service spec asked for.
+type serviceOpts struct {
+	// v2 selects the shell v2 protocol, where output is framed and the exit status is a
+	// frame rather than an inference from CLSE.
+	v2 bool
+	// pty means the host wants a terminal. Captured from a live client, which sends
+	// "shell,v2,TERM=xterm-256color,pty:" for `adb shell -t` and the same with "raw:"
+	// for `-T` and for a plain `adb shell`. A real adbd allocates a pty on "pty:" and a
+	// pipe on "raw:"; treating them as different requests rather than as synonyms is what
+	// makes `adb shell -t` and `adb shell -T` different, which they are.
+	pty bool
+	// term is the requested TERM, recorded so a trace can show what was asked for. The mock
+	// does not use it: a pty has no idea what terminal it is emulating, and choosing behaviour
+	// on this string would be inventing rules no device follows.
+	term string
+}
+
+// parseServiceSpec splits a service spec into its service name, argument and options.
+//
+// The form is "name,opt,opt,...:argument". Both halves matter and the argument may itself
+// contain colons, so the split is on the first colon rather than the last: a command like
+// `adb shell echo a:b` would otherwise arrive with the argument truncated.
+func parseServiceSpec(raw string) (service, arg string, opts serviceOpts, err error) {
 	spec := strings.TrimRight(raw, "\x00")
 	colon := strings.IndexByte(spec, ':')
 	if colon < 0 {
-		return "", "", false, fmt.Errorf("mockadbd: malformed service spec %q", raw)
+		return "", "", opts, fmt.Errorf("mockadbd: malformed service spec %q", raw)
 	}
 	head, arg := spec[:colon], spec[colon+1:]
-	opts := ""
+	optText := ""
 	if comma := strings.IndexByte(head, ','); comma >= 0 {
-		opts, head = head[comma+1:], head[:comma]
+		optText, head = head[comma+1:], head[:comma]
 	}
 	if head == "" {
-		return "", "", false, fmt.Errorf("mockadbd: empty service in %q", raw)
+		return "", "", opts, fmt.Errorf("mockadbd: empty service in %q", raw)
 	}
-	// The bare service type must be the first option, e.g. "shell,v2,TERM=...".
-	for _, opt := range strings.Split(opts, ",") {
-		if opt == "v2" {
-			v2 = true
+	// The bare service type must be the first option, e.g. "shell,v2,TERM=...". Options
+	// after it are flags, and an option this version does not know is ignored rather than
+	// rejected: adb adds them between releases, and a mock that refused a spec it did not
+	// recognise would fail on a newer client for no useful reason.
+	for _, opt := range strings.Split(optText, ",") {
+		switch {
+		case opt == "v2":
+			opts.v2 = true
+		case opt == "pty":
+			opts.pty = true
+		case opt == "raw":
+			// The explicit opposite of pty, and the default when neither is given. Recorded
+			// by leaving opts.pty false, which is the same thing.
+		case strings.HasPrefix(opt, "TERM="):
+			opts.term = strings.TrimPrefix(opt, "TERM=")
 		}
 	}
-	return head, arg, v2, nil
+	return head, arg, opts, nil
 }
 
 // splitArgv parses the quoting in a shell service argument. adbd passes the
