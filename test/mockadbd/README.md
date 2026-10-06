@@ -20,6 +20,7 @@ adb -s 127.0.0.1:5555 shell ls -l /system/bin
 |---|---|
 | Transport | CNXN negotiation, AUTH with an RSA host key, OPEN/WRTE/OKAY/CLSE, device-initiated streams |
 | `shell` | 26 commands over a real in-memory filesystem and property store |
+| interactive shell | sessions: line at a time, state carried across lines, last command's status; `-t`/`-T` pipes, `-tt` a real pty |
 | `host:` | `version`, `devices`, `transport` |
 | `sync:` | the v1 binary protocol, complete; the v2 text protocol, partially |
 | Filesystem | a seeded Android tree, read/write, `stat`, modes, mtimes, path confinement |
@@ -98,16 +99,79 @@ Stated plainly, because a simulator that overstates itself is worse than a stub.
   real device below, along with the reason `reverse` needs transport work rather than a
   case in the service switch.
 
-- **No PTY.** `adb shell` without `-t` gets a pipe. `adb shell -t` is not implemented.
-
-- **No `adb reverse` or `adb forward`.** The services are not served.
+- **`adb reverse` and `adb forward` are not served.** The protocol is captured from a real
+  device below, along with the reason `reverse` needs transport work rather than a case in the
+  service switch.
 
 - **The shell is not `/system/bin/sh`.** It is a Go interpreter over the commands in the
   table above. Behaviour matches on exit statuses -- 0, 1 for a lookup failure, 2 for
   misuse, 127 for an unknown command -- because tests assert on them.
 
-- **State is per-process.** Every `adb shell` invocation is a fresh session with `cwd` at
-  `/`, as on a real device. Nothing persists across the connection.
+- **State is per-process.** Every `adb shell COMMAND` invocation is a fresh session with `cwd`
+  at `/`, as on a real device. State *within* one interactive session does carry: `cd` in one
+  line is visible to the next. Nothing persists across invocations.
+
+- **A command inside an interactive session gets no stdin.** `cat` with no argument in a
+  session sees end of input immediately rather than consuming the lines after it. The session
+  owns stdin: the lines arriving there are commands, and a command that read them would leave
+  no way to run the next one. `adb shell cat FILE` reads the filesystem and is what a test
+  wants.
+
+- **The shell prompt is `localhost:/ $ `**, following the working directory. A device prints
+  its own hostname there; this mock has none, and inventing one would be claiming a detail it
+  does not have. The prompt is printed only when a terminal was allocated, as on a device.
+
+- **A terminal is a real pty, and only on linux.** `/dev/ptmx` is opened with `TIOCSPTLCK` and
+  `TIOCGPTN` and the slave is used as the interpreter's stdin and stdout, so echo, CRLF line
+  endings, canonical input buffering and the window size are the kernel's rather than
+  something this code writes out to look like them. On any other platform `adb shell -t` falls
+  back to a pipe and says so on stderr; the package still builds. `TIOCSWINSZ` is applied from
+  `kIdWindowSizeChange` and read back with `TIOCGWINSZ`, because that ioctl reports no error for
+  a size it disliked.
+
+## Interactive shell
+
+`adb shell` with no command opens a session rather than running one empty command:
+
+```sh
+printf 'cd /system/bin\npwd\nexit\n' | adb -s 127.0.0.1:5555 shell
+```
+
+Each line runs in turn, output comes back as it is produced, and the status reported is the
+last command's. One runner serves the whole session, which is what makes `cd` visible to the
+line after it.
+
+`-T` and `-t` differ. Both are a pipe when the client's own stdin is not a terminal -- adb
+refuses a remote terminal in that case and says so -- and both work the same way as a plain
+`adb shell`: no prompt, no echo. `-tt` forces a pty regardless, and is how you get a prompt out
+of adb without a terminal on this side:
+
+```sh
+printf 'echo one\nexit\n' | adb -s 127.0.0.1:5555 shell -tt | od -c
+```
+
+which produces a prompt, the typed line echoed back, and CRLF line endings. On a device the
+prompt is the device's own hostname and the carriage returns come from the terminal's `ONLCR`;
+here they come from this host's pty, which is why the byte sequence matches a device but the
+prompt text does not.
+
+End of input ends a piped session and its status is the last command's. A terminal session
+does not end that way, matching a device: a terminal has no end of input, so `exit` is the way
+out, and a test that forgets it hangs rather than fails.
+
+Behaviours taken from a real device rather than reasoned about, since they are what the
+`TestInteropShell*` tests assert:
+
+| | |
+|---|---|
+| status of a session | the last command's: `false` then EOF gives 1 |
+| `exit` | the last command's status; `exit N` gives N; `exit 300` gives 44 (one byte) |
+| `exit abc` | a message on stderr, status 1 |
+| end of input | ends a piped session cleanly; a session with no lines exits 0 |
+| blank line | runs nothing, prints nothing |
+| `# comment` | a comment, not an unknown command |
+| prompt with no terminal | none |
+| prompt with a terminal | printed per line, tracks `cd` |
 
 ## MOCKADBD_TRACE
 
