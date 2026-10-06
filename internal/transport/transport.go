@@ -17,6 +17,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -71,6 +72,24 @@ type Session struct {
 	conn net.Conn
 }
 
+// Role says which end of the connection this process is.
+//
+// It is not cosmetic, because the multiplexer numbers streams from the end that dialled and
+// does not renumber the other end's. Measured: with both ends built the same way, the first
+// stream each opened landed on the same number, and the session ended with "duplicate stream
+// initiated" on one side and EOF on the other. Every stream on the connection died with it,
+// including ones already carrying data. One end Client and the other Server is what lets both
+// open streams, which is required here: the gateway opens a stream when an operator connects,
+// and the agent opens one when a device asks for a port on the gateway.
+type Role int
+
+const (
+	// Dialer is the end that opened the connection: the agent, which dials the gateway.
+	Dialer Role = iota
+	// Acceptor is the end that was connected to: the gateway, which accepts devices.
+	Acceptor
+)
+
 // New wraps an authenticated connection.
 //
 // The caller must have completed the ARD handshake and checked the peer against
@@ -81,7 +100,7 @@ type Session struct {
 // verbatim from the handshake. The session does not parse it and does not check it:
 // a device that advertised nothing is a device that supports nothing, and quietly
 // substituting a list would put a client on a path the device cannot serve.
-func New(conn net.Conn, device, name, features string) (*Session, error) {
+func New(conn net.Conn, device, name, features string, role Role) (*Session, error) {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = keepalive
@@ -89,7 +108,15 @@ func New(conn net.Conn, device, name, features string) (*Session, error) {
 	cfg.MaxStreamWindowSize = 1 << 20
 	cfg.AcceptBacklog = acceptBacklog
 
-	mux, err := yamux.Client(conn, cfg)
+	var (
+		mux *yamux.Session
+		err error
+	)
+	if role == Acceptor {
+		mux, err = yamux.Server(conn, cfg)
+	} else {
+		mux, err = yamux.Client(conn, cfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("transport: start mux: %w", err)
 	}
@@ -136,10 +163,16 @@ func (s *Session) Open(ctx context.Context, kind, streamID string, meta any) (ne
 
 // Accept serves peer-initiated streams until the context ends or the session fails.
 //
-// A stream whose route header cannot be read is closed and skipped: a malformed
-// header says nothing about the health of the session, so one bad stream must not
+// Both kinds of stream arrive on the same session and are told apart by their first bytes.
+// A stream the gateway opened carries a route header, and a route header begins with this
+// protocol's version; a stream the device opened carries a bare service name. Five bytes
+// are enough to tell them apart, and both are line-delimited text, so classifying is a peek
+// rather than a read: a stream whose header cannot be read is closed and skipped, because a
+// malformed header says nothing about the health of the session and one bad stream must not
 // cost every other stream.
-func (s *Session) Accept(ctx context.Context, handler func(hs.Route, net.Conn) error) error {
+func (s *Session) Accept(ctx context.Context,
+	onRoute func(route hs.Route, conn net.Conn) error,
+	onDevice func(service string, conn net.Conn) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -152,7 +185,29 @@ func (s *Session) Accept(ctx context.Context, handler func(hs.Route, net.Conn) e
 			_ = stream.Close()
 			continue
 		}
-		route, err := hs.ReadRoute(stream)
+		br := bufio.NewReader(stream)
+		prefix, err := br.Peek(len(hs.Proto))
+		if err != nil {
+			_ = stream.Close()
+			continue
+		}
+		if string(prefix) == hs.Proto {
+			route, err := hs.ReadRoute(br)
+			if err != nil {
+				_ = stream.Close()
+				continue
+			}
+			if err := stream.SetDeadline(time.Time{}); err != nil {
+				_ = stream.Close()
+				continue
+			}
+			go func() {
+				defer func() { _ = stream.Close() }()
+				_ = onRoute(route, &prefixedConn{Conn: stream, r: br})
+			}()
+			continue
+		}
+		service, err := hs.ReadService(br)
 		if err != nil {
 			_ = stream.Close()
 			continue
@@ -163,10 +218,21 @@ func (s *Session) Accept(ctx context.Context, handler func(hs.Route, net.Conn) e
 		}
 		go func() {
 			defer func() { _ = stream.Close() }()
-			_ = handler(route, stream)
+			_ = onDevice(service, &prefixedConn{Conn: stream, r: br})
 		}()
 	}
 }
+
+// prefixedConn is a stream whose first bytes were buffered to classify it.
+//
+// The buffered reader has to stay in front of the stream, or the bytes it holds belong to
+// nobody: the handler would read from the socket and get whatever came after them.
+type prefixedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *prefixedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // Close ends the mux and the underlying connection.
 func (s *Session) Close() error {

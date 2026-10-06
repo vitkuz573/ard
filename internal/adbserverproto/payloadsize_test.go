@@ -63,7 +63,7 @@ func relayDevicePayload(t *testing.T, payload []byte) []byte {
 	defer device.Close()
 
 	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
-		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+		func(string) (net.Conn, error) { return dev.a, nil }, testOperator, nil, nil)
 	served := make(chan error, 1)
 	go func() { served <- s.Serve(server) }()
 
@@ -103,7 +103,7 @@ func relayDevicePayload(t *testing.T, payload []byte) []byte {
 		// Every device WRTE is acknowledged before the relay will read the next one, so
 		// the device has to wait for the ack. Reading it here is what keeps the two sides
 		// in step on a synchronous pipe.
-		if err := expectPacket(device, br, cmdOKAY, deviceID, open.arg0); err != nil {
+		if err := expectPacket(device, br, cmdOKAY, open.arg0, deviceID); err != nil {
 			deviceDone <- err
 			return
 		}
@@ -114,7 +114,7 @@ func relayDevicePayload(t *testing.T, payload []byte) []byte {
 			deviceDone <- err
 			return
 		}
-		if err := expectPacket(device, br, cmdCLSE, deviceID, open.arg0); err != nil {
+		if err := expectPacket(device, br, cmdCLSE, open.arg0, deviceID); err != nil {
 			deviceDone <- err
 			return
 		}

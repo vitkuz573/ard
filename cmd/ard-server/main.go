@@ -160,6 +160,7 @@ func run() error {
 		logger:  log.Default(),
 		mailbox: enrol.NewMailbox(cfg.enrolTTL),
 	}
+	gw.forwards = newForwards(gw)
 
 	deviceLn, err := net.Listen("tcp", cfg.deviceListen)
 	if err != nil {

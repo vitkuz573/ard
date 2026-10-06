@@ -50,9 +50,17 @@ const (
 	cmdOKAY = "OKAY"
 	cmdWRTE = "WRTE"
 	cmdCLSE = "CLSE"
+	cmdFAIL = "FAIL"
 
-	// Magic per command. They are not derived from the command name; each is its own
-	// constant, and the captured values are the only authority for them.
+	// Magic for FAIL. It is derived like every other command's, which is what makes the
+	// captured constants above reproducible rather than a table to be trusted: the magic is
+	// the command word with every bit flipped, so CNXN gives 0xb1a7b1bc, OPEN gives
+	// 0xb1baafb0, and FAIL gives this.
+	magicFAIL = 0xb3b6beb9
+
+	// Magic per command. Each was captured off a live exchange and each is different, which is
+	// the reason they cannot be guessed: a command written with another command's magic is
+	// rejected without a message.
 	magicCNXN = 0xb1a7b1bc
 	magicOPEN = 0xb1baafb0
 	magicOKAY = 0xa6beb4b0
@@ -107,6 +115,8 @@ func magicFor(command string) uint32 {
 		return magicWRTE
 	case cmdCLSE:
 		return magicCLSE
+	case cmdFAIL:
+		return magicFAIL
 	default:
 		return 0
 	}

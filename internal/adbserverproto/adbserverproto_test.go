@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+// testOperator is the client identity every test passes to New, standing in for whatever
+// authenticated the connection in production.
+const testOperator = "someone"
+
 // fakeFilter is the gateway's answer to "what may this client see", and a listing of it so
 // the tests can check that a serial is absent as well as refused.
 type fakeFilter struct {
@@ -127,7 +131,7 @@ func testServer() *Server {
 		connected: map[string]bool{"AAA": true},
 	}, func(string) (net.Conn, error) {
 		return nil, fmt.Errorf("no device in this test")
-	}, nil)
+	}, testOperator, nil, nil)
 }
 
 // host:version is answered with exactly twelve bytes, captured from the stock adb server:
@@ -201,7 +205,7 @@ func TestFeatureRepliesAreTheDeviceListVerbatim(t *testing.T) {
 		allowed:   map[string]bool{"AAA": true},
 		connected: map[string]bool{"AAA": true},
 		features:  map[string]string{"AAA": deviceList},
-	}, nil, nil)
+	}, nil, testOperator, nil, nil)
 
 	const want = "OKAY0027shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
 	for _, service := range []string{"host:features", "host-serial:AAA:features"} {
@@ -224,12 +228,12 @@ func TestFeatureRepliesAreTheDeviceListVerbatim(t *testing.T) {
 // still opened "shell,v2,TERM=xterm-256color,raw:", because adb asks the per-serial question
 // while it builds its transport cache and that one is answered.
 func TestHostFeaturesRefusesRatherThanGuessBetweenDevices(t *testing.T) {
-	none := New(silentFilter{fakeFilter{}}, nil, nil)
+	none := New(silentFilter{fakeFilter{}}, nil, testOperator, nil, nil)
 	if got := serveOne(t, none, "host:features"); got != "FAIL001ano devices/emulators found" {
 		t.Errorf("with no devices: %q, want FAIL001ano devices/emulators found", got)
 	}
 
-	two := New(fakeFilter{allowed: map[string]bool{"AAA": true, "BBB": true}}, nil, nil)
+	two := New(fakeFilter{allowed: map[string]bool{"AAA": true, "BBB": true}}, nil, testOperator, nil, nil)
 	if got := serveOne(t, two, "host:features"); got != "FAIL001dmore than one device/emulator" {
 		t.Errorf("with two devices: %q, want FAIL001dmore than one device/emulator", got)
 	}
@@ -240,7 +244,7 @@ func TestHostFeaturesRefusesRatherThanGuessBetweenDevices(t *testing.T) {
 // any list invented here would be a claim about a device made by something that has not
 // spoken to it.
 func TestFeatureReplyIsEmptyWhenTheFilterHasNoFeatures(t *testing.T) {
-	s := New(silentFilter{fakeFilter{allowed: map[string]bool{"AAA": true}}}, nil, nil)
+	s := New(silentFilter{fakeFilter{allowed: map[string]bool{"AAA": true}}}, nil, testOperator, nil, nil)
 	if got := serveOne(t, s, "host-serial:AAA:features"); got != "OKAY0000" {
 		t.Errorf("reply = %q, want OKAY0000", got)
 	}
@@ -257,7 +261,7 @@ func TestHostSerialGetStateAnswersFromTheRegistry(t *testing.T) {
 	s := New(fakeFilter{
 		allowed:   map[string]bool{"AAA": true, "BBB": true},
 		connected: map[string]bool{"AAA": true},
-	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, nil)
+	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, testOperator, nil, nil)
 
 	// AAA is attached, BBB is entitled but not attached. One message per case so a FAIL is
 	// distinguishable from a state, which is the whole point of the command.
@@ -278,7 +282,7 @@ func TestSerialWithAColonSurvivesHostSerialRequests(t *testing.T) {
 	s := New(fakeFilter{
 		allowed:   map[string]bool{"127.0.0.1:5555": true},
 		connected: map[string]bool{"127.0.0.1:5555": true},
-	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, nil)
+	}, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, testOperator, nil, nil)
 	if got := serveOne(t, s, "host-serial:127.0.0.1:5555:get-state"); got != "OKAY0006device" {
 		t.Errorf("reply = %q (% x), want \"OKAY0006device\"", got, got)
 	}
@@ -402,7 +406,7 @@ func TestHostTransportBecomesARawDeviceTransport(t *testing.T) {
 		func(serial string) (net.Conn, error) {
 			opened <- serial
 			return dev.a, nil
-		}, nil)
+		}, testOperator, nil, nil)
 
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(server) }()
@@ -470,7 +474,7 @@ func TestTportReportsADeviceThatWillNotOpen(t *testing.T) {
 	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
 		func(string) (net.Conn, error) {
 			return nil, fmt.Errorf("device busy")
-		}, nil)
+		}, testOperator, nil, nil)
 	got := serveOne(t, s, "host:tport:serial:AAA")
 	if !strings.HasPrefix(got, "FAIL") {
 		t.Fatalf("reply %q is not a FAIL", got)
@@ -483,7 +487,7 @@ func TestTportReportsADeviceThatWillNotOpen(t *testing.T) {
 // A nil filter is a programming error, not an open door: nothing is entitled, so everything
 // must be refused rather than allowed by accident.
 func TestNilFilterEntitlesNothing(t *testing.T) {
-	s := New(nil, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, nil)
+	s := New(nil, func(string) (net.Conn, error) { return nil, fmt.Errorf("unused") }, testOperator, nil, nil)
 	for _, service := range []string{"host:tport:serial:AAA", "host:transport:AAA"} {
 		if got := serveOne(t, s, service); !strings.HasPrefix(got, "FAIL") {
 			t.Errorf("%s with no filter: reply %q is not a FAIL", service, got)
@@ -503,7 +507,7 @@ func TestRevocationTakesEffectOnAnOpenConnection(t *testing.T) {
 		return allowed
 	}), func(string) (net.Conn, error) {
 		return nil, fmt.Errorf("not needed for this assertion")
-	}, nil)
+	}, testOperator, nil, nil)
 
 	// One request per connection, because that is the protocol: adb opens a fresh
 	// connection for each host service request. Revocation still has to take effect
@@ -569,7 +573,7 @@ func TestShellV2ExitStatusReachesTheClientUnaltered(t *testing.T) {
 	defer device.Close()
 
 	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
-		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+		func(string) (net.Conn, error) { return dev.a, nil }, testOperator, nil, nil)
 	go s.Serve(server)
 
 	// The device side: answer the handshake, then send the exact six payload bytes the
@@ -613,7 +617,7 @@ func TestShellV2ExitStatusReachesTheClientUnaltered(t *testing.T) {
 			t.Errorf("device: %v", err)
 			return
 		}
-		if err := expectPacket(device, br, cmdOKAY, deviceID, open.arg0); err != nil {
+		if err := expectPacket(device, br, cmdOKAY, open.arg0, deviceID); err != nil {
 			t.Errorf("device: the WRTE was not acknowledged: %v", err)
 			return
 		}
@@ -621,7 +625,7 @@ func TestShellV2ExitStatusReachesTheClientUnaltered(t *testing.T) {
 			t.Errorf("device: %v", err)
 			return
 		}
-		if err := expectPacket(device, br, cmdCLSE, deviceID, open.arg0); err != nil {
+		if err := expectPacket(device, br, cmdCLSE, open.arg0, deviceID); err != nil {
 			t.Errorf("device: the close was not answered with a close: %v", err)
 		}
 	}()
@@ -715,7 +719,7 @@ func TestClientInputReachesTheDeviceStreamTheDeviceNamed(t *testing.T) {
 
 	const deviceID = 0x1f
 	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
-		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+		func(string) (net.Conn, error) { return dev.a, nil }, testOperator, nil, nil)
 	go s.Serve(server)
 
 	done := make(chan struct{})
@@ -751,8 +755,11 @@ func TestClientInputReachesTheDeviceStreamTheDeviceNamed(t *testing.T) {
 			return
 		}
 		wantFrame := append([]byte{0x00, 0x05, 0x00, 0x00, 0x00}, []byte("hello")...)
-		if first.arg0 != deviceID || first.arg1 != open.arg0 {
-			t.Errorf("WRTE arg0=%d arg1=%d, want arg0=%d arg1=%d", first.arg0, first.arg1, deviceID, open.arg0)
+		// arg0 is this server's stream id and arg1 the device's. The device resolves the
+		// stream from arg1, so a packet with the pair the other way round is dropped without
+		// a word -- which is the whole reason this assertion reads both fields.
+		if first.arg0 != open.arg0 || first.arg1 != deviceID {
+			t.Errorf("WRTE arg0=%d arg1=%d, want arg0=%d arg1=%d", first.arg0, first.arg1, open.arg0, deviceID)
 		}
 		if !bytes.Equal(first.payload, wantFrame) {
 			t.Errorf("device received % x, want % x", first.payload, wantFrame)
@@ -764,7 +771,7 @@ func TestClientInputReachesTheDeviceStreamTheDeviceNamed(t *testing.T) {
 		// The end of the client's input. Read on the same buffered reader as everything else,
 		// because a second reader on the same conn would miss whatever this one had already
 		// taken in and the assertion would be about nothing.
-		if err := expectPacket(device, br, cmdCLSE, deviceID, open.arg0); err != nil {
+		if err := expectPacket(device, br, cmdCLSE, open.arg0, deviceID); err != nil {
 			t.Errorf("device: the end of the client's input did not arrive as a CLSE: %v", err)
 		}
 	}()
@@ -839,7 +846,7 @@ func TestHostTransportRepliesWithBareOKAY(t *testing.T) {
 	defer dev.a.Close()
 	defer dev.b.Close()
 	s := New(fakeFilter{allowed: map[string]bool{"AAA": true}},
-		func(string) (net.Conn, error) { return dev.a, nil }, nil)
+		func(string) (net.Conn, error) { return dev.a, nil }, testOperator, nil, nil)
 
 	p := newPipe()
 	defer p.a.Close()

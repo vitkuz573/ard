@@ -38,7 +38,62 @@ const (
 	KindLogcat = "logcat"
 	KindFiles  = "files"
 	KindRawADB = "raw-adb"
+
+	// KindDeviceOpen is a stream the device opened for itself, named by DeviceOpen's
+	// Service rather than by a route of ours.
+	//
+	// It exists because a device sometimes needs a connection to the host and the only
+	// way to get one is to ask: a reverse forward binds a port on the device, and
+	// whatever connects to that port has to reach a port on the host. The device cannot
+	// open a stream through the gateway -- the gateway opens streams in response to an
+	// operator, and a device that could open one would be able to reach any operator's
+	// device -- so it asks the agent and the agent relays the ask.
+	KindDeviceOpen = "device-open"
 )
+
+// DeviceOpen is the service name a device asked for, carried as a route's metadata.
+type DeviceOpen struct {
+	// Service is the socket specification, such as "tcp:9911".
+	Service string `json:"service"`
+}
+
+// WriteService announces a device's own request on a stream it opened.
+//
+// It is a bare NUL-terminated string rather than a route header: this stream was not opened
+// by the gateway, so there is no route for it, and the header's own version prefix would be
+// indistinguishable from a service name that happened to start with the same letters.
+func WriteService(w io.Writer, service string) error {
+	if service == "" {
+		return errors.New("hs: device stream without a service")
+	}
+	_, err := w.Write(append([]byte(service), 0))
+	return err
+}
+
+// ReadService reads a device's own request.
+//
+// The cap is the same one the control lines use, for the same reason: the peer on this end
+// is a device, and a name it never terminates would otherwise make this read until it
+// happened to see a zero byte in whatever followed.
+func ReadService(r io.Reader) (string, error) {
+	var out []byte
+	var b [1]byte
+	for {
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return "", fmt.Errorf("hs: read device service: %w", err)
+		}
+		if b[0] == 0 {
+			if len(out) == 0 {
+				return "", errors.New("hs: device stream without a service")
+			}
+			return string(out), nil
+		}
+		out = append(out, b[0])
+		if len(out) > maxControlLine {
+			return "", fmt.Errorf("hs: device service exceeds cap %d", maxControlLine)
+		}
+	}
+}
 
 // Hello is the device's first message.
 type Hello struct {

@@ -396,3 +396,55 @@ func TestEncodeDecodeData(t *testing.T) {
 		t.Errorf("payload = %q, want %q", got, payload)
 	}
 }
+
+// A device's own request is a bare NUL-terminated service name, and it must survive the trip
+// byte for byte: the name is what decides which port on the host gets the connection, so a
+// truncated or doubled terminator would send the bytes somewhere else.
+//
+// The payload follows the name on the same stream, which is what makes the two distinguishable
+// from a route header: a route begins with this protocol's version, a service name does not.
+func TestDeviceServiceRoundTripLeavesThePayloadIntact(t *testing.T) {
+	client, server := pipe(t)
+	payload := []byte("anything the tunnel carries\x00 including a NUL and spaces ")
+
+	go func() {
+		_ = WriteService(client, "tcp:9911")
+		_, _ = client.Write(payload)
+	}()
+
+	got, err := ReadService(server)
+	if err != nil {
+		t.Fatalf("read service: %v", err)
+	}
+	if got != "tcp:9911" {
+		t.Fatalf("service = %q, want tcp:9911", got)
+	}
+	rest := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, rest); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if !bytes.Equal(rest, payload) {
+		t.Errorf("payload corrupted: got %q, want %q", rest, payload)
+	}
+}
+
+func TestDeviceServiceWithoutANameIsRefused(t *testing.T) {
+	if err := WriteService(io.Discard, ""); err == nil {
+		t.Error("a device stream with no service name must be refused")
+	}
+	if _, err := ReadService(bytes.NewReader([]byte{0})); err == nil {
+		t.Error("a terminated name of zero bytes must be refused")
+	}
+}
+
+// A name that is never terminated must be refused rather than read until a zero byte happens
+// to appear in whatever followed: the peer on this end is a device, and its payload is opaque.
+func TestDeviceServiceCapsAnUnterminatedName(t *testing.T) {
+	long := bytes.Repeat([]byte("a"), maxControlLine+1)
+	if _, err := ReadService(bytes.NewReader(long)); err == nil {
+		t.Error("an unterminated service name past the cap must be refused")
+	}
+	if _, err := ReadService(bytes.NewReader(long[:16])); err == nil {
+		t.Error("a truncated service name must be refused")
+	}
+}

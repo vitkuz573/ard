@@ -273,12 +273,16 @@ type conn struct {
 	version uint32
 	mu      sync.Mutex
 	streams map[uint32]*stream
+	// pending holds the streams this device opened and is waiting for the host to
+	// accept. The read loop completes them, because the OKAY arrives on that loop
+	// and a second reader on the same socket would take packets out from under it.
+	pending map[uint32]*pendingOpen
 	writeMu sync.Mutex
 }
 
 func (l *Listener) serve(nc net.Conn) error {
 	br := bufio.NewReaderSize(nc, 64<<10)
-	c := &conn{w: nc, streams: make(map[uint32]*stream)}
+	c := &conn{w: nc, streams: make(map[uint32]*stream), pending: make(map[uint32]*pendingOpen)}
 
 	first, err := readMessage(br)
 	if err != nil {
@@ -337,6 +341,14 @@ func (l *Listener) serve(nc net.Conn) error {
 			//
 			// End of input under v2 is kIdCloseStdin, which adb does send -- captured on the
 			// wire as the frame after the last stdin frame, frequently in the same packet.
+			//
+			// An OKAY naming a stream this device opened is not an acknowledgement but the
+			// answer to its own OPEN, and it is handled before this: the stream is not
+			// receiving anything yet, and the host's id in it is what the stream will have
+			// to address the host by.
+			if c.completePending(m) {
+				break
+			}
 			if len(m.Data) > 0 {
 				c.deliver(m.Arg1, m.Data)
 			}
@@ -556,14 +568,36 @@ func (c *conn) handleOpen(cfg Config, m Message) error {
 		}
 	}
 	tracef("OPEN service=%q arg=%q v2=%t pty=%t TERM=%q", service, arg, opts.v2, opts.pty, opts.term)
-	switch service {
-	case "shell", "shell,v2", "shell,raw":
+	switch {
+	case service == "shell" || service == "shell,v2" || service == "shell,raw":
 		go runShell(cfg, arg, s, opts)
+
 	// "sync", not "sync:" -- the trailing colon is not what adb sends, and guessing it
 	// from the documentation rather than from a trace cost a debugging round.
-	case "sync", "sync:", "sync:v1", "sync:,version=1":
+	case service == "sync" || service == "sync:" || service == "sync:v1" || service == "sync:,version=1":
 		go runSync2(cfg, s)
-	case "host:version", "host:devices", "host:transport":
+
+	case service == "tcp":
+		go forwardService(cfg, s, arg)
+
+	// The reverse services arrive as one service name with the operation in the
+	// argument, because that is how the service spec splits: "reverse:forward:tcp:A;tcp:B"
+	// has the service "reverse" and everything after the first colon as its argument.
+	case service == "reverse":
+		switch {
+		case strings.HasPrefix(arg, "forward:"):
+			go reverseForwardService(cfg, s, strings.TrimPrefix(arg, "forward:"))
+		case strings.HasPrefix(arg, "killforward-all"):
+			go reverseKillForwardAllService(cfg, s)
+		case strings.HasPrefix(arg, "killforward:"):
+			go reverseKillForwardService(cfg, s, strings.TrimPrefix(arg, "killforward:"))
+		case arg == "list-forward":
+			go reverseListForwardService(cfg, s)
+		default:
+			go failStream(s, "unknown reverse service %q", arg)
+		}
+
+	case service == "host:version" || service == "host:devices" || service == "host:transport":
 		// Answer with a plausible line so a host that probes these sees
 		// something sane rather than a hang.
 		go func() {

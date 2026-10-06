@@ -143,8 +143,27 @@ func (f operatorFilter) Open(serial string) (net.Conn, error) {
 // TLS policy to keep in step with the first.
 func (g *gateway) serveAdbServer(conn net.Conn, operator, role string) {
 	filter := operatorFilter{gw: g, op: operator, role: role, remote: conn.RemoteAddr().String()}
-	srv := adbserverproto.New(filter, filter.Open, func(format string, args ...any) {
+	srv := adbserverproto.New(filter, filter.Open, operator, func(format string, args ...any) {
 		g.logger.Printf("operator adb session (%s/%s): %s", operator, role, fmt.Sprintf(format, args...))
+	}, g.forwards)
+	// A device that opened a stream for itself is asking for a port on this machine, and
+	// this gateway is the machine. The dial is bounded to the gateway's own loopback by the
+	// same rule the forward's other half uses, so a device cannot name a host elsewhere.
+	srv.SetDeviceDialer(g.forwards)
+	// A reverse forward binds a port on the device and keeps it, so the transport it was
+	// asked on is still carrying work after the request is answered. This server takes that
+	// transport and serves the device's own streams on it until the device ends it.
+	srv.SetTransportAdopter(func(serial, service string, conn net.Conn) bool {
+		go func() {
+			defer conn.Close()
+			srv.ServeDeviceStreams(conn, serial)
+		}()
+		g.logger.Printf("operator %s: %s keeps the device transport, so its callbacks are served here",
+			operator, service)
+		g.audit.Record(audit.Event{
+			Kind: "forward.reverse_transport", Actor: operator, Device: serial, Detail: service,
+		})
+		return true
 	})
 	if err := srv.Serve(conn); err != nil {
 		g.logger.Printf("operator adb session (%s) ended: %v", operator, err)

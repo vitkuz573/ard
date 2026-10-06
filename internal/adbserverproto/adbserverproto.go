@@ -66,6 +66,23 @@ type Opener func(serial string) (net.Conn, error)
 type Server struct {
 	filter Filter
 	open   Opener
+	// forwards owns this server's port forwards, when it has any. Optional: a server
+	// without one refuses the forwarding services by name rather than leaving them
+	// unanswered, which a client reads as a hang.
+	forwards Forwards
+	// dialer reaches a port on this server's own machine for a device that opened a stream
+	// asking for one. Nil when this server has no ports to offer; see SetDeviceDialer.
+	dialer DeviceDialer
+	// adopter decides whether a device transport outlives the request that opened it. Nil
+	// closes every transport with its request; see SetTransportAdopter.
+	adopter func(serial, service string, conn net.Conn) bool
+	// operator is who this connection is, and forwardSerial which device it switched to.
+	// Both are recorded when they become known rather than asked for again, because the
+	// answer to a forwarding request is a port that has to outlive this connection: the
+	// connection adb used to ask for it is closed as soon as the answer is sent, so an
+	// operator's name left on it would be gone by the time anyone asked who owns the port.
+	operator      string
+	forwardSerial string
 	// logf is optional and receives one line per unexpected condition. It is nil in
 	// tests and never required in production.
 	logf func(format string, args ...any)
@@ -76,9 +93,17 @@ type Server struct {
 	relayPrefix []byte
 }
 
-// New returns a Server. logf may be nil.
-func New(filter Filter, open Opener, logf func(string, ...any)) *Server {
-	return &Server{filter: filter, open: open, logf: logf}
+// New returns a Server for one authenticated client. logf may be nil.
+//
+// operator is the client's own identity, taken by the caller from whatever authenticated the
+// connection. It is not this package's business how that was established -- TLS, a socket
+// permission, whatever -- only that it is known before the first request is answered, because
+// a port bound on behalf of nobody is a port nobody may be told about later.
+//
+// forwards may be nil, in which case the forwarding services are refused by name: a client
+// that asked for a port and got silence would wait rather than report anything.
+func New(filter Filter, open Opener, operator string, logf func(string, ...any), forwards Forwards) *Server {
+	return &Server{filter: filter, open: open, operator: operator, logf: logf, forwards: forwards}
 }
 
 func (s *Server) debugf(format string, args ...any) {
@@ -179,6 +204,17 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 	case req == "host:devices", req == "host:devices-l":
 		return false, s.replyValue(c, s.deviceList())
 
+	case req == "host:list-forward", req == "host:list-forward-all":
+		// A plain host request rather than a service on a switched transport, and it names
+		// no serial: measured, `adb forward --list` sends exactly "host:list-forward" and
+		// gets "SERIAL tcp:LOCAL tcp:REMOTE\n" per forward. The serial-qualified form is
+		// answered too because the stock server accepts it, measured, and it is the form a
+		// caller reaching for a per-device answer would try first.
+		if s.forwards == nil {
+			return false, writeFail(c, "port forwarding is not available on this server")
+		}
+		return false, s.replyValue(c, s.forwards.List(""))
+
 	case strings.HasPrefix(req, "host-serial:"):
 		serial, action := splitSerialAction(req)
 		switch {
@@ -192,6 +228,19 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 			// stock server answers it with the same bytes it gives host:features, which
 			// is what makes the two interchangeable there.
 			return false, s.replyValue(c, s.features(serial))
+
+		case action == "list-forward":
+			// The per-device form of the same listing, which the stock server accepts and
+			// answers with only that device's forwards:
+			//
+			//	host-serial:SERIAL:list-forward -> OKAY 0022 "SERIAL tcp:9930 tcp:9931\n"
+			if !s.allowed(serial) {
+				return false, writeFail(c, deviceNotFound(serial))
+			}
+			if s.forwards == nil {
+				return false, writeFail(c, "port forwarding is not available on this server")
+			}
+			return false, s.replyValue(c, s.forwards.List(serial))
 
 		case action == "get-state":
 			// `adb get-state` asks the server what it thinks the device's state is, and does
@@ -299,6 +348,10 @@ func (s *Server) beginTransport(c net.Conn, serial string, smartSocket bool) (bo
 	if !s.allowed(serial) {
 		return false, writeFail(c, deviceNotFound(serial))
 	}
+	// Remembered rather than passed down: the service that arrives next may be a request
+	// about this server rather than about the device, and it needs to know which device the
+	// client chose and who the client is.
+	s.forwardSerial = serial
 	dev, err := s.open(serial)
 	if err != nil {
 		// Logged rather than only returned. The FAIL carries the reason to the operator, which
@@ -317,7 +370,18 @@ func (s *Server) beginTransport(c net.Conn, serial string, smartSocket bool) (bo
 	if smartSocket {
 		// A switched transport is not a raw relay: the client sends a service request and
 		// expects the server to have opened the stream already. See serveHostService.
-		err = s.serveHostService(c, dev, s.relayPrefix)
+		//
+		// It reports the service it ran and whether this connection can be given away, which
+		// is the difference between closing the device transport and keeping it: a device
+		// that bound a port of its own holds that listener on this transport, and closing
+		// it here would end the forward before anything reached the port.
+		var kept bool
+		var service string
+		kept, service, err = s.serveHostService(c, dev, s.relayPrefix)
+		if kept && s.adopter != nil && s.adopter(serial, service, dev) {
+			// Somebody else owns the device connection now, including its closing.
+			return true, err
+		}
 	} else {
 		err = s.relay(c, dev, s.relayPrefix)
 	}

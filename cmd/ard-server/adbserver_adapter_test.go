@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -80,7 +81,9 @@ func testGateway(t *testing.T) *gateway {
 	}
 	t.Cleanup(func() { _ = aud.Close() })
 
-	return &gateway{reg: reg, authz: policy, audit: aud, logger: nil}
+	g := &gateway{reg: reg, authz: policy, audit: aud, logger: log.New(io.Discard, "", 0)}
+	g.forwards = newForwards(g)
+	return g
 }
 
 // ask drives one adb server protocol request through a server built from the gateway and
@@ -90,7 +93,7 @@ func ask(t *testing.T, g *gateway, operator string, service string) string {
 
 	client, server := net.Pipe()
 	filter := operatorFilter{gw: g, op: operator}
-	srv := adbserverproto.New(filter, filter.Open, nil)
+	srv := adbserverproto.New(filter, filter.Open, operator, nil, g.forwards)
 	go srv.Serve(server)
 
 	go func() {
@@ -213,8 +216,9 @@ func TestReplyFramingIsExact(t *testing.T) {
 	g := testGateway(t)
 	// Drive the connection by hand so the framing can be inspected byte by byte.
 	client, server := net.Pipe()
-	filter := operatorFilter{gw: g, op: "alice"}
-	srv := adbserverproto.New(filter, filter.Open, nil)
+	const operator = "alice"
+	filter := operatorFilter{gw: g, op: operator}
+	srv := adbserverproto.New(filter, filter.Open, operator, nil, g.forwards)
 	go srv.Serve(server)
 
 	go func() {

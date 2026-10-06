@@ -31,6 +31,8 @@ type gateway struct {
 	audit   *audit.Auditor
 	authz   *acl.Policy
 	logger  *log.Logger
+	// forwards owns the port forwards an operator's adb binds on this gateway.
+	forwards *forwards
 }
 
 // serveDevices accepts agent connections.
@@ -109,7 +111,7 @@ func (g *gateway) handleDevice(ctx context.Context, raw net.Conn, tlsCfg *tls.Co
 		return fmt.Errorf("device %q is not enrolled", hello.Device)
 	}
 
-	device, err := transport.New(conn, hello.Device, hello.Name, hello.Features)
+	device, err := transport.New(conn, hello.Device, hello.Name, hello.Features, transport.Acceptor)
 	if err != nil {
 		return err
 	}
@@ -145,18 +147,33 @@ func (g *gateway) handleDevice(ctx context.Context, raw net.Conn, tlsCfg *tls.Co
 		}
 	}()
 
-	return device.Accept(ctx, func(route hs.Route, stream net.Conn) error {
-		// Devices must not be able to request streams. The gateway opens streams in
-		// response to an operator; anything arriving here is a bug or an attempt to
-		// invert the model, so the stream is closed and the attempt recorded.
-		_ = stream.Close()
-		g.audit.Record(audit.Event{
-			Kind: "device.stream_rejected", Device: hello.Device, Actor: certName,
-			Remote: remote,
-			Detail: fmt.Sprintf("device-initiated stream %s kind=%s", route.Stream, route.Kind),
+	return device.Accept(ctx,
+		func(route hs.Route, stream net.Conn) error {
+			// One kind of device-initiated stream is real: a device that needs a
+			// connection to a port here asks for one by name, which is how a reverse
+			// forward reaches the other half of its tunnel. The agent relays the ask with
+			// the service name in its metadata, and nothing else about it is believed.
+			if route.Kind == hs.KindDeviceOpen {
+				return g.handleDeviceOpen(hello.Device, route.Meta, stream)
+			}
+			// Everything else is a bug or an attempt to invert the model. The gateway
+			// opens streams in response to an operator, and a device that could ask for
+			// one would be able to reach any operator's device, so the stream is closed
+			// and the attempt recorded.
+			_ = stream.Close()
+			g.audit.Record(audit.Event{
+				Kind: "device.stream_rejected", Device: hello.Device, Actor: certName,
+				Remote: remote,
+				Detail: fmt.Sprintf("device-initiated stream %s kind=%s", route.Stream, route.Kind),
+			})
+			return fmt.Errorf("device-initiated streams are not permitted")
+		},
+		// A stream the device opened on its own adbd connection, with no route header.
+		// It has to be relayed to the gateway as a named request rather than served here:
+		// the gateway owns the policy and the ports, and the agent owns neither.
+		func(service string, stream net.Conn) error {
+			return relayDeviceOpen(ctx, device, hello.Device, service, stream)
 		})
-		return fmt.Errorf("device-initiated streams are not permitted")
-	})
 }
 
 // refuse reports why a device was rejected before closing.

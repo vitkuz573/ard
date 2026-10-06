@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,7 +24,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -299,7 +302,7 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	}
 	log.Printf("connected, session %s, device features %s", welcome.Session, features)
 
-	session, err := transport.New(conn, cfg.deviceID, cfg.deviceName, features)
+	session, err := transport.New(conn, cfg.deviceID, cfg.deviceName, features, transport.Dialer)
 	if err != nil {
 		return err
 	}
@@ -316,9 +319,50 @@ func serve(ctx context.Context, cfg config, ca *tlsx.Verifier, id *tlsx.Identity
 	}()
 
 	log.Printf("serving")
-	return session.Accept(ctx, func(route hs.Route, stream net.Conn) error {
-		return handleStream(ctx, route, stream, resolve)
-	})
+	return session.Accept(ctx,
+		func(route hs.Route, stream net.Conn) error {
+			return handleStream(ctx, route, stream, resolve)
+		},
+		func(service string, stream net.Conn) error {
+			return handleDeviceOpen(ctx, session, service, stream)
+		})
+}
+
+// handleDeviceOpen relays a stream the device opened on its own adbd connection.
+//
+// A device opens one when it needs a connection to a port on the gateway: a reverse forward
+// binds a port on the device, and whatever connects to that port has to land on the other
+// side. The agent is in the middle of that path, so it is the agent that sees the ask.
+//
+// The relay is a splice and nothing more: the service name goes up as a route's metadata and
+// the bytes come back down the same stream. What the gateway does with the name is its
+// business -- it owns the ports and the policy -- and what this agent must not do is open a
+// stream of its own to adbd, because that would be a second connection to the device for a
+// request the device itself made and could have made directly.
+func handleDeviceOpen(ctx context.Context, session *transport.Session, service string, stream net.Conn) error {
+	log.Printf("device opened %s; relaying it to the gateway", service)
+	meta, err := json.Marshal(hs.DeviceOpen{Service: service})
+	if err != nil {
+		_ = stream.Close()
+		return err
+	}
+	upstream, err := session.Open(ctx, hs.KindDeviceOpen, newStreamID(), json.RawMessage(meta))
+	if err != nil {
+		_ = stream.Close()
+		return fmt.Errorf("relay %s: %w", service, err)
+	}
+	defer upstream.Close()
+
+	done := make(chan error, 2)
+	go func() { _, err := io.Copy(upstream, stream); done <- err }()
+	go func() { _, err := io.Copy(stream, upstream); done <- err }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		log.Printf("device stream %s ended: %v", service, err)
+		return nil
+	}
 }
 
 // readDeviceFeatures asks this device's adbd what it supports and returns the feature list.
@@ -580,3 +624,14 @@ func randomInt(n int64) int64 {
 }
 
 func randomFraction() float64 { return float64(randomInt(65536)) / 65536.0 }
+
+// streamSeq numbers the streams this agent relays, and newStreamID names one.
+//
+// The name is only for correlation between this agent's log and the gateway's: a route header
+// carries it so both ends can talk about the same stream, and neither end decides anything
+// from it. The sequence makes it unique within this process, which is all that is asked of it.
+var streamSeq atomic.Uint64
+
+func newStreamID() string {
+	return "do-" + strconv.FormatUint(streamSeq.Add(1), 36)
+}
