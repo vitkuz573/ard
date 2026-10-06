@@ -116,8 +116,19 @@ func (s *Server) Serve(c net.Conn) error {
 // transport and the caller must stop speaking this protocol.
 func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 	switch {
-	case req == "host:version", req == "host:features":
+	case req == "host:version":
 		return false, s.replyValue(c, versionReply)
+
+	case req == "host:features":
+		// A feature list, not a version string. adb asks this separately from host:version
+		// and parses the answer as a comma-separated list; handing it the version reply
+		// made it treat a server it did not understand as one it should not talk to.
+		//
+		// Empty is honest. Everything this server does is decided by which services it
+		// answers, and advertising features it does not implement is how a client ends up
+		// on a path that cannot work -- the same mistake a device banner makes when it
+		// claims compression it cannot decompress.
+		return false, s.replyValue(c, "")
 
 	case req == "host:devices", req == "host:devices-l":
 		return false, s.replyValue(c, s.deviceList())
