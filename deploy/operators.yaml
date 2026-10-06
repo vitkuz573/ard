@@ -58,12 +58,11 @@ roles:
       - "CHANGE-ME-device-uuid"
     members: []
 
-    # NOTE on "shell" and the operator bridge: an operator connects through ard-connect,
-    # which bridges a raw ADB connection. One ADB connection carries shell, install, file
-    # transfer and port forwarding together, so the bridge cannot be separated by
-    # permission. Holding "shell" on a device therefore means holding adb on that device.
-    # A role without "shell" can still see the device in ard-connect's listing, and is
-    # told it is not permitted to drive it.
+    # NOTE on "shell": an operator reaches a device through adb, and one ADB connection
+    # carries shell, install, file transfer and port forwarding together. The gateway
+    # therefore cannot separate them by permission, and holding "shell" on a device means
+    # holding adb on that device. A role without "shell" can still see the device in
+    # `adb devices`, and is told on its own terminal that it is not permitted to drive it.
 
   # Break-glass role for a named operator. Holds no grants by default, so enabling
   # the role does not by itself grant access to anything: grants are added here

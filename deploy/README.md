@@ -24,10 +24,17 @@ Three TCP ports are opened. Two require mutual TLS against separate roots:
     7000/tcp   device listener   trusts the device CA
     7100/tcp   operator listener trusts the operator CA
 
-Nothing that speaks the raw ADB protocol is ever exposed on a network interface.
-`ard-proxy` binds `127.0.0.1` only, because the port it serves is an
-unauthenticated ADB transport: anyone who can reach it has full control of the
-device behind it.
+The third, 7200, is the enrolment listener and is different in kind: it accepts a
+peer with no client certificate, because a device has none until it is enrolled. It
+can do nothing on its own — it stores a certificate request and waits for a human
+holding the CA.
+
+Nothing that speaks the raw ADB protocol is ever exposed on a network interface,
+and nothing serves an unauthenticated ADB transport at all. The gateway answers
+adb's server protocol only after mutual TLS has identified an operator and that
+operator's name has been found in the ACL, and every device question is then
+answered from that operator's own grants. `ard-connect` publishes its one port on
+the operator's own machine, so there is no gateway-side port for it at all.
 
 Devices and operators both dial in. That is not incidental — devices sit behind
 NAT, often carrier-grade NAT, so the gateway can never connect to them.
@@ -39,7 +46,12 @@ NAT, often carrier-grade NAT, so the gateway can never connect to them.
 then add the UUID to `ARD_DEVICES` in `/etc/ard/ard-server.env` and grant it in
 `/etc/ard/operators.yaml`, then restart:
 
-    systemctl restart ard-server ard-proxy
+    systemctl restart ard-server
 
-Ports are assigned from the order of `ARD_DEVICES`, so reordering that list
-changes existing serials. Treat it as append-only.
+`scripts/deploy.sh --rotate-device <uuid>` does the PKI half of this and preserves
+the existing list.
+
+The order of `ARD_DEVICES` no longer means anything: `adb` asks the gateway which
+devices exist and is answered with UUIDs, so there is no per-device port to
+renumber. Appending is still the right habit — the deploy preserves the list and only
+adds to it — but reordering does not invalidate any saved serial.

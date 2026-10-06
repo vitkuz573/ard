@@ -41,7 +41,8 @@ Record this per host, locally:
 `/etc/nftables.conf`, loaded by `nftables.service`. Default-deny `input`, and
 `forward` is dropped outright — nothing on this host routes.
 
-Only TCP 22 is accepted. ICMP is accepted deliberately: without path MTU discovery
+Accepted: TCP 22 and the three gateway ports (7000 devices, 7100 operators, 7200
+enrolment). Nothing else. ICMP is accepted deliberately: without path MTU discovery
 the symptom is a hung TLS handshake rather than a routing error.
 
 `destroy table inet ard` replaces the table instead of `flush ruleset`, so
@@ -85,7 +86,9 @@ operator port reachable. This turns that into a visible failure.
   a foreground dpkg would take a SIGHUP and leave package management inconsistent.
 - `pkill -f <pattern>` over SSH will match and kill the shell running it, because
   sshd executes the command as `bash -c "<command>"` and the pattern is present in
-  that command line. Kill by PID.
+  that command line. On the host, `systemctl restart ard-server`. On a development
+  machine running the end-to-end scripts, `scripts/stop.sh <name>` — it matches
+  process names exactly rather than command lines, and reports what survived.
 ## ARD gateway services
 
 Deployed with a single command: `scripts/deploy.sh`. It cross-compiles, uploads,
@@ -96,8 +99,7 @@ regenerated.
 
 | Service | Purpose |
 |---|---|
-| `ard-server` | accepts device and operator connections, holds device sessions |
-| `ard-proxy` | presents each device on a loopback port to the stock `adb` |
+| `ard-server` | accepts device and operator connections, holds device sessions, answers adb's server protocol |
 | `ard-firewall-verify` | asserts at boot that the firewall is really enforcing |
 
 ### Enrolling a device
@@ -121,9 +123,17 @@ something other than what was signed:
 The CA key is root-only and `ard-ca enrol` needs it, so this runs as root over SSH. It is
 the only signing path: the gateway holds no CA key and cannot issue anything.
 
-Loopback ports are assigned from the order of `ARD_DEVICES` in
-`/etc/ard/ard-server.env`, so **treat that list as append-only**: reordering it
-changes every operator's saved `adb` serial.
+`ARD_DEVICES` in `/etc/ard/ard-server.env` is the device allowlist, and it still
+deserves **append-only** handling — but for a different reason than it used to. Its
+order no longer carries meaning: adb asks the gateway which devices exist and is told
+the UUID, so there is no port to renumber. Reordering the list does not change anyone's
+serial. Appending is still right because the deploy preserves the list across runs and
+only ever adds to it, so a rewrite that drops a device disconnects it.
+
+The `adb` serial an operator uses is the device UUID, and it does not change when the
+device reconnects, is re-enrolled, or moves address. If an operator reports that their
+serial is gone, the device is not in `ARD_DEVICES` or their role has no grant for it —
+not that a port moved.
 
 ### PKI permissions on the gateway
 
