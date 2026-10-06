@@ -1,35 +1,41 @@
+// Command ard-connect is the operator's side of remote ADB.
+//
+// # Why this exists
+//
+// adb cannot do TLS. There is no option for it. So a remote device cannot be reached by the
+// stock adb binary without something terminating TLS on the operator's own machine. That is
+// not an architectural preference; it is what the protocol forces, and `ssh -L` is the same
+// answer wearing different clothes. This is that answer without handing out a login.
+//
+// # What it does
+//
+// It listens on one port, and for every connection adb opens it opens a mutual-TLS
+// connection to the gateway and splices the two together. That is all it does.
+//
+// # What it deliberately does not do
+//
+// It does not know which devices exist, and it does not care. That is the whole change from
+// the version this replaces: the old client was told the device list in a JSON greeting and
+// then bound a loopback port per device, so the gateway had to keep a port table whose
+// entries had to stay stable across reconnects, and the operator had to learn serials before
+// any of this worked. adb already has a protocol for asking which devices exist and for
+// switching onto one of them, so this client hands the connection straight through and the
+// gateway answers those questions. One port, no list, no serials, nothing to keep in step.
+//
+// Usage
+//
+//	ard-connect -gateway host:port -ca server-ca.pem -cert operator.pem -key operator.key
+//	adb -P 15000 devices
+//	adb -P 15000 -s DEVICE-UUID shell
+//
+// The port is chosen with -P for adb and with -listen for this program. 15000 is a default,
+// not a requirement: nothing else uses it, and any free port works.
 package main
-
-// ard-connect: the operator's side of remote ADB.
-//
-// Why this exists
-//
-// The gateway presents each device to the stock adb server on a loopback port. That works,
-// but only for someone with a shell on the gateway host, so every operator would need SSH
-// access to the VPS. That does not scale as a product: SSH is all-or-nothing, it is not
-// scoped per device, one person's access cannot be revoked without disturbing the rest,
-// and it grants root on the machine that holds the CA private keys.
-//
-// What this does instead
-//
-// It binds a loopback port per device the operator is entitled to, and for each adb
-// connection it opens a mutual-TLS connection to the gateway and splices bytes. The stock
-// adb binary is untouched: it still speaks plaintext TCP to 127.0.0.1 and believes it is
-// talking to a local adbd.
-//
-// A local helper is unavoidable, not an architectural preference. adb cannot do TLS -- it
-// has no option for it -- so something has to terminate TLS on the operator's own
-// machine. `ssh -L` is one such helper, which is exactly why SSH was in the requirements
-// before. This is the same shape without handing out a login.
-//
-// Authorization lives on the gateway. The device list this client receives is already
-// filtered by the operator's role, and every attach is checked again server-side, so a
-// modified client asking for a device it was not shown gains nothing.
 
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,12 +44,10 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/vitkuz573/ard/internal/registry"
 	"github.com/vitkuz573/ard/internal/tlsx"
 )
 
@@ -53,11 +57,15 @@ type config struct {
 	caPath     string
 	certPath   string
 	keyPath    string
-	localBase  int
-	localHost  string
-	device     string
+	listen     string
 	once       bool
 	timeout    time.Duration
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatalf("ard-connect: %v", err)
+	}
 }
 
 func run() error {
@@ -67,266 +75,176 @@ func run() error {
 	flag.StringVar(&cfg.caPath, "ca", "", "path to the server CA certificate (required)")
 	flag.StringVar(&cfg.certPath, "cert", "", "this operator's certificate (required)")
 	flag.StringVar(&cfg.keyPath, "key", "", "this operator's private key (required)")
-	flag.IntVar(&cfg.localBase, "local-base", 15000, "first local port; device n is published on local-base+n")
-	flag.StringVar(&cfg.localHost, "local-host", "127.0.0.1", "address to publish local ports on; keep it on loopback")
-	flag.StringVar(&cfg.device, "device", "", "publish only this device, instead of everything the role allows")
-	flag.BoolVar(&cfg.once, "once", false, "serve one adb connection and exit, instead of running until interrupted")
+	flag.StringVar(&cfg.listen, "listen", "127.0.0.1:15000", "local address to publish the adb port on")
+	flag.BoolVar(&cfg.once, "once", false, "serve one adb connection and exit")
 	flag.DurationVar(&cfg.timeout, "dial-timeout", 15*time.Second, "how long to wait for the gateway")
 	flag.Parse()
 
-	for name, value := range map[string]string{
-		"gateway": cfg.gateway, "ca": cfg.caPath, "cert": cfg.certPath, "key": cfg.keyPath,
-	} {
-		if value == "" {
-			return fmt.Errorf("-%s is required", name)
-		}
-	}
-	if cfg.serverName == "" {
-		if host, _, err := net.SplitHostPort(cfg.gateway); err == nil {
-			cfg.serverName = host
-		}
+	switch {
+	case cfg.gateway == "":
+		return errors.New("-gateway is required")
+	case cfg.caPath == "":
+		return errors.New("-ca is required")
+	case cfg.certPath == "":
+		return errors.New("-cert is required")
+	case cfg.keyPath == "":
+		return errors.New("-key is required")
 	}
 
-	log.SetFlags(0)
-	log.SetPrefix("ard-connect: ")
-
-	c, err := tlsClient(cfg)
+	tlsCfg, err := operatorTLS(&cfg)
 	if err != nil {
 		return err
 	}
-	defer c.Close()
-
-	greeting, err := greet(c, cfg.device)
-	if err != nil {
-		return err
-	}
-	if len(greeting.Devices) == 0 {
-		return fmt.Errorf("the %s role has no devices granted, so there is nothing to publish", greeting.Role)
-	}
-	// Split what may be driven from what may merely be seen. Publishing a read-only
-	// device would let `adb connect` succeed and every command fail, which reads as a
-	// broken device rather than as policy.
-	driveable := make([]int, 0, len(greeting.Devices))
-	for i, d := range greeting.Devices {
-		if d.Bridgeable {
-			driveable = append(driveable, i)
-		}
-	}
-	if len(driveable) == 0 {
-		names := make([]string, 0, len(greeting.Devices))
-		for _, d := range greeting.Devices {
-			names = append(names, d.UUID)
-		}
-		return fmt.Errorf("this operator can see %s, but the %s role does not permit driving them",
-			strings.Join(names, ", "), greeting.Role)
-	}
-
-	// Publish loopback ports in the order the gateway listed them, so the numbering is
-	// stable for as long as the granted set is. The operator's adb serial is
-	// 127.0.0.1:<port>, and that is what appears in `adb devices`.
-	published := make(map[int]string, len(greeting.Devices))
-	ln := make([]net.Listener, 0, len(greeting.Devices))
-	defer func() {
-		for _, l := range ln {
-			_ = l.Close()
-		}
-	}()
-
-	fmt.Printf("operator %s, role %s\n", greeting.Operator, greeting.Role)
-	fmt.Printf("%-10s %-34s %s\n", "adb serial", "device", "state")
-	for n, idx := range driveable {
-		d := greeting.Devices[idx]
-		port := cfg.localBase + n
-		l, err := net.Listen("tcp", net.JoinHostPort(cfg.localHost, fmt.Sprint(port)))
-		if err != nil {
-			return fmt.Errorf("publish %s on %d: %w", d.UUID, port, err)
-		}
-		ln = append(ln, l)
-		published[port] = d.UUID
-		fmt.Printf("127.0.0.1:%-4d %-34s %s\n", port, d.UUID, d.State)
-		go serveLocal(l, cfg, d.UUID, greeting.Operator)
-	}
-	// Mention the rest, so an operator knows the device exists and why it is absent.
-	for _, d := range greeting.Devices {
-		if !d.Bridgeable {
-			fmt.Printf("%-10s %-34s %s\n", "-", d.UUID, "visible, not permitted to drive")
-		}
-	}
-	fmt.Printf("\nnow: adb connect 127.0.0.1:%d && adb -s 127.0.0.1:%d shell\n",
-		cfg.localBase, cfg.localBase)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if cfg.once {
-		l := ln[0]
-		conn, err := l.Accept()
-		if err != nil {
-			return err
-		}
-		_ = conn.Close()
-		return nil
-	}
-	<-ctx.Done()
-	fmt.Println("\nshutting down")
-	return nil
-}
-
-// tlsClient builds the operator's mutual-TLS connection to the gateway.
-//
-// The certificate decides who the operator is, and the gateway reads the identity from
-// the handshake rather than from anything sent afterwards, so a client cannot claim to be
-// someone else by editing a field.
-func tlsClient(cfg config) (*tls.Conn, error) {
-	ca, err := tlsx.LoadVerifierFile(cfg.caPath)
+	ln, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
-		return nil, fmt.Errorf("load the server CA: %w", err)
+		return fmt.Errorf("listen on %s: %w", cfg.listen, err)
 	}
-	// LoadIdentity takes a path prefix and appends .crt/.key, which is how the agent
-	// loads its own identity too. Keeping both callers on one shape means there is one
-	// way this is done rather than two that can drift.
-	id, err := tlsx.LoadIdentity(trimExt(cfg.certPath))
-	if err != nil {
-		return nil, fmt.Errorf("load the operator identity: %w", err)
-	}
-	conn, err := tlsx.ClientTLSFromVerifier(ca, id, cfg.serverName, tls.VersionTLS13)
-	if err != nil {
-		return nil, err
-	}
-	d := &net.Dialer{Timeout: cfg.timeout}
-	raw, err := d.Dial("tcp", cfg.gateway)
-	if err != nil {
-		return nil, fmt.Errorf("connect to the gateway: %w", err)
-	}
-	return tls.Client(raw, conn), nil
-}
+	defer ln.Close()
 
-// greeting mirrors what the gateway sends first. The device list is already filtered by
-// role on the server, which is why this client never needs to decide what it may see.
-type greeting struct {
-	Operator string `json:"operator"`
-	Role     string `json:"role"`
-	Devices  []struct {
-		registry.Device
-		// Bridgeable is the gateway's own decision. The client does not recompute it,
-		// because a client that guessed would either refuse a device the operator may
-		// use or advertise one they may not.
-		Bridgeable bool `json:"bridgeable"`
-	} `json:"devices"`
-}
+	log.Printf("publishing the adb port at %s; point adb at it with -P %s",
+		ln.Addr(), portOf(ln.Addr()))
+	log.Printf("gateway %s, device list and authorization enforced there", cfg.gateway)
 
-func greet(conn *tls.Conn, only string) (*greeting, error) {
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetDeadline(time.Time{})
-	var g greeting
-	if err := json.NewDecoder(conn).Decode(&g); err != nil {
-		return nil, fmt.Errorf("read the gateway's greeting: %w", err)
-	}
-	if g.Operator == "" {
-		return nil, errors.New("the gateway did not identify the operator")
-	}
-	if only != "" {
-		kept := g.Devices[:0]
-		for _, d := range g.Devices {
-			if d.UUID == only {
-				kept = append(kept, d)
-			}
-		}
-		g.Devices = kept
-	}
-	return &g, nil
-}
-
-// serveLocal handles one adb connection to one device.
-func serveLocal(l net.Listener, cfg config, device, operator string) {
-	for {
-		local, err := l.Accept()
-		if err != nil {
-			return
-		}
-		go func(local net.Conn) {
-			defer local.Close()
-			if err := bridge(local, cfg, device); err != nil {
-				log.Printf("%s: %v", device, err)
-			}
-		}(local)
-	}
-}
-
-// bridge opens one TLS connection to the gateway, asks for the device, and splices.
-//
-// A fresh connection per adb connection is deliberate. adb already multiplexes every
-// service it needs over the single TCP connection it opens to a given device, so pooling
-// would add state without saving anything, and it would leave a connection open with no
-// adb connection behind it.
-func bridge(local net.Conn, cfg config, device string) error {
-	up, err := tlsClient(cfg)
-	if err != nil {
-		return err
-	}
-	defer up.Close()
-
-	// The greeting is sent on every connection, so it must be consumed before the
-	// attach request. Skipping it would put JSON where the gateway expects a request.
-	var hello greeting
-	if err := json.NewDecoder(up).Decode(&hello); err != nil {
-		return fmt.Errorf("read greeting: %w", err)
-	}
-
-	req, err := json.Marshal(map[string]string{"op": "attach", "device": device})
-	if err != nil {
-		return err
-	}
-	if _, err := up.Write(append(req, '\n')); err != nil {
-		return fmt.Errorf("send attach: %w", err)
-	}
-	var resp struct {
-		Device string `json:"device"`
-		Error  string `json:"error"`
-	}
-	if err := json.NewDecoder(up).Decode(&resp); err != nil {
-		return fmt.Errorf("read attach response: %w", err)
-	}
-	if resp.Error != "" {
-		return errors.New(resp.Error)
-	}
-
-	// Bidirectional copy. Both directions matter: adb sends commands and reads output,
-	// and a half-open relay looks exactly like a hung device.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	defer wg.Wait()
+
 	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(up, local)
-		// CloseWrite rather than Close: the ADB protocol ends with one side stopping,
-		// and a full close here would cut off the reply still in flight.
-		_ = up.CloseWrite()
+		<-ctx.Done()
+		ln.Close()
 	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(local, up)
-		if c, ok := local.(*net.TCPConn); ok {
-			_ = c.CloseWrite()
+
+	for {
+		local, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("accept: %w", err)
 		}
-	}()
-	wg.Wait()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := forward(local, cfg, tlsCfg); err != nil {
+				log.Printf("%s: %v", local.RemoteAddr(), err)
+			}
+			local.Close()
+			if cfg.once {
+				stop()
+			}
+		}()
+	}
+}
+
+// forward splices one local connection to the gateway over mutual TLS.
+//
+// Each adb connection gets its own TLS connection, because adb opens one connection per
+// request it makes to the server and expects each to be answered on that connection. A
+// single multiplexed TLS connection carrying several would need a multiplexer of our own on
+// both ends, and adb's own protocol already provides the framing; adding a second one would
+// mean two places to get a boundary wrong.
+func forward(local net.Conn, cfg config, tlsCfg *tls.Config) error {
+	d := &net.Dialer{Timeout: cfg.timeout, KeepAlive: 30 * time.Second}
+	raw, err := d.DialContext(context.Background(), "tcp", cfg.gateway)
+	if err != nil {
+		return fmt.Errorf("dial gateway: %w", err)
+	}
+	defer raw.Close()
+
+	// The deadline covers the handshake only. Past it the connection belongs to adb, and a
+	// shell session is meant to be idle for as long as the operator is thinking.
+	_ = raw.SetDeadline(time.Now().Add(cfg.timeout))
+	remote := tls.Client(raw, tlsCfg)
+	if err := remote.Handshake(); err != nil {
+		return fmt.Errorf("gateway handshake: %w", err)
+	}
+	// Check the role rather than trusting the port.
+	//
+	// The gateway presents its *server* certificate on every listener, including the
+	// operator one, and distinguishes listeners by which CA they trust -- not by the leaf
+	// role. Requiring an operator role here would reject the gateway this client exists to
+	// talk to, and it did: the handshake check failed, the connection was closed, and adb
+	// reported "couldn't read status: connection reset by peer" with nothing useful in
+	// between. The server role is what the gateway legitimately presents.
+	if _, err := tlsx.VerifyPeerRole(remote.ConnectionState(), tlsx.OrgUnitServer); err != nil {
+		return fmt.Errorf("peer is not an ard server: %w", err)
+	}
+	_ = remote.SetDeadline(time.Time{})
+	_ = local.SetDeadline(time.Time{})
+
+	return splice(local, remote)
+}
+
+// splice copies in both directions and returns when either side stops.
+func splice(a, b net.Conn) error {
+	errc := make(chan error, 2)
+	go func() { _, err := io.Copy(a, b); errc <- err }()
+	go func() { _, err := io.Copy(b, a); errc <- err }()
+
+	// The first direction to finish is normally the one that closed: adb closes its end when
+	// it is done with a device, and the gateway's socket is still open. Waiting for the
+	// second would hang on a connection that is already finished.
+	if err := <-errc; err != nil && !isClosed(err) {
+		return err
+	}
 	return nil
 }
 
-// trimExt drops a trailing .crt or .key so a path can be used as the prefix
-// LoadIdentity expects. An operator will reasonably type the full certificate path.
-func trimExt(p string) string {
-	for _, ext := range []string{".crt", ".key"} {
-		if strings.HasSuffix(p, ext) {
-			return strings.TrimSuffix(p, ext)
-		}
-	}
-	return p
+func isClosed(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
-func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "ard-connect:", err)
-		os.Exit(1)
+// operatorTLS builds the client configuration: the server CA for verification and this
+// operator's own certificate for mutual authentication.
+//
+// The certificate is required. An operator endpoint that accepted a one-sided handshake
+// would authenticate the server to nobody and the operator to the server, which is the same
+// as authenticating neither.
+func operatorTLS(cfg *config) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(cfg.caPath)
+	if err != nil {
+		return nil, fmt.Errorf("read -ca: %w", err)
 	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("-ca %s contains no certificates", cfg.caPath)
+	}
+
+	cert, err := tls.LoadX509KeyPair(cfg.certPath, cfg.keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load operator certificate: %w", err)
+	}
+
+	name := cfg.serverName
+	if name == "" {
+		host, _, err := net.SplitHostPort(cfg.gateway)
+		if err != nil {
+			host = cfg.gateway
+		}
+		name = host
+	}
+
+	return &tls.Config{
+		RootCAs:      pool,
+		Certificates: []tls.Certificate{cert},
+		ServerName:   name,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+func portOf(a net.Addr) string {
+	if ta, ok := a.(*net.TCPAddr); ok {
+		return fmt.Sprint(ta.Port)
+	}
+	_, port, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return ""
+	}
+	return port
 }

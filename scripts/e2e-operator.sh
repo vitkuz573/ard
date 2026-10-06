@@ -134,13 +134,13 @@ grep -q "serving" "$WORK/agent.log" && ok "device connected through the gateway"
 # --------------------------------------------------------------------- operator
 
 step "operator client, from a machine that is not the gateway"
-LOCALBASE=$(( 26000 + RANDOM % 2000 ))
+LOCALPORT=$(( 26000 + RANDOM % 2000 ))
 "$WORK/bin/ard-connect" \
   -gateway "127.0.0.1:$OPPORT" \
   -ca "$PKI/server/ca.crt" \
   -cert "$PKI/operators/leaves/$OPERATOR.crt" \
   -key "$PKI/operators/leaves/$OPERATOR.key" \
-  -local-base "$LOCALBASE" \
+  -listen "127.0.0.1:$LOCALPORT" \
   >"$WORK/connect.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 60); do
@@ -148,12 +148,10 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 
-if grep -q "adb serial" "$WORK/connect.log" 2>/dev/null; then
-  ok "client published a local port for the granted device"
+if grep -q "publishing the adb port" "$WORK/connect.log" 2>/dev/null; then
+  ok "client published one local adb port"
 else
-  bad "the operator client did not start"
-  sed 's/^/      /' "$WORK/connect.log" | head -10
-  exit 1
+  bad "the operator client did not start"; sed "s/^/      /" "$WORK/connect.log"; exit 1
 fi
 echo "      --- client output ---"
 sed 's/^/      /' "$WORK/connect.log" | head -6
@@ -171,37 +169,38 @@ step "stock adb, driven from the operator's machine"
 export ADB_VENDOR_KEYS="$WORK/adbkeys"
 mkdir -p "$ADB_VENDOR_KEYS"
 
+  # adb talks to the helper as if it were its own server: one port, and it asks which
+  # devices exist rather than being handed a list. No adb connect, no serial in advance --
+  # that is the point of the change.
+  for _ in $(seq 1 40); do
+    adb -P "$LOCALPORT" devices >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+
+  DEVICES="$(adb -P "$LOCALPORT" devices 2>/dev/null || true)"
+  printf "%s\n" "$DEVICES" | sed "s/^/      /"
+
+  if printf "%s\n" "$DEVICES" | grep -q "^$DEVICE[[:space:]]*device"; then
+    ok "adb sees the device through the operator port, by asking"
+  else
+    bad "adb did not report the device as ready; got: ${DEVICES:-<nothing>}"
+    exit 1
+  fi
 adb kill-server >/dev/null 2>&1 || true
-adb connect "127.0.0.1:$LOCALBASE" 2>&1 | tail -1 | sed 's/^/      /'
-
-for _ in $(seq 1 40); do
-  state="$(adb devices | awk -v s="127.0.0.1:$LOCALBASE" '$1==s{print $2}')"
-  [[ "$state" == "device" ]] && break
-  sleep 0.25
-done
-
-if adb devices | grep -q "^127.0.0.1:$LOCALBASE[[:space:]]*device"; then
-  ok "adb sees the device over the operator bridge"
-else
-  bad "adb did not report the device as ready"
-  adb devices | sed 's/^/      /'
-  exit 1
-fi
-
 # The real assertion: the transport is transparent in both directions.
 #
 # Only commands mockadbd implements are used here. It answers whoami, get-state, cat,
 # true and false, and reports 127 for anything else -- so asking it for getprop would
 # test the mock rather than the bridge. Property reads and exit-code propagation are
 # covered against real hardware instead.
-WHO="$(timeout 25 adb -s "127.0.0.1:$LOCALBASE" shell whoami 2>/dev/null | tr -d '\r\n' || true)"
+WHO="$(timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell whoami 2>/dev/null | tr -d '\r\n' || true)"
 if [[ "$WHO" == "shell" ]]; then
   ok "adb shell whoami returned: $WHO"
 else
   bad "adb shell produced '$WHO', want 'shell'"
 fi
 
-timeout 25 adb -s "127.0.0.1:$LOCALBASE" shell false >/dev/null 2>&1 || rc=$?
+timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell false >/dev/null 2>&1 || rc=$?
 rc=${rc:-0}
 if [[ $rc -eq 1 ]]; then
   ok "a failing command's exit code propagates"
@@ -222,7 +221,7 @@ printf 'hello-through-the-bridge' > "$STDIN_FILE"
 # Every adb call gets a timeout. adb's shell client does not always notice that stdin
 # closed, and when it does not, `cat` blocks forever and the whole script hangs instead of
 # reporting. A check that can hang is worse than one that can fail.
-OUT="$(timeout 25 adb -s "127.0.0.1:$LOCALBASE" shell cat < "$STDIN_FILE" 2>/dev/null | tr -d '\r\n' || true)"
+OUT="$(timeout 25 adb -P "$LOCALPORT" -s "$DEVICE" shell cat < "$STDIN_FILE" 2>/dev/null | tr -d '\r\n' || true)"
 if [[ "$OUT" == "hello-through-the-bridge" ]]; then
   ok "stdin round-trips"
 else
@@ -234,13 +233,13 @@ fi
 step "authorization is enforced on the gateway"
 # A role without shell must not get the bridge, whatever the client asks for.
 "$WORK/bin/ard-ca" operator -dir "$PKI" -name bob >/dev/null 2>&1
-BADPORT=$(( LOCALBASE + 40 ))
+BADPORT=$(( LOCALPORT + 40 ))
 timeout 20 "$WORK/bin/ard-connect" \
   -gateway "127.0.0.1:$OPPORT" \
   -ca "$PKI/server/ca.crt" \
   -cert "$PKI/operators/leaves/bob.crt" \
   -key "$PKI/operators/leaves/bob.key" \
-  -local-base "$BADPORT" \
+  -listen "127.0.0.1:$BADPORT" \
   >"$WORK/connect-bob.log" 2>&1 || true
 
 # Bob holds logcat on this device and is deliberately not given shell.
@@ -253,7 +252,7 @@ if timeout 25 "$WORK/bin/ard-connect" -gateway "127.0.0.1:$OPPORT" \
      -ca "$PKI/server/ca.crt" \
      -cert "$PKI/operators/leaves/bob.crt" \
      -key "$PKI/operators/leaves/bob.key" \
-     -local-base "$BADPORT" \
+     -listen "127.0.0.1:$BADPORT" \
      >"$WORK/connect-bob.log" 2>&1; then
   bad "a logcat-only operator was given something to run"
 else
