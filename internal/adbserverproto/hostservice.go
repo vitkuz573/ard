@@ -44,6 +44,9 @@ func (s *Server) serveHostService(c net.Conn, dev net.Conn, prefix []byte) error
 	if err != nil {
 		return fmt.Errorf("read service request: %w", err)
 	}
+	// Which service was requested is worth one line: it is the only thing that distinguishes
+	// `adb shell whoami` from `adb push` in the log, and without it a session that opens a
+	// transport and delivers nothing has nothing to explain it.
 	s.debugf("adbserverproto: service %q on a switched transport", service)
 
 	dbr := bufio.NewReader(dev)
@@ -93,6 +96,9 @@ func (s *Server) handshake(br *bufio.Reader, dev net.Conn, service string) (uint
 	if reply.command != cmdCNXN {
 		return 0, fmt.Errorf("device answered %q where CNXN was expected", reply.command)
 	}
+	// The device's banner, logged because it is where the shell v2 negotiation is decided:
+	// a device that does not list shell_v2 answers every command without a status frame, and
+	// that presents as this relay dropping the exit code.
 	s.debugf("adbserverproto: device says %q", string(reply.payload))
 
 	if _, err := dev.Write(encodePacket(cmdOKAY, cnxnArg0, adbMaxData, nil)); err != nil {
@@ -115,7 +121,6 @@ func (s *Server) handshake(br *bufio.Reader, dev net.Conn, service string) (uint
 	if reply.arg0 == 0 {
 		return 0, fmt.Errorf("device answered OPEN for %q with stream id 0", service)
 	}
-	s.debugf("adbserverproto: device stream id %d", reply.arg0)
 	return reply.arg0, nil
 }
 
@@ -195,6 +200,9 @@ func (s *Server) pumpHostStream(c net.Conn, dev net.Conn, cbr *bufio.Reader, dbr
 			case cmdOKAY, cmdOPEN, cmdCNXN:
 				// Handshake leftovers. Nothing to hand the client.
 			default:
+				// Not an error: a device may legitimately send STATUS or SYNC frames on a
+				// sync service, and this relay has no use for either. Logged so that an
+				// unexpected one is a fact in the log rather than a silence.
 				s.debugf("adbserverproto: device sent %q, ignored", p.command)
 			}
 		}
