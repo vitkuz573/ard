@@ -70,13 +70,28 @@ ok "device and operator identities issued"
 #
 # Naming a role after nobody is the trap: the file parses, loads, and refuses every
 # operator, which reads as deliberate. So the policy below names members explicitly.
+#
+# `adb logcat` is not a permission and is not written here: it has no service name of its
+# own, so it arrives as the shell service with a command line attached and is governed by
+# "shell". A name the gateway does not know stops it from starting, which is the point --
+# a policy that loads and grants less than it reads as control and is not.
+#
+# The permissions are split across four roles so that each check below is about one gate
+# rather than about a role that holds everything:
+#
+#   maintainer  holds everything, and drives the device throughout this script
+#   observer    holds a permission and no shell, so the bridge refuses it
+#   driver      holds shell and no forward or reverse, so those two permissions can be
+#               revoked and the revocation observed against the real client
+#   porter      holds forward and reverse on the same device as the maintainer, so the
+#               only thing between one operator's port and another's is ownership
 cat > "$PKI/operators/operators.yaml" <<YAML
 roles:
-  # May drive this one device. shell is required for the bridge, because a raw ADB
+  # May drive these two devices. shell is required for the bridge, because a raw ADB
   # connection cannot be separated by permission -- it carries shell, install, file
   # transfer and forwarding all at once.
   - name: maintainer
-    permissions: ["shell", "exec", "files", "install", "logcat"]
+    permissions: ["shell", "exec", "files", "install", "forward", "reverse"]
     grants:
       - "$DEVICE"
       - "$DEVICE_V1"
@@ -85,10 +100,26 @@ roles:
   # Holds a permission but is deliberately not given shell. The bridge must refuse it,
   # which is what proves the gate is load-bearing rather than decorative.
   - name: observer
-    permissions: ["logcat"]
+    permissions: ["files"]
     grants:
       - "$DEVICE"
     members: ["bob"]
+
+  # Holds shell and drives the device, but binds no port on the gateway in either
+  # direction. Every `adb forward` and `adb reverse` from this role must be refused.
+  - name: driver
+    permissions: ["shell", "exec", "files", "install"]
+    grants:
+      - "$DEVICE"
+    members: ["carol"]
+
+  # Holds forward and reverse on the same device as the maintainer, so that one operator
+  # cannot release another's port. Ownership is the only thing between them.
+  - name: porter
+    permissions: ["shell", "forward", "reverse"]
+    grants:
+      - "$DEVICE"
+    members: ["frank"]
 YAML
 ok "operator policy grants $OPERATOR only $DEVICE"
 
@@ -659,7 +690,7 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 
-# Bob holds logcat on this device and is deliberately not given shell. So he must be told the
+# Bob holds files on this device and is deliberately not given shell. So he must be told the
 # device exists -- a denial with no explanation is impossible to act on -- and he must not be
 # able to open a transport to it. The distinction is that the device is visible in the listing
 # and the refusal comes when he tries to use it, which is where the policy is.
@@ -667,9 +698,9 @@ BOBDEVICES="$(timeout 15 adb -P "$BADPORT" devices 2>/dev/null || true)"
 printf "%s\n" "$BOBDEVICES" | sed 's/^/      /'
 
 if printf "%s\n" "$BOBDEVICES" | grep -q "^$DEVICE[[:space:]]*device"; then
-  ok "an entitled read-only operator is told the device exists"
+  ok "an operator entitled to the device is told it exists"
 else
-  bad "the device is hidden from an operator whose role holds logcat on it"
+  bad "the device is hidden from an operator whose role holds a permission on it"
 fi
 
 # Now the refusal. adb prints the gateway's FAIL message on stderr, so that is where the reason
@@ -686,9 +717,9 @@ printf '%s\n' "$BOBOUT" | sed 's/^/      /'
 # satisfy a grep for "may not attach" if any other part of the output ever said it, and the
 # check would pass while the thing it exists to catch went unnoticed.
 if printf '%s\n' "$BOBOUT" | grep -q "^shell$"; then
-  bad "a logcat-only operator got a shell session"
+  bad "an operator whose role holds no shell got a shell session"
 else
-  ok "a logcat-only operator is refused a shell session"
+  ok "an operator whose role holds no shell is refused a shell session"
 fi
 
 # And no session came back that could be mistaken for one: the output has to be the refusal
@@ -712,18 +743,18 @@ fi
 
 # The gateway agreed, independently of what the client decided: it identified bob and marked
 # the device not bridgeable, so no attach was ever attempted. What must NOT appear is a stream
-# being opened for him -- a read-only operator getting device access would be the whole failure
-# this test exists to catch.
+# being opened for him -- an operator who may not drive the device getting one would be the whole
+# failure this test exists to catch.
 if grep -q '"actor":"bob"' "$WORK/audit.log" 2>/dev/null; then
-  ok "the gateway identified the read-only operator"
+  ok "the gateway identified the operator it refused"
 else
-  bad "the gateway did not record the read-only operator at all"
+  bad "the gateway did not record the refused operator at all"
 fi
 
 if grep -qE '"kind":"stream.open","actor":"bob"' "$WORK/audit.log" 2>/dev/null; then
   bad "a stream was opened for an operator who may not drive the device"
 else
-  ok "no stream was opened for the read-only operator"
+  ok "no stream was opened for the refused operator"
 fi
 
 # And the refusal itself has to be in the gateway's log, not only in the client's terminal: an
@@ -732,9 +763,307 @@ fi
 if grep -q "may not attach" "$WORK/server.log" 2>/dev/null; then
   ok "the gateway logged the refusal and its reason"
 else
-  bad "the gateway did not log why it refused the read-only operator"
+  bad "the gateway did not log why it refused the operator"
   grep -i bob "$WORK/server.log" | sed 's/^/      /' | head -3
 fi
+
+# ------------------------------------------------- revoking a permission
+
+step "revoking a permission takes the capability away, observed through adb"
+
+# A permission that is checked but whose absence nothing observes is a permission that might as
+# well not be checked. So the revocation is measured from the other end: an operator whose role
+# holds shell drives the device and binds a port in both directions, and an operator whose role
+# holds the same permissions without `forward` and `reverse` is stopped at exactly those two.
+#
+# Both roles drive the same device. If the refusals below came from the device or from the
+# transport rather than from the permissions, the driver would be refused too -- so the driver
+# passing and the other operator failing on the same device and the same commands is what makes
+# this a check of the permission rather than of the path.
+"$WORK/bin/ard-ca" operator -dir "$PKI" -name carol >/dev/null 2>&1
+CAROLPORT=$(( BADPORT + 1 ))
+"$WORK/bin/ard-connect" \
+  -gateway "127.0.0.1:$OPPORT" \
+  -ca "$PKI/server/ca.crt" \
+  -cert "$PKI/operators/leaves/carol.crt" \
+  -key "$PKI/operators/leaves/carol.key" \
+  -listen "127.0.0.1:$CAROLPORT" \
+  >"$WORK/connect-carol.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 60); do
+  grep -q "publishing the adb port" "$WORK/connect-carol.log" 2>/dev/null && break
+  sleep 0.25
+done
+if grep -q "publishing the adb port" "$WORK/connect-carol.log" 2>/dev/null; then
+  ok "the second operator's client published a port"
+else
+  bad "the second operator's client did not start, so the checks below would prove nothing"
+  sed 's/^/      /' "$WORK/connect-carol.log" | head -5
+  exit 1
+fi
+
+adb kill-server >/dev/null 2>&1 || true
+export ADB_VENDOR_KEYS="$WORK/adbkeys"
+for _ in $(seq 1 40); do
+  timeout 15 adb -P "$CAROLPORT" devices >/dev/null 2>&1 && break
+  sleep 0.25
+done
+
+# The positive side first, and on this same device: shell is what the two roles share, so a
+# failure here would say the fixture is wrong rather than that the permissions work.
+CAROLSHELL="$(timeout 25 adb -P "$CAROLPORT" -s "$DEVICE" shell whoami 2>&1 | tr -d '\r' || true)"
+if printf '%s\n' "$CAROLSHELL" | grep -qx "shell"; then
+  ok "an operator holding shell drives the device: $CAROLSHELL"
+else
+  bad "the operator whose role holds shell was refused: $CAROLSHELL"
+fi
+
+CAROL_FWD_LOCAL=$(( 42000 + RANDOM % 1000 ))
+CAROLFWD="$(timeout 30 adb -P "$CAROLPORT" -s "$DEVICE" forward "tcp:$CAROL_FWD_LOCAL" "tcp:$FWD_PORT" 2>&1 || true)"
+printf '%s\n' "$CAROLFWD" | sed 's/^/      /'
+
+# The outcome, not the wording: what matters is that the port was not bound. `adb forward`
+# prints the port it bound and nothing else, so a refusal is a message and a success is a
+# number, and the port answering is the third and final piece of evidence.
+if printf '%s\n' "$CAROLFWD" | grep -qx "$CAROL_FWD_LOCAL"; then
+  bad "a forward was bound for a role holding no forward permission"
+else
+  ok "adb forward is refused to a role that does not hold forward"
+fi
+
+# Nothing is listening: a refusal that arrived after the bind would leave a port on the gateway
+# reaching the device, which is the whole thing the permission exists to prevent.
+if python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('127.0.0.1', $CAROL_FWD_LOCAL), 2).close()
+except OSError:
+    sys.exit(0)
+sys.exit(1)
+"; then
+  ok "no port is bound on the gateway for the refused forward"
+else
+  bad "tcp:$CAROL_FWD_LOCAL is accepting connections after the forward was refused"
+fi
+
+# And the refusal has to be actionable: the device, the role, and the permission to ask for.
+# One of the three alone leaves the reader guessing, and the operator's next question is always
+# "what do I need to ask for".
+if printf '%s\n' "$CAROLFWD" | grep -q "$DEVICE" &&
+   printf '%s\n' "$CAROLFWD" | grep -q "driver" &&
+   printf '%s\n' "$CAROLFWD" | grep -q "forward"; then
+  ok "the forward refusal names the device, the role and the missing permission"
+else
+  bad "the forward refusal does not explain itself"
+fi
+
+CAROL_REV_REMOTE=$(( 43000 + RANDOM % 1000 ))
+CAROLREV="$(timeout 30 adb -P "$CAROLPORT" -s "$DEVICE" reverse "tcp:$CAROL_REV_REMOTE" "tcp:$REV_PORT" 2>&1 || true)"
+printf '%s\n' "$CAROLREV" | sed 's/^/      /'
+
+# The same three-part message, for the same reason and on the other direction.
+if printf '%s\n' "$CAROLREV" | grep -q "$DEVICE" &&
+   printf '%s\n' "$CAROLREV" | grep -q "driver" &&
+   printf '%s\n' "$CAROLREV" | grep -q "reverse"; then
+  ok "the reverse refusal names the device, the role and the missing permission"
+else
+  bad "adb reverse was not refused with a reason that explains itself: $CAROLREV"
+fi
+
+# The refusal has to be about the permission rather than about the path, so the same command
+# from the role that holds `reverse` must not be refused for it. Without this, a refusal
+# produced by anything else on the way -- the mock, the transport, a port already in use --
+# would satisfy the check above.
+HOLDER_REV_REMOTE=$(( 43500 + RANDOM % 1000 ))
+HOLDERREV="$(timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" reverse "tcp:$HOLDER_REV_REMOTE" "tcp:$REV_PORT" 2>&1 || true)"
+printf '%s\n' "$HOLDERREV" | sed 's/^/      /'
+if printf '%s\n' "$HOLDERREV" | grep -q "lacks permission"; then
+  bad "the role holding reverse was refused for it: $HOLDERREV"
+else
+  ok "the role holding reverse is not refused for it on the same device"
+fi
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" reverse --remove "tcp:$HOLDER_REV_REMOTE" >/dev/null 2>&1 || true
+
+# And the same for forward, so both halves of the pair read as permissions rather than as a
+# gateway that cannot bind a port at all.
+HOLDER_FWD_LOCAL=$(( 44000 + RANDOM % 1000 ))
+if timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward "tcp:$HOLDER_FWD_LOCAL" "tcp:$FWD_PORT" 2>&1; then
+  ok "the role holding forward binds a port on the same device"
+else
+  bad "the role holding forward was refused; the revocation above would prove nothing"
+fi
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward --remove "tcp:$HOLDER_FWD_LOCAL" >/dev/null 2>&1 || true
+
+# ------------------------------------------------- one operator's forwards
+
+step "one operator does not see or release another's forwards"
+
+# A forward outlives the connection that asked for it: adb closes that connection as soon as the
+# port is bound, so anything the gateway learns about the forward has to be recorded at binding
+# time rather than read off a connection that is gone. Two consequences follow, and both are
+# about reachability rather than about tidiness.
+#
+# The listing is a request about ports, and a device identifier in it is the string `adb -s`
+# takes. An unfiltered listing hands one operator the device ids and ports of another
+# operator's tunnels.
+#
+# The removal is worse than the listing: a port bound on the gateway is still listening and still
+# serving, so answering OKAY to a removal that did not happen would tell the operator their port
+# is gone while anything that can reach the gateway is still reaching a device through it.
+
+# The round-trip section above released its forward, so one is bound here and stays bound for
+# the length of this section. It is on the gateway's loopback and it is alice's, and both facts
+# are what the next checks turn on.
+OWNED_FWD_LOCAL=$(( 45500 + RANDOM % 1000 ))
+if timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward "tcp:$OWNED_FWD_LOCAL" "tcp:$FWD_PORT" 2>&1; then
+  ok "the first operator bound a forward to keep for this section"
+else
+  bad "could not bind the forward this section depends on"
+  exit 1
+fi
+
+# The listing is answered from the gateway's own set rather than from the device, so the first
+# operator's own port has to appear in it.
+ALICE_PORT_LIST="$(timeout 30 adb -P "$LOCALPORT" forward --list 2>&1 || true)"
+printf '%s\n' "$ALICE_PORT_LIST" | sed 's/^/      /'
+if printf '%s\n' "$ALICE_PORT_LIST" | grep -q "tcp:$OWNED_FWD_LOCAL"; then
+  ok "the operator who bound the forward sees it in the listing"
+else
+  bad "the operator's own forward is not in the listing: $ALICE_PORT_LIST"
+fi
+
+# The same question asked by an operator who holds forward on the same device. `adb forward
+# --list` with no serial is the form the stock server answers.
+CAROL_LIST="$(timeout 30 adb -P "$CAROLPORT" forward --list 2>&1 || true)"
+printf '%s\n' "$CAROL_LIST" | sed 's/^/      /'
+if printf '%s\n' "$CAROL_LIST" | grep -q "tcp:$OWNED_FWD_LOCAL"; then
+  bad "another operator was shown a forward that is not his"
+else
+  ok "another operator is shown no forward belonging to the first"
+fi
+
+# The same for the per-device form, which is what a caller reaching for a scoped answer tries
+# first and which the stock server accepts.
+CAROL_LIST_SERIAL="$(timeout 30 adb -P "$CAROLPORT" -s "$DEVICE" forward --list 2>&1 || true)"
+printf '%s\n' "$CAROL_LIST_SERIAL" | sed 's/^/      /'
+if printf '%s\n' "$CAROL_LIST_SERIAL" | grep -q "tcp:$OWNED_FWD_LOCAL"; then
+  bad "the per-device listing showed another operator's forward"
+else
+  ok "the per-device listing shows the asking operator's forwards only"
+fi
+
+# The removal needs its own operator. Carol holds no forward permission, so her attempt would
+# stop at the permission rather than at the ownership, which is the right answer for her and
+# proves nothing about ownership. Frank holds forward on the same device, so the only thing
+# standing between him and alice's port is whose it is.
+"$WORK/bin/ard-ca" operator -dir "$PKI" -name frank >/dev/null 2>&1
+FRANKPORT=$(( CAROLPORT + 1 ))
+"$WORK/bin/ard-connect" \
+  -gateway "127.0.0.1:$OPPORT" \
+  -ca "$PKI/server/ca.crt" \
+  -cert "$PKI/operators/leaves/frank.crt" \
+  -key "$PKI/operators/leaves/frank.key" \
+  -listen "127.0.0.1:$FRANKPORT" \
+  >"$WORK/connect-frank.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 60); do
+  grep -q "publishing the adb port" "$WORK/connect-frank.log" 2>/dev/null && break
+  sleep 0.25
+done
+if grep -q "publishing the adb port" "$WORK/connect-frank.log" 2>/dev/null; then
+  ok "a third operator's client published a port"
+else
+  bad "the third operator's client did not start, so the ownership checks would prove nothing"
+  sed 's/^/      /' "$WORK/connect-frank.log" | head -5
+  exit 1
+fi
+
+adb kill-server >/dev/null 2>&1 || true
+export ADB_VENDOR_KEYS="$WORK/adbkeys"
+for _ in $(seq 1 40); do
+  timeout 15 adb -P "$FRANKPORT" devices >/dev/null 2>&1 && break
+  sleep 0.25
+done
+
+# Frank may forward on this device -- the permission is his -- so he binds one of his own, which
+# is what makes the listing below a comparison between two non-empty answers rather than between
+# an answer and an empty one.
+FRANK_FWD_LOCAL=$(( 46000 + RANDOM % 1000 ))
+if timeout 30 adb -P "$FRANKPORT" -s "$DEVICE" forward "tcp:$FRANK_FWD_LOCAL" "tcp:$FWD_PORT" 2>&1; then
+  ok "the second forward-capable operator bound a port of his own"
+else
+  bad "the second forward-capable operator could not bind a port; the checks below would prove nothing"
+fi
+
+# The listing is then compared in both directions: each operator sees his own port and not the
+# other's. One direction alone would pass against a gateway that shows nothing to anybody.
+FRANK_LIST="$(timeout 30 adb -P "$FRANKPORT" forward --list 2>&1 || true)"
+printf '%s\n' "$FRANK_LIST" | sed 's/^/      /'
+if printf '%s\n' "$FRANK_LIST" | grep -q "tcp:$FRANK_FWD_LOCAL"; then
+  ok "the second operator sees the forward he bound"
+else
+  bad "the second operator's own forward is not in his listing: $FRANK_LIST"
+fi
+if printf '%s\n' "$FRANK_LIST" | grep -q "tcp:$OWNED_FWD_LOCAL"; then
+  bad "the second operator was shown the first operator's forward"
+else
+  ok "neither operator is shown the other's forward"
+fi
+
+FRANK_STEAL="$(timeout 30 adb -P "$FRANKPORT" -s "$DEVICE" forward --remove "tcp:$OWNED_FWD_LOCAL" 2>&1 || true)"
+printf '%s\n' "$FRANK_STEAL" | sed 's/^/      /'
+if printf '%s\n' "$FRANK_STEAL" | grep -qi "another operator"; then
+  ok "the refusal says the port belongs to another operator"
+else
+  bad "removing another operator's forward did not say whose it is: $FRANK_STEAL"
+fi
+
+# And the port is still there, which is the part that decides whether the refusal was honest. A
+# removal that answered OKAY and left the listener bound would satisfy the check above while the
+# tunnel kept carrying traffic.
+FWD_STILL_LISTED="$(timeout 30 adb -P "$LOCALPORT" forward --list 2>&1 || true)"
+if printf '%s\n' "$FWD_STILL_LISTED" | grep -q "tcp:$OWNED_FWD_LOCAL"; then
+  ok "the refused removal left the first operator's forward in place"
+else
+  bad "the first operator's forward is gone: $FWD_STILL_LISTED"
+fi
+
+FWD_STILL_CARRIES="$(timeout 30 python3 -c "
+import socket
+c = socket.create_connection(('127.0.0.1', $OWNED_FWD_LOCAL), 5)
+c.sendall(b'still-bound')
+c.settimeout(10)
+print(c.recv(256).decode(), end='')
+c.close()
+" 2>&1 || true)"
+printf '%s\n' "$FWD_STILL_CARRIES" | sed 's/^/      /'
+if [[ "$FWD_STILL_CARRIES" == "echo:still-bound" ]]; then
+  ok "the port refused for removal is still carrying traffic, so the refusal was honest"
+else
+  bad "the port stopped carrying traffic: $FWD_STILL_CARRIES"
+fi
+
+# Frank's own port is released, so the removal half is shown to work rather than to be broken
+# for everybody: a check that only ever sees refusals passes against a gateway that removes
+# nothing at all.
+timeout 30 adb -P "$FRANKPORT" -s "$DEVICE" forward --remove "tcp:$FRANK_FWD_LOCAL" >/dev/null 2>&1 || true
+if python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('127.0.0.1', $FRANK_FWD_LOCAL), 2).close()
+except OSError:
+    sys.exit(0)
+sys.exit(1)
+"; then
+  ok "an operator can still release a forward of his own"
+else
+  bad "an operator could not release his own forward, so the refusals above prove nothing"
+fi
+
+# The forward this section bound is released, so a run of this script leaves nothing listening
+# on the gateway.
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" forward --remove "tcp:$OWNED_FWD_LOCAL" >/dev/null 2>&1 || true
+timeout 30 adb -P "$LOCALPORT" -s "$DEVICE" reverse --remove "tcp:$REV_REMOTE" >/dev/null 2>&1 || true
 
 adb kill-server >/dev/null 2>&1 || true
 adb connect "$MOCKADDR" >/dev/null 2>&1 || true

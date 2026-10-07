@@ -41,7 +41,9 @@ func TestKindForServiceMatchesWhatAdbSends(t *testing.T) {
 		// itself. Neither has a name to be told apart by.
 		{"shell,v2,TERM=xterm-256color,raw:whoami", KindShell},
 		{"shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat '-d'", KindShell},
+		{"shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat", KindShell},
 		{"shell,v2,TERM=xterm-256color,raw:screencap -p /sdcard/s.png", KindShell},
+		{"shell,v2,TERM=xterm-256color,raw:screenrecord --time-limit 1 /sdcard/v.mp4", KindShell},
 		{"shell:ls /sdcard", KindShell},
 		{"root:", KindShell},
 		{"unroot:", KindShell},
@@ -141,17 +143,31 @@ func TestTheKindTableAndThePermissionsAgreeBothWays(t *testing.T) {
 			t.Errorf("kind %q requires a permission but no request ever reaches it", kind)
 		}
 	}
-	// And every permission is required by some kind, so none is a name that can be written
-	// into a policy file and never consulted.
+	// And every declared permission is required by some kind, so none is a name that can be
+	// written into a policy file and never consulted. The list below is the whole declared
+	// vocabulary, and it is compared with the table in both directions: a permission added
+	// to the declarations without a kind behind it, and a permission left in this list that
+	// the table has dropped, are both failures rather than something a reader has to notice.
+	declared := []Permission{
+		PermShell, PermExec, PermFiles, PermInstall, PermForward, PermReverse,
+	}
 	required := map[Permission]bool{}
 	for _, perm := range KindToPermission {
 		required[perm] = true
 	}
-	for _, perm := range []Permission{
-		PermShell, PermExec, PermFiles, PermInstall, PermForward, PermReverse,
-	} {
+	seen := map[Permission]bool{}
+	for _, perm := range declared {
+		if seen[perm] {
+			t.Errorf("permission %q is listed twice in the declared vocabulary", perm)
+		}
+		seen[perm] = true
 		if !required[perm] {
 			t.Errorf("permission %q is declared but no kind requires it", perm)
+		}
+	}
+	for perm := range required {
+		if perm != PermAll && !seen[perm] {
+			t.Errorf("a kind requires permission %q, which is absent from the declared vocabulary", perm)
 		}
 	}
 }
@@ -251,6 +267,72 @@ roles:
 	}
 	if !strings.Contains(d.Reason, "no defined permission") {
 		t.Errorf("unhelpful reason: %s", d.Reason)
+	}
+}
+
+// The policy the repository ships is the policy an operator's gateway loads, so it is
+// checked against the same loader the gateway uses rather than read as documentation.
+//
+// The vocabulary and this file drift apart silently: a permission removed from the
+// declarations stays in a role here, the file still reads like a policy, and the only
+// sign is a gateway that will not start with a message naming a role nobody configured on
+// purpose. It stops every deployment, which is the right outcome, but it is discovered on
+// the machine holding the CA keys rather than in a test.
+func TestTheShippedPolicyLoads(t *testing.T) {
+	path := filepath.Join("..", "..", "deploy", "operators.yaml")
+	if _, err := Load(path); err != nil {
+		t.Fatalf("the shipped policy does not load, so no gateway would start with it: %v", err)
+	}
+}
+
+// Every permission the shipped policy hands out has to be one the code consults, and the
+// kind behind it has to be a request a real adb sends. A role naming a permission the
+// gateway loads but never asks about would pass the loader and grant something unusable,
+// which reads in the policy file as a capability nobody has.
+func TestEveryPermissionTheShippedPolicyGrantsIsConsulted(t *testing.T) {
+	required := map[Permission]bool{}
+	for _, perm := range KindToPermission {
+		required[perm] = true
+	}
+	p, err := Load(filepath.Join("..", "..", "deploy", "operators.yaml"))
+	if err != nil {
+		t.Fatalf("load shipped policy: %v", err)
+	}
+	for _, role := range p.roles() {
+		for _, perm := range role.Permissions {
+			// The wildcard is the exception, and it is a real exception rather than a
+			// special case in this check: Authorize compares a role's permissions against
+			// whatever a kind requires, so a wildcard is consulted without a kind of its own.
+			if perm != PermAll && !required[perm] {
+				t.Errorf("role %q grants %q, which no kind ever requires", role.Name, perm)
+			}
+		}
+	}
+}
+
+// The loader's vocabulary and the kind table have to be the same set, and this is checked
+// against the loader's own set rather than against a list written here.
+//
+// A permission added to the declarations but left out of the kind table is loadable and
+// unused: a role file may grant it, every request is authorized without it, and the policy
+// reads as though something is being withheld. That is the failure this asserts against, and
+// deriving both halves from the same source is what makes the assertion about the code rather
+// than about this test's idea of it.
+func TestTheLoadableVocabularyIsExactlyWhatSomeKindRequires(t *testing.T) {
+	loadable := loadablePermissions()
+	required := map[Permission]bool{}
+	for _, perm := range KindToPermission {
+		required[perm] = true
+	}
+	for perm := range loadable {
+		if perm != PermAll && !required[perm] {
+			t.Errorf("permission %q can be granted by a policy file but no kind ever requires it", perm)
+		}
+	}
+	for perm := range required {
+		if !loadable[perm] {
+			t.Errorf("a kind requires permission %q, which a policy file cannot grant", perm)
+		}
 	}
 }
 

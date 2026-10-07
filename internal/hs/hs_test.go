@@ -125,8 +125,8 @@ func TestRouteHeaderCarriesMeta(t *testing.T) {
 	meta := json.RawMessage(`{"cols":120,"rows":40}`)
 
 	go func() {
-		_ = WriteRoute(client, Route{Device: "d", Kind: KindShell, Stream: "s", Meta: meta})
-		_ = writeLine(client, Proto+" ROUTE "+mustJSON(Route{Kind: KindShell, Stream: "s"}))
+		_ = WriteRoute(client, Route{Device: "d", Kind: KindADB, Stream: "s", Meta: meta})
+		_ = writeLine(client, Proto+" ROUTE "+mustJSON(Route{Kind: KindADB, Stream: "s"}))
 	}()
 
 	rt, err := ReadRoute(server)

@@ -69,17 +69,23 @@ step "generating PKI"
 "$BIN/ard-ca" operator -dir "$WORK/pki" -name "$OPERATOR" >/dev/null
 ok "server, device and operator certificates issued"
 
-# An operator with a grant but deliberately no "shell". A raw ADB connection cannot be
-# split by permission -- one connection carries shell, install, files and forwarding
-# together -- so this is the role that must be refused when it tries to drive a device.
+# Two roles, and the second is the shape that proves the gate: it holds a permission
+# without holding "shell". Reaching a device costs the raw ADB bridge, and one ADB
+# connection carries shell, install, files and forwarding together, so a role that is not
+# given shell can see the device and must be refused every command on it.
+#
+# The full role holds both forwarding permissions. `adb logcat` is not a permission
+# because it has no service name of its own -- it arrives as the shell service with a
+# command line attached -- so it is governed by "shell" here exactly as it is in the
+# gateway, and writing it into a policy file stops the gateway from starting.
 cat > "$WORK/operators.yaml" <<YAML
 roles:
   - name: e2e
-    permissions: ["shell", "exec", "files", "install", "logcat"]
+    permissions: ["shell", "exec", "files", "install", "forward", "reverse"]
     grants: ["$DEVICE"]
     members: ["$OPERATOR"]
   - name: e2e-observer
-    permissions: ["logcat"]
+    permissions: ["files"]
     grants: ["$DEVICE"]
     members: ["bob"]
 YAML

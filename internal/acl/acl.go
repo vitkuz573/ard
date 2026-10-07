@@ -118,7 +118,9 @@ var KindToPermission = map[string]Permission{
 //	adb shell whoami        shell,v2,TERM=xterm-256color,raw:whoami
 //	adb shell input tap     shell,v2,TERM=xterm-256color,raw:input tap 100 100
 //	adb shell screencap     shell,v2,TERM=xterm-256color,raw:screencap -p /sdcard/s.png
+//	adb shell screenrecord  shell,v2,TERM=xterm-256color,raw:screenrecord --time-limit 1 /sdcard/v.mp4
 //	adb logcat -d           shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat '-d'
+//	adb logcat              shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat
 //	adb exec-out echo hi    exec:echo 'hi'
 //	adb push / adb pull     sync:
 //	adb sideload            sideload-host:2273746:65536
@@ -135,14 +137,14 @@ var KindToPermission = map[string]Permission{
 //	adb reverse --remove    reverse:killforward:tcp:9910
 //	adb reverse --remove-all reverse:killforward-all
 //
-// Two things that measurement settles and that a permission vocabulary has to respect.
+// Three things that measurement settles and that a permission vocabulary has to respect.
 //
-// `adb logcat` arrives as a shell. It is the device's `logcat` binary with its
-// arguments, spelled as a shell command line, so a permission that separated reading
-// the log from opening a shell would be separated by nothing: the same bytes reach the
-// device through `adb shell logcat`. The same holds for the screen services, which are
-// `adb shell input` and `adb shell screenrecord`. So neither has a name of its own and
-// neither is a permission; a name is what a check could be made on, and there is none.
+// `adb logcat` arrives as a shell. It is the device's own `logcat` binary with its
+// arguments, spelled as a shell command line, so a permission separating reading the log
+// from opening a shell would separate nothing: the identical bytes reach the device
+// through `adb shell logcat`. `adb shell screenrecord` and `adb shell screencap` arrive the
+// same way. A check can only be made on a name, and these have none of their own, so both
+// are governed by the shell permission and neither is a name a policy file may hold.
 //
 // `exec` is a name of its own: `adb exec-out` sends `exec:` and `adb shell` sends
 // `shell:...`, so the two are tellable apart on the wire and the split is real. It
@@ -258,14 +260,7 @@ func Load(path string) (*Policy, error) {
 		byRole:     make(map[string]role, len(f.Roles)),
 		byOperator: make(map[string]role),
 	}
-	// Derived from the kind table rather than written out beside it. Two lists of the
-	// same permissions would be two places to forget one, and the failure is a policy
-	// that loads and then refuses something its author asked for, or worse accepts
-	// something they did not.
-	known := map[Permission]bool{PermAll: true}
-	for _, perm := range KindToPermission {
-		known[perm] = true
-	}
+	known := loadablePermissions()
 	for _, r := range f.Roles {
 		if r.Name == "" {
 			return nil, fmt.Errorf("acl: %s has a role with no name", path)
@@ -291,6 +286,19 @@ func Load(path string) (*Policy, error) {
 		}
 	}
 	return p, nil
+}
+
+// loadablePermissions is the set of names a policy file may write, derived from the kind
+// table rather than written out beside it. Two lists of the same permissions would be two
+// places to forget one, and both failures are quiet: a name the loader knows that no kind
+// requires grants a role something no request can be refused for, and a name the loader does
+// not know that a kind requires cannot be granted at all.
+func loadablePermissions() map[Permission]bool {
+	out := map[Permission]bool{PermAll: true}
+	for _, perm := range KindToPermission {
+		out[perm] = true
+	}
+	return out
 }
 
 // Decision is the outcome of an authorization check.
@@ -347,6 +355,18 @@ func (r role) allows(device string) bool {
 		}
 	}
 	return false
+}
+
+// roles returns every role in file order, so a caller that has to inspect the whole policy
+// rather than answer one question about one operator reads the roles themselves and not a
+// projection of them.
+func (p *Policy) roles() []role {
+	out := make([]role, 0, len(p.byRole))
+	for _, r := range p.byRole {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // Roles lists role names, for diagnostics.

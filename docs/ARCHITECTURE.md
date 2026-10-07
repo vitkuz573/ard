@@ -61,11 +61,11 @@ These are structural, not features. They constrain every component.
    certificate*. Audit is written before the action starts, not after.
 5. **No implicit reachability.** Nothing is reachable because it exists. Devices are
    allowlisted by UUID before a session exists, and operator access to a device is a
-   grant in the ACL — checked on every request, not once per connection. Forwarding
-   adds no reachability of its own: `adb forward` binds the gateway's loopback and
-   `adb reverse` reaches the gateway's loopback, so both are reachable only from the
-   gateway host, and both arrive on a switched transport whose permission gate has
-   already answered for that device.
+   grant in the ACL — checked on every request, not once per connection, against the kind
+   of stream the request actually carries rather than against the transport it arrived
+   on. Forwarding adds no reachability of its own: `adb forward` binds the gateway's
+   loopback and `adb reverse` reaches the gateway's loopback, so both are reachable
+   only from the gateway host, and both name a service of their own.
 6. **Devices are inert by default.** A device may only be routed to by an operator
    who holds a grant for that device.
 7. **A completed TLS handshake is not an authorization decision.** Under TLS 1.3 the
@@ -135,38 +135,43 @@ inspect it.
 ## 3. The single primitive: a stream
 
 Everything is one primitive. **A stream is an authenticated, audited, bidirectional
-byte pipe from an operator session to one device.** Shell, file transfer, logcat and
-video are all just typed streams on top of it. No feature adds a new transport, so
-adding a feature cannot break the security model.
+byte pipe from an operator session to one device.** Shell, file transfer, video and
+anything else an operator runs are typed streams on top of it. No feature adds a new
+transport, so adding a feature cannot break the security model.
 
-Stream kinds that open a stream on a device: `adb` — a raw pipe to that device's
-`adbd` — and it is the only one the agent will serve. `ard-agent` refuses any other
-kind rather than opening a stream it cannot honour. `hs` also names `shell`, `exec`,
-`logcat`, `files` and `raw-adb`; no code opens a stream of any of them, and they are
-the ACL's vocabulary for a kind that would exist if one were added.
+Two kinds open a stream: `adb`, a raw pipe to that device's `adbd`, and `device-open`,
+a stream the device opened for itself (section 4.4). Every name in `hs` has code that
+opens it, and `ard-agent` refuses any kind it does not have a route for rather than
+opening a stream it cannot honour.
 
-The ACL maps each kind to the permission it requires, so a new kind cannot be added
-without somebody deciding who may use it: `internal/acl.KindToPermission` maps `shell`,
-`exec`, `files`, `logcat`, `screen`, `forward`, `reverse`, `raw-adb`, `adb` and
-`operator-bridge` onto permissions, and a kind that is not in the map is refused rather
-than allowed by default.
+**A stream kind and a stream permission are different questions.** The kind is what the
+agent dispatches on, so it says what the gateway asks the device for. The permission is
+what the operator's role may do. A kind that reached the device as the permission's own
+name would open a stream nothing on the device handles: the connection is accepted and
+then nothing is ever read from it, and the shell request produces no output and no
+error. So an attach is authorized with kind `operator-bridge` — which maps to `shell`,
+because one ADB connection carries shell, install, file transfer and forwarding
+together — and the stream opened is of kind `adb`.
+
+What each request needs is decided from the service name the client's adb sends on the
+transport it just switched onto, because that name is the only thing that says what the
+request is for: everything after it is a command line or a socket specification, and the
+gateway relays it without reading it. `internal/acl.KindForService` turns that name into
+a kind and `KindToPermission` turns the kind into the permission it requires, so a new
+service cannot ship without somebody deciding who may use it — a service with no
+classified kind is refused rather than allowed by default.
+
+The measured service names and the kinds they mean are listed at
+`internal/acl.KindForService`. What that measurement settles about the vocabulary: there
+is no permission for the device log or for the screen. `adb logcat` sends the shell
+service with a command line attached, and `adb shell screenrecord` and `adb shell
+screencap` arrive the same way, so both are governed by `shell` — the identical bytes
+reach the device through `adb shell logcat`, and a permission separating them would
+separate nothing. A check can only be made on a name.
 
 No stream of kind `forward` or `reverse` is ever opened, because forwarding needs no
 kind of its own: the gateway holds the ports and the device holds the device-side
-listener, so both halves are answered on a transport already open under kind `adb`
-(section 4.4). What the operator leg does today, per attach, is two things that must
-not be confused:
-
-- the authorization check is made with kind `operator-bridge`, which maps to the
-  `shell` permission. One ADB connection carries shell, install, file transfer and
-  forwarding together, so the gate cannot be anything narrower than `shell` without
-  handing shell to a role that deliberately excluded it. This is also why `forward` and
-  `reverse` are not separate gates in practice: both requests arrive on a transport
-  that has already been switched under this check, so `shell` is what authorises them.
-- the stream actually opened is of kind `adb`, because that is what the agent
-  dispatches on. Passing the permission's name as the stream kind opens a stream
-  nothing on the device handles: the connection is accepted and then nothing is ever
-  read from it, and the shell request produces no output and no error.
+listener, so both halves are answered on a transport already open under kind `adb`.
 
 ---
 
@@ -401,9 +406,10 @@ of them (sections 4.2 and 4.4).
   with the first.
 - Screen streaming. `scrcpy-server` → H.264 → remux to fMP4 → MSE in the browser.
   Remux only, no decode. Highest-effort item.
-- The stream kinds the ACL names that no code opens: `files`, `logcat`, `screen`. File
-  transfer and forwarding do not need one, because both are carried by the device's own
-  service on a stream of kind `adb`.
+- A permission finer than ADB's own names. `adb logcat` and the screen services arrive
+  as the shell service with a command line attached, so there is no name to check a
+  narrower permission on. A cut below `shell` would be a fiction the policy file could
+  express and the wire could not enforce.
 - Multi-factor auth, per-device grant expiry.
 - Clustering more than one gateway node.
 

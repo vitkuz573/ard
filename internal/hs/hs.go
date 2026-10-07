@@ -29,15 +29,16 @@ const Proto = "ARD/1"
 // from forcing an unbounded allocation.
 const maxControlLine = 8 << 10
 
-// Kind identifies what a stream carries. Only the device-side kinds exist today;
-// the operator side reuses them to expose a raw adb transport.
+// Kind identifies what a stream carries. Two kinds open a stream: an operator's raw adb
+// transport to a device, and a stream the device opened for itself.
+//
+// A kind is a property of the stream the gateway opens, and it is what the agent dispatches
+// on, so every name here has code that opens it. A name nothing opens would be a claim about
+// the protocol that no path backs, and it is the kind of name a reader would then take to be
+// a supported capability. What an operator may ask for is decided from the service name their
+// adb sends, in internal/acl.
 const (
-	KindADB    = "adb"
-	KindShell  = "shell"
-	KindExec   = "exec"
-	KindLogcat = "logcat"
-	KindFiles  = "files"
-	KindRawADB = "raw-adb"
+	KindADB = "adb"
 
 	// KindDeviceOpen is a stream the device opened for itself, named by DeviceOpen's
 	// Service rather than by a route of ours.

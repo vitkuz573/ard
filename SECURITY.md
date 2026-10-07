@@ -62,15 +62,18 @@ Stated because a security tool that overstates itself is worse than none.
   permission specifically, and holding `shell` on a device means holding adb on
   that device. Roles control *which devices* and *what class of access*; they do
   not sandbox `shell` once granted.
-- **A permission model finer than one connection can carry.** The policy has eight
-  permissions and only one of them decides anything on the operator leg. A role that
-  holds `logcat` but not `shell` sees the device in `adb devices` and is refused a
-  transport with the reason on its own terminal; a role that holds `shell` gets shell,
-  install, file transfer and forwarding, because ADB multiplexes them over one TCP
-  connection. `forward` and `reverse` are named in the policy vocabulary and are not
-  consulted on their own: both requests arrive on a switched transport, whose gate is
-  `shell`. What the permissions buy is which *devices* a role may drive, not a finer
-  cut within one.
+- **A permission model finer than ADB's own names.** Every command an operator runs
+  arrives as a service name on a transport the client switched onto, and that name is the
+  only thing that says what the request is for. `exec-out`, `sync:`, `abb_exec:` and the
+  two forwarding families are names of their own, so `exec`, `files`, `install`,
+  `forward` and `reverse` are checked per request against them. `adb logcat` is not: it
+  sends the shell service with a command line attached, so reading the log is governed by
+  `shell`, and the identical bytes reach the device through `adb shell logcat`. A
+  permission for it would separate nothing. The same connection carries shell, install,
+  file transfer and forwarding together, so holding `shell` on a device means holding
+  adb on that device; the other permissions narrow a role that already holds it. What the
+  permissions buy is which *devices* a role may drive and which commands it may name,
+  not a sandbox around `shell` once granted.
 - **A hostile network** during first contact. A device enrolling has no CA
   certificate, so it cannot verify the gateway at all: the connection that carries
   its certificate request is not authenticated. It reports the fingerprint of the

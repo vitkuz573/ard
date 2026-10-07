@@ -20,27 +20,40 @@
 # separation is what lets one operator be allowed to install on a lab bench and
 # nothing else.
 #
-# Permissions:
-#   "*"          every permission below
-#   shell        interactive shell
-#   exec         one-shot commands
-#   files        push and pull
-#   install      install and uninstall packages
-#   logcat       read the device log
-#   screen       view the screen and inject input
-#   forward      adb port forward. Reachability of the result is the gateway's own
-#                loopback, so this is not about the network: it says the role may
-#                open a connection from the gateway to a port on the device.
-#   reverse      adb reverse forwarding, the other direction: the device binds a port
-#                and the gateway connects to its own loopback when something reaches
-#                it.
+# Permissions, and nothing else may be written here: a name the gateway does not know
+# stops the gateway from starting, because a policy that loads and grants less than its
+# author wrote reads as control and is not.
 #
-# NOTE on forward/reverse: both requests arrive on a switched transport -- adb sends
-# host:tport first and the service on the connection it gets back -- so in practice
-# holding "shell" is what authorises them, and neither "forward" nor "reverse" is
-# consulted on its own anywhere in the gateway. They are kept here because the names
-# are part of the policy vocabulary and a role file that mentions only permissions the
-# code acts on is a policy that has to be re-read to find out which those are.
+#   "*"          every permission below
+#   shell        interactive shell, and `adb root`, `adb unroot` and `adb remount`
+#   exec         `adb exec-out`, one-shot commands
+#   files        push, pull and sideload
+#   install      installing and uninstalling packages
+#   forward      adb port forward. The port is bound on this gateway, so this is a
+#                permission to make a port on this machine answer for a phone across
+#                the internet.
+#   reverse      adb reverse forwarding, the other direction: the device binds a port
+#                and the gateway connects to its own loopback when something reaches it.
+#
+# There is no permission for reading the device log, for the screen, or for anything else
+# that adb presents as a named service of its own, because no such service exists. What
+# `adb logcat` sends on the wire, measured against a stock adb binary, is the shell
+# service with a command line attached:
+#
+#   shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat '-d'
+#
+# so it is governed by `shell`, and a permission that separated it from a shell would
+# separate nothing: the identical bytes reach the device through `adb shell logcat`.
+# `adb shell screenrecord` arrives the same way. A check can only be made on a name, and
+# these have none of their own. The service names and the kinds they mean are measured in
+# internal/acl.KindForService.
+#
+# On `shell` and the rest: reaching a device at all costs the raw ADB bridge, and one
+# ADB connection carries shell, install, file transfer and forwarding together, because
+# ADB multiplexes them over one TCP connection itself. So the bridge is gated on
+# `shell` and the permissions below narrow a role that already holds it; a role without
+# `shell` can see the device in `adb devices` and is told on its own terminal that it is
+# not permitted to drive it.
 #
 # Grants are device UUIDs, a trailing "*" prefix such as lab-*, or "*" for all.
 #
@@ -48,9 +61,15 @@
 # shell, which is almost never what was intended.
 
 roles:
-  # Read-only observer. A safe default for onboarding an operator.
-  - name: viewer
-    permissions: ["logcat"]
+  # Sees a device and cannot drive it.
+  #
+  # `files` is the narrowest permission in the vocabulary and it is what makes the device
+  # visible: the gateway shows an operator the devices they hold a permission on, so a
+  # role holding one can answer "does this device exist for me" without being able to
+  # touch it. Every command is refused, and the refusal names the role and the permission
+  # it would need.
+  - name: observer
+    permissions: ["files"]
     grants:
       - "CHANGE-ME-device-uuid"
     # Certificate common names that hold this role. Empty means nobody, and a role with
@@ -60,18 +79,23 @@ roles:
     # by file order. Add real names here when you enrol someone.
     members: []
 
-  # Full interactive access, to one explicitly named device.
+  # Full interactive access to one explicitly named device, including the two directions
+  # of port forwarding.
   - name: maintainer
-    permissions: ["shell", "exec", "files", "install", "logcat"]
+    permissions: ["shell", "exec", "files", "install", "forward", "reverse"]
     grants:
       - "CHANGE-ME-device-uuid"
     members: []
 
-    # NOTE on "shell": an operator reaches a device through adb, and one ADB connection
-    # carries shell, install, file transfer and port forwarding together. The gateway
-    # therefore cannot separate them by permission, and holding "shell" on a device means
-    # holding adb on that device. A role without "shell" can still see the device in
-    # `adb devices`, and is told on its own terminal that it is not permitted to drive it.
+  # Drives devices and moves files, and binds no port on this gateway in either
+  # direction. Useful as the shape to start from: `forward` and `reverse` are the two
+  # permissions that change what is reachable rather than what is readable, so a role
+  # that has no reason to make a port here answer for a phone should leave them out.
+  - name: driver
+    permissions: ["shell", "exec", "files", "install"]
+    grants:
+      - "CHANGE-ME-device-uuid"
+    members: []
 
   # Break-glass role for a named operator. Holds no grants by default, so enabling
   # the role does not by itself grant access to anything: grants are added here
