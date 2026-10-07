@@ -28,10 +28,19 @@
 #   install      install and uninstall packages
 #   logcat       read the device log
 #   screen       view the screen and inject input
-#   forward      adb port forward. This is the sensitive one: a forward can expose
-#                a device port to anyone who can reach the gateway, so keep it off
-#                unless it is genuinely needed.
-#   reverse      adb reverse forwarding
+#   forward      adb port forward. Reachability of the result is the gateway's own
+#                loopback, so this is not about the network: it says the role may
+#                open a connection from the gateway to a port on the device.
+#   reverse      adb reverse forwarding, the other direction: the device binds a port
+#                and the gateway connects to its own loopback when something reaches
+#                it.
+#
+# NOTE on forward/reverse: both requests arrive on a switched transport -- adb sends
+# host:tport first and the service on the connection it gets back -- so in practice
+# holding "shell" is what authorises them, and neither "forward" nor "reverse" is
+# consulted on its own anywhere in the gateway. They are kept here because the names
+# are part of the policy vocabulary and a role file that mentions only permissions the
+# code acts on is a policy that has to be re-read to find out which those are.
 #
 # Grants are device UUIDs, a trailing "*" prefix such as lab-*, or "*" for all.
 #

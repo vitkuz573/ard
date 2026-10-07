@@ -36,6 +36,13 @@ operator's name has been found in the ACL, and every device question is then
 answered from that operator's own grants. `ard-connect` publishes its one port on
 the operator's own machine, so there is no gateway-side port for it at all.
 
+An operator's `adb forward` does bind a port on this host, and it needs no firewall
+rule: the gateway binds it on `127.0.0.1`, so it is reachable from the host and from
+nothing else. `adb reverse` reaches the same loopback from the other end. A forward
+outlives the adb connection that created it, so a host left with unexpected bound
+ports is usually an operator's forward still held — `adb forward --list` names it,
+`adb forward --remove-all` releases it.
+
 Devices and operators both dial in. That is not incidental — devices sit behind
 NAT, often carrier-grade NAT, so the gateway can never connect to them.
 
