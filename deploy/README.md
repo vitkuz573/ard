@@ -9,7 +9,7 @@ step BPF and crash-loops:
     bpf-restrict-fs: Failed to create inner BPF map: Operation not permitted
     ard-server.service: Failed at step BPF spawning ...: Operation not permitted
 
-It was removed rather than worked around with `CAP_BPF`, because granting a
+It is left out rather than worked around with `CAP_BPF`, because granting a
 capability to the gateway in order to restrict it is a bad trade. The protections
 that apply without BPF are kept: `ProtectSystem=strict`, `ReadOnlyPaths`,
 `CapabilityBoundingSet=`, `AmbientCapabilities=`, `SystemCallFilter`, and

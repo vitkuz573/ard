@@ -14,10 +14,10 @@ import java.util.List;
 /**
  * In-app certificate enrolment.
  *
- * This replaces the procedure that used to need a laptop: mint a certificate on the
+ * Getting a certificate onto a device by hand needs a laptop: mint a certificate on the
  * gateway, adb push two files, and move them into the app's private directory with
- * run-as. That put a device private key in a terminal, in a push, and in shell history,
- * and it required physical access every time a device was added.
+ * run-as. That puts a device private key in a terminal, in a push, and in shell history,
+ * and it requires physical access every time a device is added.
  *
  * Here the device generates its own key and asks for a certificate. What the operator
  * does is type one code shown on this screen into a command on the gateway host. No key
