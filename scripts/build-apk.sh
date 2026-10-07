@@ -100,10 +100,10 @@ fi
 "$BUILD_TOOLS/apksigner" verify --verbose "$APK" | tail -2
 
 step "verifying the APK actually contains what the app reads"
-# Build success is not the same as a usable artefact. Every earlier version of this
-# script reported "APK ready" while shipping an APK with no agent binary in it, and
-# the failure only surfaced on a phone as FileNotFoundException. The checks below
-# assert the specific things the app depends on at runtime.
+# Build success is not the same as a usable artefact: an APK with no agent binary in it
+# builds and signs fine, and the failure only surfaces on a phone as
+# FileNotFoundException. The checks below assert the specific things the app depends on at
+# runtime.
 require_entry() {
   if ! unzip -l "$APK" | grep -qE "$1"; then
     echo "APK is missing $2" >&2

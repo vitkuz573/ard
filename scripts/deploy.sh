@@ -178,12 +178,12 @@ fi
 # Build the server env by merging the shipped template with whatever the host already
 # has.
 #
-# This used to take the existing file as the base whenever one was present, which meant
-# the template was only ever read on a first install. Every setting added in a later
-# version therefore silently never arrived on an existing deployment. The symptom is
-# nasty: systemd expands an undefined variable to an empty string and passes that to a
-# flag which requires a value, so the service fails with INVALIDARGUMENT and the whole
-# gateway goes down for want of a line in a config file.
+# Taking the existing file as the base would mean the template is only ever read on a
+# first install, so a setting added in a later version silently never arrives on an
+# existing deployment. The symptom is nasty: systemd expands an undefined variable to an
+# empty string and passes that to a flag which requires a value, so the service fails
+# with INVALIDARGUMENT and the whole gateway goes down for want of a line in a config
+# file.
 #
 # The merge rules, and why each one:
 #   - the template supplies structure, comments and any key the host has never seen,
@@ -333,14 +333,11 @@ verify "no CA key readable by ard" "sudo -u ard test -r /etc/ard/pki/devices/ca.
 
 # A policy whose roles name no members admits nobody, and every operator is refused with
 # "has no role" -- which reads as a deliberate lockdown rather than as the configuration
-# mistake it is. Deploying over such a file used to succeed silently.
-# A policy whose roles name no members admits nobody, and every operator is refused with
-# "has no role" -- which reads as a deliberate lockdown rather than as the configuration
 # mistake it is.
 #
-# This asks the gateway rather than grepping the YAML. An earlier attempt counted
-# quoted list items, which matched the entries under "grants" as well as under "members"
-# and therefore reported success on a policy that admits nobody at all.
+# This asks the gateway rather than grepping the YAML, because counting quoted list items
+# in the file matches the entries under "grants" as well as under "members" and therefore
+# reports success on a policy that admits nobody at all.
 MEMBERS="$(ssh_ "journalctl -u ard-server --since '-10min' --no-pager | grep -oE 'operator policy: .*' | tail -1" || true)"
 ADMITTED="$(sed -n 's/.*operator policy: [0-9]* roles, \([0-9]*\) admitted.*/\1/p' <<<"$MEMBERS")"
 if [[ "${ADMITTED:-0}" -gt 0 ]]; then

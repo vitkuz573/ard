@@ -77,11 +77,9 @@ sudo -n true 2>/dev/null || { bad "this test needs passwordless sudo (to sign as
 # The gateway runs as the current, unprivileged user -- deliberately, and this matches
 # how the systemd unit runs it in production.
 #
-# An earlier version of this test started it with sudo, and that is exactly why a bug
-# shipped: requireRootControl also refused to act unless the *server* was root, a
-# precondition that is both wrong and unreachable in production. Under sudo the test
-# passed; on the real gateway the feature was permanently unavailable. The check depends
-# on the peer's uid, which an unprivileged server can read perfectly well.
+# The check depends on the peer's uid, which an unprivileged server reads perfectly
+# well, so a gateway running as root would pass this test while exercising a
+# configuration the production unit does not use.
 #
 # Only the signing tool needs root, and that is the asymmetry the design intends.
 "$WORK/bin/ard-server" \
@@ -104,13 +102,13 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-# Assert the gateway is unprivileged, so this test cannot quietly drift back into the
-# configuration that hid the bug.
+# Assert the gateway is unprivileged, so this test cannot drift into the configuration
+# the production unit does not use.
 GW_UID="$(ps -o uid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
 if [[ -n "$GW_UID" && "$GW_UID" != "0" ]]; then
   ok "gateway runs unprivileged (uid $GW_UID), as in production"
 else
-  bad "the gateway is running as root; this test no longer matches production"
+  bad "the gateway is running as root, which the production unit does not use"
 fi
 if grep -q "enrol on" "$WORK/server.log" 2>/dev/null; then
   ok "gateway listening, enrolment port reported"
@@ -242,9 +240,8 @@ fi
 #
 # device.crt is signed by the DEVICE root, so that is what must verify it. ca.crt is the
 # SERVER root, because it is what the device uses to verify the gateway on every
-# connection. Checking the leaf against the delivered file therefore *must* fail, and an
-# earlier version of this test asserted the opposite and was wrong for the same reason
-# the code was: it treated one certificate as both the signer and the trust anchor.
+# connection. Checking the leaf against the delivered file therefore *must* fail: one
+# certificate is not both the signer and the trust anchor.
 if openssl verify -CAfile "$PKI/devices/ca.crt" "$DEVDIR/device.crt" >/dev/null 2>&1; then
   ok "issued certificate chains to the device root"
 else
