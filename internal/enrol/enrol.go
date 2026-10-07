@@ -1,9 +1,7 @@
 // Package enrol carries certificate requests from a device to whoever holds the CA.
 //
-// The problem it solves: enrolment used to mean the CA generated a key pair on the
-// gateway host and a human copied two files onto a phone. A device private key on a
-// server, in a terminal, in an adb push and in shell history is a device private key
-// in four places it should never be.
+// The problem it solves: a device private key on a server, in a terminal, in an adb push
+// and in shell history is a device private key in four places it should never be.
 //
 // So the device generates its own key and sends a CSR, and the private key never
 // moves. What still needs to happen is a decision by a human: a CA must not sign

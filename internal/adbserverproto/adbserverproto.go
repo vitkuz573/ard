@@ -83,7 +83,7 @@ type Server struct {
 	// operator is who this connection is, and forwardSerial which device it switched to.
 	// Both are recorded when they become known rather than asked for again, because the
 	// answer to a forwarding request is a port that has to outlive this connection: the
-	// connection adb used to ask for it is closed as soon as the answer is sent, so an
+	// connection adb asks for it on is closed as soon as the answer is sent, so an
 	// operator's name left on it would be gone by the time anyone asked who owns the port.
 	operator      string
 	forwardSerial string

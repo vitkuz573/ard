@@ -2,11 +2,10 @@ package tlsx
 
 // Certificate signing requests.
 //
-// The reason this file exists: enrolment used to mean the CA generated a key pair,
-// wrote both halves onto the gateway host, and an operator copied them onto a phone
-// by hand. That put a device private key on a machine, in a chat, in an adb push,
-// and in the operator's shell history. It also meant the operator had to be
-// present for every device, forever.
+// The reason this file exists: a device private key on a machine, in a chat, in an adb
+// push and in the operator's shell history is a private key in four places it should
+// never be, and copying one onto a phone by hand means the operator has to be present
+// for every device, forever.
 //
 // With a CSR the device generates its own key and keeps it. The CA only ever sees
 // a signature request, so there is nothing to copy and nothing to leak. The

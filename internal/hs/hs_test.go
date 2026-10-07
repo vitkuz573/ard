@@ -323,7 +323,7 @@ func TestLinkStreamIsolation(t *testing.T) {
 		t.Error("beta stream was not terminated by link shutdown")
 	}
 	// Close must be idempotent: a peer that drops mid-traffic makes the read loop
-	// and Close race, and double-closing the channel used to panic.
+	// and Close race, and a double close would otherwise panic.
 	link.Close()
 }
 

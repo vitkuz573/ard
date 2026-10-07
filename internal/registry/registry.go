@@ -41,7 +41,8 @@ type Device struct {
 	// Features is the feature list the device's adbd reported in its CNXN banner,
 	// verbatim. It belongs to this entry rather than to the gateway because it
 	// changes with the device: a reboot can bring a different adbd, and a list left
-	// over from the previous session would describe software that is no longer there.
+	// over from the previous session would describe software this device is no
+	// longer running.
 	Features string `json:"features"`
 }
 
