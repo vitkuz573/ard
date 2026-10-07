@@ -62,6 +62,9 @@ func requestSyncRaw(t *testing.T, l *mockadbd.Listener, req []byte) []byte {
 	return nil
 }
 
+// statV2BodyLen is the body of a v2 stat record, after its command word.
+const statV2BodyLen = 68
+
 // syncLenRequest frames a request as the sync protocol does: the command word, then a
 // 4-byte path length, then the path.
 func syncLenRequest(cmd string, path string) []byte {
@@ -171,20 +174,31 @@ func TestListV2ReplyCarriesSecondCountTimestamps(t *testing.T) {
 	}
 }
 
-// The v1 listing: DENT entries whose body is 16 bytes -- mode 4, size 4, mtime 8 -- and
-// whose name is NUL-terminated.
+// The v1 listing: DENT entries of twenty bytes -- the word, then mode, size, timestamp
+// and the name's length, each a 4-byte little-endian word -- followed by the name.
 //
-// Two things here are measured rather than derived. The reply word is DENT, not DNT2: a
-// DNT2 read as a DENT puts the entry's 72-byte body where a 16-byte one is expected, the
-// directory bit lands somewhere else, and `adb pull <dir>` reports nothing and exits
-// without an error.
+// The widths are the client's, and they are the only evidence for them. Measured from the
+// sizes of the reads a stock client makes on the reply to LIST, on a device advertising
+// neither stat_v2 nor ls_v2 so the client takes the v1 path:
 //
-// And the body is 16 bytes with a 64-bit mtime in the middle of two 32-bit fields. From
-// the sizes of the reads a stock client makes on this reply: 4 bytes for DENT, then 16,
-// then the name to its NUL. A body of twelve bytes -- which is what STAT uses, and so the
-// obvious thing to reuse -- puts the name four bytes early, and the reads show the client
-// taking the first four letters of the name as the end of the body.
-func TestListV1ReplyIsDENTWithA16ByteBodyAndANulTerminatedName(t *testing.T) {
+//	read  4  "DENT"
+//	read 16  <mode u32> <size u32> <mtime u32> <namelen u32>
+//	read  6  "nested"     <- namelen from the word above, not up to a NUL
+//	read 20  "DENT" + the same 16 words
+//	read  7  "one.txt"
+//	read 20  "DONE" + 16 zero bytes
+//
+// A client asking for sixteen bytes after DENT is saying there are four words to read, and
+// one asking for twenty at DONE is saying the terminator is a whole entry's width with no
+// name in it.
+//
+// Two shapes carry the listing and both are invisible when wrong. The timestamp is 32 bits
+// like every other word here: with it in eight, the name-length word reads the timestamp's
+// high half, which is zero, so the entry arrives nameless and the client's next read takes
+// the first four letters of a name as a command word -- not one, and the pull stops having
+// printed `pull: building file list...`. And the name is length-prefixed with nothing after
+// it: a NUL in that position is read as the first byte of the name's length.
+func TestListV1EntryIsFourWordsThenTheName(t *testing.T) {
 	fs := seedTree(t)
 	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{FS: fs})
 	if err != nil {
@@ -194,44 +208,111 @@ func TestListV1ReplyIsDENTWithA16ByteBodyAndANulTerminatedName(t *testing.T) {
 
 	got := requestSyncRaw(t, l, syncLenRequest("LIST", "/data/local/tmp/tree"))
 
-	if word := string(got[0:4]); word != "DENT" {
-		t.Fatalf("first reply word is %q, want DENT: a client told DNT2 here reads the entry "+
-			"at the wrong offsets and stops without saying why", word)
-	}
-
 	const mtime = 0x6ac5289e
+	// The whole first entry as the client reads it: the word, four words, the name and
+	// nothing else. The name's length is the fourth word, which is what makes the name
+	// end where it ends.
 	want := []byte{
 		'D', 'E', 'N', 'T',
-		0xa4, 0x81, 0x00, 0x00, // 0100644: a regular file, rw-r--r--
+		0xa4, 0x81, 0x00, 0x00, // mode 0100644: a regular file, rw-r--r--
 		0x03, 0x00, 0x00, 0x00, // size 3
-		0x9e, 0x28, 0xc5, 0x6a, 0x00, 0x00, 0x00, 0x00, // mtime, 64 bits
-		'a', '.', 't', 'x', 't', 0x00,
+		0x9e, 0x28, 0xc5, 0x6a, // mtime, 32 bits -- four bytes, not eight
+		0x05, 0x00, 0x00, 0x00, // name length 5
+		'a', '.', 't', 'x', 't',
 	}
 	if !bytes.HasPrefix(got, want) {
 		t.Fatalf("first v1 entry:\n got %x\nwant %x", got[:len(want)], want)
 	}
-	if v := binary.LittleEndian.Uint64(got[12:20]); v != mtime {
-		t.Fatalf("entry mtime is %#x, want %#x", v, mtime)
+	if v := binary.LittleEndian.Uint32(got[12:16]); v != mtime {
+		t.Fatalf("entry mtime is %#x, want %#x: eight bytes here puts the name length where "+
+			"the timestamp's high half is, and every entry arrives nameless", v, mtime)
+	}
+	if v := binary.LittleEndian.Uint32(got[16:20]); v != uint32(len("a.txt")) {
+		t.Fatalf("name length is %d, want %d", v, len("a.txt"))
 	}
 
 	// The second entry names the subdirectory and carries the directory bit, which is
-	// what a client tests to decide whether to recurse into it. It starts after the
-	// first: word, body, and "a.txt" with its NUL.
-	const firstEntry = 4 + 16 + len("a.txt") + 1
-	second := got[firstEntry : firstEntry+4+16+len("sub")+1]
+	// what a client tests to decide whether to recurse into it. It starts where the
+	// first name ended, with no terminator in between.
+	second := got[len(want):]
+	secondEntry := 20 + len("sub")
 	if word := string(second[0:4]); word != "DENT" {
 		t.Fatalf("second reply word is %q, want DENT", word)
 	}
 	if mode := binary.LittleEndian.Uint32(second[4:8]); mode != 0o040755 {
 		t.Fatalf("subdirectory mode is %#o, want %#o", mode, 0o040755)
 	}
-	if name := string(second[20:24]); name != "sub\x00" {
-		t.Fatalf("second entry's name is %q, want \"sub\\x00\"", name)
+	if name := string(second[20:secondEntry]); name != "sub" {
+		t.Fatalf("second entry's name is %q, want sub: a NUL here is read as part of the "+
+			"length that precedes it", name)
 	}
 
-	doneAt := firstEntry + 4 + 16 + len("sub") + 1
+	doneAt := len(want) + secondEntry
 	if word := string(got[doneAt : doneAt+4]); word != "DONE" {
 		t.Fatalf("terminator word at %d is %q, want DONE", doneAt, word)
+	}
+}
+
+// The v1 listing's terminator is twenty bytes: the word and an entry's width with nothing
+// in it.
+//
+// Measured from the same reads as the entries above: the client's read at DONE is twenty
+// bytes, which is the word plus the four words an entry carries. A terminator of four
+// bytes -- the sync reply header with a zero length, which is what a pull's DONE carries
+// and what the v2 listing's terminator is not -- leaves the client waiting out a read it
+// has already begun, and a directory pull hangs there having reported nothing.
+func TestListV1ReplyEndsWithADoneCarryingAnEntryWidth(t *testing.T) {
+	fs := seedTree(t)
+	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{FS: fs})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	got := requestSyncRaw(t, l, syncLenRequest("LIST", "/data/local/tmp/tree"))
+
+	const entry = 20
+	wantLen := entry + len("a.txt") + entry + len("sub") + entry
+	if len(got) != wantLen {
+		t.Fatalf("reply is %d bytes, want %d: %x", len(got), wantLen, got)
+	}
+
+	doneAt := wantLen - entry
+	if word := string(got[doneAt : doneAt+4]); word != "DONE" {
+		t.Fatalf("terminator word at %d is %q, want DONE", doneAt, word)
+	}
+	if tail := got[doneAt+4:]; !bytes.Equal(tail, make([]byte, entry-4)) {
+		t.Fatalf("DONE carries %d bytes and not all zeros: %x", len(tail), tail)
+	}
+}
+
+// LST2 is a v2 stat request, not a listing.
+//
+// A client told a listing request answered with one record stops there: it reads the reply
+// word, sees no DNT2 entry and no DONE, and the walk is over with nothing collected. So
+// LST2 answers with a stat record, sharing STA2's path -- which is also what makes the two
+// spellings one case rather than two.
+func TestListV2IsAskedForWithLIS2(t *testing.T) {
+	fs := seedTree(t)
+	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{FS: fs})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+
+	got := requestSyncRaw(t, l, syncLenRequest("LST2", "/data/local/tmp/tree"))
+
+	// One record and nothing else: the word, then the 68-byte stat body. A directory
+	// listing here would be a run of DNT2 entries and a DONE, and its first word would
+	// be DNT2 rather than the request's own.
+	if len(got) != 4+statV2BodyLen {
+		t.Fatalf("LST2 answered with %d bytes, want one %d-byte record: %x", len(got), 4+statV2BodyLen, got)
+	}
+	if word := string(got[0:4]); word != "LST2" {
+		t.Fatalf("reply word is %q, want the request's own LST2", word)
+	}
+	if mode := binary.LittleEndian.Uint32(got[4+20 : 4+24]); mode != 0o040755 {
+		t.Fatalf("recorded mode is %#o, want the directory's %#o", mode, 0o040755)
 	}
 }
 

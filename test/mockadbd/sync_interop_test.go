@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	mockadbd "github.com/vitkuz573/ard/test/mockadbd"
@@ -360,3 +361,89 @@ func TestInteropPushCreatesNothingButTheFile(t *testing.T) {
 		t.Fatalf("push changed the node count by %d, want 1", got-before)
 	}
 }
+
+// A directory pull end to end on the v1 sync path, which is the path a device whose banner
+// advertises neither stat_v2 nor ls_v2 puts a client on.
+//
+// It is a separate test from the directory pull above because the two take different code
+// through this device: which commands the client sends is decided by the feature list, so
+// the banner is what selects the path, and the reply widths differ along it. A device
+// without those features is not hypothetical -- it is every device predating them, and one
+// whose answer is wrong costs the operator the directory rather than an error.
+//
+// The nested file is larger than one DATA frame, so the transfer inside the directory is
+// not passing because everything fits in a single packet. The assertion is on the bytes,
+// not on adb's own count of what it pulled: a listing answered in the wrong shape ends the
+// walk early and adb reports what it collected.
+func TestInteropPullDirectoryOnTheV1Path(t *testing.T) {
+	adb := requireAdb(t)
+	fs := mockadbd.NewVFS()
+	l, err := mockadbd.Listen("127.0.0.1:0", mockadbd.Config{
+		FS:     fs,
+		Banner: v1OnlyBanner,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	startPrivateServer(t, adb)
+	serial := l.Addr().String()
+	if out, err := adbCmd(t, adb, "connect", serial).CombinedOutput(); err != nil {
+		t.Fatalf("adb connect: %v\n%s", err, out)
+	}
+	waitForState(t, adb, serial, "device")
+
+	contents := map[string][]byte{
+		"/data/local/tmp/tree/one.txt": []byte("first file"),
+		// Larger than one DATA frame, so the transfer inside the directory spans
+		// several and the reassembly is part of what this checks.
+		"/data/local/tmp/tree/nested/two.txt":   []byte("second file"),
+		"/data/local/tmp/tree/nested/three.bin": make([]byte, 200_000),
+	}
+	if _, err := rand.Read(contents["/data/local/tmp/tree/nested/three.bin"]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	for path, data := range contents {
+		if err := fs.WriteFile(path, data, 0o644); err != nil {
+			t.Fatalf("seed %s: %v", path, err)
+		}
+	}
+
+	dst := t.TempDir()
+	if out, err := adbCmd(t, adb, "-s", serial, "pull", "/data/local/tmp/tree", dst).CombinedOutput(); err != nil {
+		t.Fatalf("adb pull of a directory: %v\n%s", err, out)
+	}
+
+	for path, want := range contents {
+		got, err := os.ReadFile(filepath.Join(dst, "tree", strings.TrimPrefix(path, "/data/local/tmp/tree/")))
+		if err != nil {
+			t.Fatalf("%s did not come back: %v", path, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: %d bytes back, want %d", path, len(got), len(want))
+		}
+	}
+	// The shape as well as the contents: a walk that stopped after the first entry
+	// returns a directory with one file in it and no error, and a per-file comparison
+	// alone would pass if the missing file's own comparison never ran.
+	entries, err := os.ReadDir(filepath.Join(dst, "tree", "nested"))
+	if err != nil {
+		t.Fatalf("the nested directory did not come back: %v", err)
+	}
+	if len(entries) != 2 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("the nested directory holds %v, want two files", names)
+	}
+}
+
+// v1OnlyBanner is a device banner with no sync features beyond shell_v2 and cmd.
+//
+// The features that select the sync path are stat_v2, ls_v2 and sendrecv_v2. Their absence
+// is what makes the client send STAT, LIST and SEND rather than the v2 spellings, so a
+// banner carrying them would put this device on the v2 path and TestInteropPullDirectoryOnTheV1Path
+// would not be testing what its name says.
+const v1OnlyBanner = "device::ro.product.name=ard_mock_v1;ro.product.model=MockV1;" +
+	"ro.build.type=user;features=shell_v2,cmd,"

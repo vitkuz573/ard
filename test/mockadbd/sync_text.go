@@ -29,7 +29,6 @@ package mockadbd
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -72,13 +71,33 @@ func mkid(a, b, c, d byte) uint32 {
 // statV2Len is the body of a STA2 reply, and DNT2 is the same plus a name length.
 const statV2Len = 68
 
-// Errors reported through the v2 stat body's error field. They are the numbers from
-// <errno.h>, because that is what a client turns back into a message.
-const (
-	errNoEnt   = 2
-	errIsDir   = 21
-	errTooLong = 36
-)
+// syncChunk is how much of a file travels in one DATA frame.
+//
+// adbd uses 64 KiB. Larger frames are legal and faster; this matches the platform so a
+// relay tested against the mock sees the frame sizes it will see in the field, and so a
+// bug in reassembly cannot hide behind an unusually large frame.
+const syncChunk = 64 * 1024
+
+// statMode folds the directory bit into the mode word, the way stat(2) does.
+//
+// It is not cosmetic: adb decides whether to recurse by testing this bit, so a directory
+// reported without it is pulled as an empty file. Every reply that carries a mode -- the
+// v2 stat, the v1 stat, and both listings' entries -- folds the same way, and a listing
+// whose entries disagreed with the stat about a directory's file type would make the client
+// walk it as a file.
+func statMode(dir bool, mode os.FileMode) uint32 {
+	m := uint32(mode.Perm())
+	if dir {
+		m |= 0o040000 // S_IFDIR
+	} else {
+		m |= 0o100000 // S_IFREG
+	}
+	return m
+}
+
+// errNoEnt is ENOENT, reported through the v2 stat body's error field. It is the number
+// from <errno.h> because that is what a client turns back into its own message.
+const errNoEnt = 2
 
 func idString(v uint32) string {
 	return string([]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)})
@@ -114,6 +133,10 @@ func runSync2(cfg Config, s *stream) {
 		case quitW:
 			return
 
+		// A v2 stat is asked for with STA2 or with LST2, the second spelling naming the same
+		// request in the letters the v1 listing used. Both name one path and answer one
+		// record, which is why they share a case. LST2 is not a listing request, and
+		// answering one with a single record ends the client's walk with nothing collected.
 		case sta2, lst2:
 			path, err := readLenString(s)
 			if err != nil {
@@ -461,23 +484,39 @@ func listV2(cfg Config, s *stream, path string) {
 
 // listV1 answers a v1 LIST.
 //
-// The reply word is DENT and not DNT2, and the name is NUL-terminated rather than
-// preceded by its length. Measured, from the reads a stock client makes on the
-// reply to LIST /dir:
+// The entry is four 4-byte words and then the name: mode, size, timestamp, name length.
+// Every field is 32 bits, the timestamp among them, and the name is length-prefixed with
+// no terminator after it.
 //
-//	DENT <mode u32> <size u32> <mtime u64> "a\0"
-//	DENT <mode u32> <size u32> <mtime u64> "b\0"
-//	DONE <12 zero bytes>
+// Measured from the sizes of the reads a stock client makes on the reply to LIST, on a
+// device whose banner advertises neither stat_v2 nor ls_v2 so the client takes the v1
+// path:
 //
-// A DNT2 here is read as a DENT whose mode is the entry's whole 72-byte body
-// shifted, so the directory bit lands somewhere else and the client decides the
-// path is not a directory and stops: `adb pull <dir>` reports nothing and exits,
-// having produced no error either.
+//	read  4  "DENT"
+//	read 16  <mode u32> <size u32> <mtime u32> <namelen u32>
+//	read  6  "nested"      <- namelen from the word above, not up to a NUL
+//	read 20  "DENT" + the same 16 words
+//	read  7  "one.txt"
+//	read 20  "DONE" + 16 zero bytes
 //
-// The mtime is 64 bits wide while the two fields before it are 32. That asymmetry
-// is why a DENT cannot be assembled out of 4-byte words, and it is measured rather
-// than assumed: the client reads DENT as 4 bytes, the body as 16, and then the
-// name up to its NUL.
+// So an entry is twenty bytes plus the name, and the terminator is twenty bytes with no
+// name in it. The read sizes are the widths: a client asking for sixteen bytes after
+// DENT is saying the four words are there, and one asking for twenty at DONE is saying
+// the terminator is a whole entry's width.
+//
+// Both details carry the listing. A timestamp in eight bytes makes the name-length word
+// read the timestamp's high half, which is zero, so every entry arrives nameless and the
+// client's next read takes the first four letters of a name as a command word; it is not
+// one, and the transfer stops having printed nothing but its progress line:
+//
+//	$ adb pull /data/local/tmp/tree ./out
+//	pull: building file list...
+//
+// A terminator shorter than twenty bytes leaves the client waiting out a read it has
+// already begun, which reports nothing and never finishes.
+//
+// A DNT2 here is read as a DENT whose 72-byte entry body is shifted, so the directory bit
+// lands somewhere else and the client decides the path is not a directory and stops.
 func listV1(cfg Config, s *stream, path string) {
 	entries, err := cfg.FS.ReadDir(path)
 	if err != nil {
@@ -485,28 +524,24 @@ func listV1(cfg Config, s *stream, path string) {
 		return
 	}
 	for _, e := range entries {
-		if err := putWord(s, dent1); err != nil {
-			return
-		}
-		// mode 4 bytes, size 4, mtime 8. The mtime is the odd one out: it is a
-		// 64-bit field even though everything around it is 32 bits, so a body built
-		// from 4-byte words puts the name four bytes early and every entry after the
-		// first is read at the wrong offset.
-		//
-		// Measured, from the sizes of the reads a stock client makes on the reply to
-		// LIST: 4 bytes for DENT, then 16 for the body, then the name to its NUL.
-		var b [16]byte
-		le32(b[0:], statMode(e.Dir, e.Mode))
-		le32(b[4:], uint32(len(e.Data)))
-		le64(b[8:], uint64(e.ModTime.Unix()))
-		// The name and its NUL go out with the body: one entry is one write, which is
-		// what a client reading a fixed-width body then a C string wants.
-		if err := s.writeRaw(append(append(b[:], e.Name...), 0)); err != nil {
+		// The word and the four words go out as one write. A client reads the record as
+		// twenty bytes, and a record split across two packets leaves it holding four and
+		// waiting for the rest for as long as the transfer takes to finish.
+		var b [20]byte
+		le32(b[0:], dent1)
+		le32(b[4:], statMode(e.Dir, e.Mode))
+		le32(b[8:], uint32(len(e.Data)))
+		le32(b[12:], uint32(e.ModTime.Unix()))
+		le32(b[16:], uint32(len(e.Name)))
+		if err := s.writeRaw(append(b[:], e.Name...)); err != nil {
 			return
 		}
 	}
-	_ = putWord(s, doneW)
-	_ = s.writeRaw(make([]byte, 12))
+	// One entry's width with nothing in it, read with the read the entries are read
+	// with.
+	var done [20]byte
+	le32(done[0:], doneW)
+	_ = s.writeRaw(done[:])
 }
 
 // splitSendV1 parses the v1 push form, "path,mode".
@@ -651,14 +686,4 @@ func recvFile(cfg Config, s *stream, path string) {
 	// DONE is a stat body instead, which is why it is 72 bytes and this is 4.
 	_ = putWord(s, doneW)
 	_ = s.writeRaw(make([]byte, 4))
-}
-
-// hexPreview renders bytes compactly for a trace line.
-func hexPreview(p []byte) string {
-	const max = 48
-	s := hex.EncodeToString(p)
-	if len(s) > max {
-		return s[:max] + "..."
-	}
-	return s
 }

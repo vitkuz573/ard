@@ -26,6 +26,11 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 step(){ printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
 DEVICE="op-test-device"
+# A second device whose banner advertises no sync features beyond shell_v2 and cmd, which
+# is what puts adb on the v1 sync path. It is a separate identity rather than a flag on the
+# first one because the path is chosen per device, from that device's own feature list, and
+# a gateway that answered both from one list would be testing the same reply twice.
+DEVICE_V1="op-test-device-v1sync"
 OPERATOR="alice"
 
 cleanup() {
@@ -57,6 +62,7 @@ PKI="$WORK/pki"
 mkdir -p "$PKI/server" "$PKI/devices" "$PKI/operators"
 "$WORK/bin/ard-ca" init -dir "$PKI" -san "localhost,127.0.0.1" >/dev/null
 "$WORK/bin/ard-ca" device -dir "$PKI" -id "$DEVICE" >/dev/null
+"$WORK/bin/ard-ca" device -dir "$PKI" -id "$DEVICE_V1" >/dev/null
 "$WORK/bin/ard-ca" operator -dir "$PKI" -name "$OPERATOR" >/dev/null
 ok "device and operator identities issued"
 
@@ -73,6 +79,7 @@ roles:
     permissions: ["shell", "exec", "files", "install", "logcat"]
     grants:
       - "$DEVICE"
+      - "$DEVICE_V1"
     members: ["$OPERATOR"]
 
   # Holds a permission but is deliberately not given shell. The bridge must refuse it,
@@ -100,7 +107,7 @@ SOCK="$WORK/control.sock"
   -listen-enrol "127.0.0.1:$((DEVPORT+2))" \
   -control-socket "$SOCK" \
   -pki "$PKI" \
-  -devices "$DEVICE" \
+  -devices "$DEVICE,$DEVICE_V1" \
   -operators "$PKI/operators/operators.yaml" \
   -audit "$WORK/audit.log" \
   >"$WORK/server.log" 2>&1 &
@@ -134,6 +141,33 @@ for _ in $(seq 1 60); do
   sleep 0.25
 done
 grep -q "serving" "$WORK/agent.log" && ok "device connected through the gateway" || { bad "device did not connect"; sed 's/^/      /' "$WORK/agent.log" | head -5; exit 1; }
+
+# The second device advertises no sync features beyond shell_v2 and cmd. adb picks the
+# spelling of every sync command it sends from the feature list it is given for the device,
+# so this banner is what puts it on the v1 path -- and it has to be a device of its own,
+# because the list is per device and a gateway that answered both from one list would make
+# the two checks measure the same reply.
+V1_BANNER='device::ro.product.name=ard_mock_v1sync;ro.product.model=MockV1;ro.build.type=user;features=shell_v2,cmd,'
+"$WORK/bin/mockadbd" -addr "127.0.0.1:0" -banner "$V1_BANNER" >"$WORK/mock-v1.log" 2>&1 &
+PIDS+=($!)
+sleep 0.5
+MOCKADDR_V1="$(grep -oE '127\.0\.0\.1:[0-9]+' "$WORK/mock-v1.log" | head -1)"
+[[ -n "$MOCKADDR_V1" ]] && ok "second mock adbd on $MOCKADDR_V1" || { bad "no second mock address"; exit 1; }
+
+"$WORK/bin/ard-agent" \
+  -gateway "127.0.0.1:$DEVPORT" \
+  -device "$DEVICE_V1" \
+  -adbd "$MOCKADDR_V1" \
+  -ca "$PKI/server/ca.crt" \
+  -cert "$PKI/devices/leaves/$DEVICE_V1.crt" \
+  -key "$PKI/devices/leaves/$DEVICE_V1.key" \
+  >"$WORK/agent-v1.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 60); do
+  grep -q "serving" "$WORK/agent-v1.log" 2>/dev/null && break
+  sleep 0.25
+done
+grep -q "serving" "$WORK/agent-v1.log" && ok "the v1-sync device connected through the gateway" || { bad "the v1-sync device did not connect"; sed 's/^/      /' "$WORK/agent-v1.log" | head -5; exit 1; }
 
 # --------------------------------------------------------------------- operator
 
@@ -208,10 +242,15 @@ step "adb is told what the device supports, from the device"
 # A connection per request, which is what adb does -- it opens a fresh connection for each host
 # service request -- and a second request on one connection is answered with silence and a
 # close. Asking both questions on one socket would measure that instead of the answers.
+#
+# Each answer is labelled with the request that produced it, because the reply carries no
+# serial and there are two devices with different feature lists. Matching an answer to a
+# device is the whole basis of the per-device check below, and grepping the answers as one
+# blob would leave that mapping to the order they happened to come back in.
 FEATURES_RAW="$(timeout 15 python3 -c "
 import socket
 
-def ask(req):
+def ask(label, req):
     s = socket.create_connection(('127.0.0.1', $LOCALPORT), 5)
     s.settimeout(10)
     try:
@@ -221,23 +260,42 @@ def ask(req):
         body = b''
         while len(body) < n:
             body += s.recv(n - len(body))
-        print(tok.decode(), body.decode())
+        print(label + '\t' + tok.decode() + '\t' + body.decode())
     finally:
         s.close()
 
-ask(b'host:features')
-ask(b'host-serial:$DEVICE:features')
+ask('host', b'host:features')
+ask('v2', b'host-serial:$DEVICE:features')
+ask('v1', b'host-serial:$DEVICE_V1:features')
 " 2>&1 || true)"
 printf '%s\n' "$FEATURES_RAW" | sed 's/^/      /'
 
-# The mock's banner lists ls_v2, which is what makes a directory push work, and it does not
-# list sendrecv_v2_brotli, which adb would then compress a large push with. Both halves are
-# checked: a list carrying everything would break a push, and a list carrying nothing would
-# break every command.
-if printf '%s\n' "$FEATURES_RAW" | grep -q "ls_v2"; then
-  ok "adb's feature answer carries what the device's own banner said"
+# The v2 mock's banner lists ls_v2, which is what makes a directory push work, and it does
+# not list sendrecv_v2_brotli, which adb would then compress a large push with. Both halves
+# are checked: a list carrying everything would break a push, and a list carrying nothing
+# would break every command.
+#
+# Read by the label the asker printed, which is the only thing tying an answer to a device.
+features_for() { printf '%s\n' "$FEATURES_RAW" | awk -F'\t' -v k="$1" '$1 == k { print $3; exit }'; }
+V2_FEATURES="$(features_for v2)"
+V1_FEATURES="$(features_for v1)"
+printf '      v2 answer: %s\n' "$V2_FEATURES"
+printf '      v1 answer: %s\n' "$V1_FEATURES"
+
+# Both answers must be OKAY as well as correct: a refusal reads as an empty list, and an
+# empty list is indistinguishable here from a device that was told it has nothing.
+if [[ "$V2_FEATURES" == "ls_v2"* || "$V2_FEATURES" == *"ls_v2,"* ]]; then
+  ok "adb's answer for the v2 device carries what that device's own banner said"
 else
-  bad "adb's feature answer does not carry the device's own list"
+  bad "adb's answer for the v2 device does not carry ls_v2 from its own banner"
+fi
+
+if [[ -z "$V1_FEATURES" ]]; then
+  bad "adb's answer for the v1-sync device was refused, so nothing after this would be meaningful"
+elif [[ "$V1_FEATURES" == *ls_v2* || "$V1_FEATURES" == *stat_v2* || "$V1_FEATURES" == *sendrecv_v2* ]]; then
+  bad "the v1-sync device was told it has the v2 sync features, so adb would never take the v1 path"
+else
+  ok "adb is told the v1-sync device has no v2 sync features, which is what selects the v1 path"
 fi
 
 if printf '%s\n' "$FEATURES_RAW" | grep -q "sendrecv_v2_brotli"; then
@@ -379,6 +437,62 @@ if [[ "$(cat "$DIRBACK/one.txt" 2>/dev/null)" == "first file" ]] &&
 else
   bad "the directory did not come back intact"
   find "$DIRBACK" -type f 2>/dev/null | sort | sed 's/^/      /'
+fi
+
+# ------------------------------------------------- the v1 sync path
+
+step "a directory survives push and pull on the v1 sync path"
+
+# adb picks the spelling of every sync command from the feature list it is given for the
+# device, and the two spellings are not interchangeable on the wire. A v2 listing entry is a
+# DNT2 word, a 68-byte stat body, and a length-prefixed name; a v1 one is a DENT word, four
+# 4-byte words, and the name. Neither client reads the other's, and both report a
+# directory pull that collected nothing as a plain failure.
+#
+# So this is the same check against a device that advertises no v2 sync features, which is
+# what a device predating them looks like and what puts adb on the v1 path. The reply
+# widths on that path are the ones measured off a stock client's reads, and getting either
+# wrong ends the directory walk rather than failing the command: a walk that stops after
+# the first entry returns a directory with one file in it, and a client waiting out a read
+# of a width the device did not send hangs at the end of the listing instead of reporting.
+#
+# The nested file is larger than one DATA frame so the transfer inside the directory is not
+# passing because everything fits in a single packet.
+V1DIR_DST="/data/local/tmp/dir-on-the-v1-path"
+if timeout 120 adb -P "$LOCALPORT" -s "$DEVICE_V1" push "$PUSHDIR" "$V1DIR_DST" >"$WORK/push-dir-v1.log" 2>&1; then
+  ok "adb push reported success for a directory on the v1 path"
+else
+  bad "adb push failed for a directory on the v1 path"
+  sed 's/^/      /' "$WORK/push-dir-v1.log" | head -3
+fi
+
+V1DIR_BACK="$WORK/dir-pulled-back-v1"
+rm -rf "$V1DIR_BACK"
+if timeout 120 adb -P "$LOCALPORT" -s "$DEVICE_V1" pull "$V1DIR_DST" "$V1DIR_BACK" >"$WORK/pull-dir-v1.log" 2>&1; then
+  ok "adb pull reported success for a directory on the v1 path"
+else
+  bad "adb pull failed for a directory on the v1 path"
+  sed 's/^/      /' "$WORK/pull-dir-v1.log" | head -3
+fi
+
+if [[ "$(cat "$V1DIR_BACK/one.txt" 2>/dev/null)" == "first file" ]] &&
+   [[ "$(cat "$V1DIR_BACK/nested/two.txt" 2>/dev/null)" == "second file" ]] &&
+   cmp -s "$PUSHDIR/nested/three.bin" "$V1DIR_BACK/nested/three.bin"; then
+  ok "every file came back on the v1 path, including a nested one spanning many frames"
+else
+  bad "the directory did not come back intact on the v1 path"
+  find "$V1DIR_BACK" -type f 2>/dev/null | sort | sed 's/^/      /'
+fi
+
+# The shape as well as the contents, for the reason given above: a walk that stopped after
+# the first entry produces one file, no error, and a per-file comparison that never got to
+# run. Counting what came back is what distinguishes the two.
+V1DIR_FILES="$(find "$V1DIR_BACK" -type f 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$V1DIR_FILES" == "3" ]]; then
+  ok "the v1 listing was walked to the end: three files, not one"
+else
+  bad "the v1 listing returned $V1DIR_FILES files, want 3"
+  find "$V1DIR_BACK" -type f 2>/dev/null | sort | sed 's/^/      /'
 fi
 
 # ----------------------------------------------------------- port forwarding
