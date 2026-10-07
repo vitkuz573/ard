@@ -338,13 +338,6 @@ func (l *Listener) serve(nc net.Conn) error {
 			// An OKAY acknowledges a packet the device sent. It is not input, and an
 			// empty one in particular is not end of input.
 			//
-			// Shell v2 used to treat an empty-payload OKAY as end of input, on the grounds
-			// that `adb shell cat` otherwise waited for an input end that never came. That
-			// was the wrong conclusion drawn from a symptom with another cause, and it
-			// breaks exactly the feature it was meant to protect: an interactive session
-			// has the device ack its prompt before the host has typed anything, so the very
-			// first ack ended input and the session lasted one line.
-			//
 			// End of input under v2 is kIdCloseStdin, which adb does send -- captured on the
 			// wire as the frame after the last stdin frame, frequently in the same packet.
 			//

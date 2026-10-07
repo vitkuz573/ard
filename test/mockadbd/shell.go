@@ -12,10 +12,8 @@ import (
 
 // The device shell.
 //
-// It used to be a switch over eight hardcoded commands with no access to storage, which
-// made the filesystem pointless: nothing could look at it. This runs commands against the
-// VFS and the property store instead, so `ls`, `cat` and `stat` describe the same tree a
-// push writes into.
+// Commands run against the VFS and the property store, so `ls`, `cat` and `stat` describe
+// the same tree a push writes into.
 //
 // Commands are deliberately boring and Unix-shaped rather than clever. A relay test writes
 // something like `adb shell ls -l /data/local/tmp` because that is what it would run

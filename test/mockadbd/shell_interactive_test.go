@@ -17,10 +17,9 @@ import (
 
 // `adb shell` with no command.
 //
-// This is the case that used to answer "shell: empty command" and exit 1: the service
-// request carried no argument, one empty command was run, and the stream closed. A relay
-// hands an operator a stream and the operator types several things into it, so the whole
-// shape was untestable.
+// The service request carries no argument, and a relay hands an operator a stream that the
+// operator types several things into, so one invocation has to survive several commands
+// rather than run one and close.
 //
 // Every expectation here was taken from a real device rather than reasoned about, because
 // the details are exactly the ones a test asserts on and the differences between a pipe and

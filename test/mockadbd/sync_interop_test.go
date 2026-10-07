@@ -14,12 +14,6 @@ import (
 
 // These tests push and pull against a real adb and assert on the device's filesystem.
 //
-// Why they used to be skipped, and why they are not any more.
-//
-// The transfer worked and the bytes arrived, but the adb process never returned, so a test
-// that waits for adb hangs rather than fails, and the whole file was skipped for that reason.
-// The delay was in the adb server, and it was this repository's fault after all.
-//
 // The server is not a pipe. It proxies the client's sync socket to the device stream
 // through asocket, and local_socket_flush_outgoing() in adb's sockets.cpp stops reading the
 // client as soon as it has forwarded a chunk: it deletes FDE_READ and waits. Only
@@ -27,10 +21,12 @@ import (
 // device. adbd raises that packet from local_socket_flush_incoming(), in the same
 // sockets.cpp the server shares, once the bytes are in the command's socket.
 //
-// This mock never answered a WRTE with an OKAY. So the server forwarded the client's stat
-// request, delivered the stat reply it got back, deleted FDE_READ, and waited for an ack
-// that could not arrive. The client, holding the stat reply, sent the rest of the push and
-// waited for a reply the server was no longer allowed to ask for. Both waited forever.
+// Every WRTE the host sends therefore has to be answered with an OKAY. Without one the
+// server forwards the client's stat request, delivers the stat reply it got back, stops
+// reading the client, and waits for an ack that cannot arrive. The client, holding the
+// stat reply, sends the rest of the push and waits for a reply the server is no longer
+// reading for. Both wait forever, and because adb never returns, a test that waits for
+// adb hangs rather than fails.
 //
 // The server's own trace shows it, and only the last two lines matter:
 //
@@ -38,12 +34,13 @@ import (
 //	sockets.cpp:237 LS(8): acks not deferred, blocking          # and the client socket stops being read
 //	                                                                  ... and nothing else
 //
-// `adb shell` passed throughout, which is the prediction that identifies it: a shell
+// `adb shell` is untouched by this, which is the prediction that identifies it: a shell
 // command needs no second write from the client after the device speaks, so it never asks
 // for the ack again. Every sync request after the first does, because the next command
 // cannot be sent until the previous reply has arrived.
 //
-// Three explanations were checked against the reference and dropped, each by measurement:
+// Three explanations do not account for it, each checked against the reference by
+// measurement:
 //
 //   - The CNXN Arg1 window is 0x100000 on this mock and on the phone, identical.
 //   - The stream id does not matter: the phone picks 112 and this mock picked 1, and
@@ -53,29 +50,28 @@ import (
 //     too. The client socket going unread is the FDE_READ deletion above, not a condition
 //     variable, and the two appear in one trace at a glance.
 //
-// What the reference settled before that, and what is fixed here: a real adbd sends the
+// What the reference settled, and what this mock does: a real adbd sends the
 // whole 72-byte stat reply as one packet and the whole 8-byte DONE reply as one packet, and
 // it leaves every byte after the errno zero for a path that does not exist.
 //
-// Three more things the wire turned up once the hang was gone, all of them invisible
-// while it was there because adb never got far enough to exercise them:
+// Three more things the wire settles, each invisible to a test that never gets far enough
+// to exercise it:
 //
 //   - SND2 and RCV2 are written as one buffer: id, length, path, then the same id again
 //     before the mode and the flags. Reading the two setup words without the repeated id
-//     left the flags word where the DATA frames were expected, and a flags word of zero
-//     turned a 256 KiB push into `unexpected sync command 0x00000000`. Small pushes missed
-//     it because adb sends the v1 SEND form for those.
-//   - The banner offered sendrecv_v2_brotli, sendrecv_v2_lz4 and sendrecv_v2_zstd, and
-//     nothing here compresses. adb reads the feature list and picks the best one it knows,
-//     so above its own size threshold it compressed the payload and the mock read a zstd
-//     frame as sync framing -- the same error, with 0x00000004 instead of zero. Those three
-//     features are gone from the default banner.
-//   - The device reads the send stream in 64 KiB chunks rather than framing exactly, so
-//     the handler for one file held the next file's request in the chunk it had just read
-//     and dropped it. adb writes those requests back to back -- a directory push is one
-//     long run of them -- so the stream desynchronised at the second file. It is handed
-//     back now; TestHostTwoSyncSendsInOnePacket is the guard, because reproducing the
-//     coalescing through adb would depend on how fast adb writes.
+//     leaves the flags word where the DATA frames are expected, and a flags word of zero
+//     turns a 256 KiB push into `unexpected sync command 0x00000000`. Small pushes do not
+//     reach it: adb sends the v1 SEND form for those.
+//   - adb reads the feature list and picks the best compression it knows, so a banner
+//     offering sendrecv_v2_brotli, sendrecv_v2_lz4 or sendrecv_v2_zstd to a device that
+//     does not compress makes the client send a zstd frame as sync framing --
+//     `unexpected sync command 0x00000004`. This banner offers none of them.
+//   - The device reads the send stream in 64 KiB chunks rather than framing exactly, so a
+//     handler for one file has to hand back the tail of the chunk it did not consume. adb
+//     writes those requests back to back -- a directory push is one long run of them -- so
+//     dropping that tail desynchronises the stream at the second file.
+//     TestHostTwoSyncSendsInOnePacket is the guard, because reproducing the coalescing
+//     through adb would depend on how fast adb writes.
 //
 // The tools, in order of what each was worth:
 //

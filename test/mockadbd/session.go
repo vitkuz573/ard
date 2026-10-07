@@ -10,11 +10,9 @@ import (
 
 // An interactive `adb shell`: the case where the service request carried no command.
 //
-// This used to run one empty command, print "shell: empty command" and close. That is what
-// a device does not do, and it made the shape untestable: a relay hands an operator a
-// stream, the operator types several things, and every one of them has to come back before
-// the stream closes. Here a session reads a line, runs it, writes what it produced, and
-// reads the next line until the input ends.
+// A relay hands an operator a stream, the operator types several things, and every one of
+// them has to come back before the stream closes. A session reads a line, runs it, writes
+// what it produced, and reads the next line until the input ends.
 //
 // The behaviours below were each checked against a real device rather than reasoned about,
 // because the details are the ones a test asserts on:

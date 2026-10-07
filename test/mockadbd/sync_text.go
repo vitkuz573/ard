@@ -309,12 +309,10 @@ func failMsg(s *stream, format string, args ...any) {
 
 // writeStatV2 emits id followed by the 68-byte body.
 //
-// The id and the body go out in one write, not two. They used to be two, because putWord
-// and writeRaw were separate steps, and a client coped with the split -- adb acknowledged
-// both packets -- but then sat idle for the better part of a minute before sending anything
-// at all. Coalescing them removed the wait. A real adbd assembles the reply and writes it
-// once, so one write is both what the device does and what the client is shaped for; the
-// split was a quirk of how this code was written, not of the protocol.
+// The id and the body go out in one write, not two. A real adbd assembles the reply and
+// writes it once, so one write is both what the device does and what the client is shaped
+// for; a split reply is acknowledged in two packets and the client then sits idle waiting
+// for something that does not come.
 func writeStatV2(s *stream, id, errno uint32, n *Node) error {
 	var head [4]byte
 	binary.LittleEndian.PutUint32(head[:], id)

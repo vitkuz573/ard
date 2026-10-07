@@ -158,11 +158,9 @@ func TestTruncatedTransferIsVisibleToAClient(t *testing.T) {
 	waitForState(t, adb, serial, "device")
 
 	// Whatever adb manages to do, it must not report a complete, coherent command it did
-	// not receive. Either it errors, or it hangs, or it returns something partial.
-	// The assertion is not "it failed" but "it did not deliver output it never received".
-	// Accepting either outcome, as an earlier version of this test did, means it passes
-	// whether or not the fault layer works -- which is the failure mode a fault test must
-	// not have.
+	// not receive. Either it errors, or it hangs, or it returns something partial -- but
+	// it must not pass by delivering output it never received, which is the failure mode
+	// a fault test must not have.
 	var out string
 	done := make(chan struct{})
 	go func() {
