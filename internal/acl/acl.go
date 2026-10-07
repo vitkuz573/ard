@@ -1,13 +1,18 @@
 // Package acl decides whether an operator may act on a device.
 //
-// Two ideas are kept separate on purpose:
+// Three ideas, kept separate on purpose:
 //
-//   - a permission answers "may this operator open a shell at all"
+//   - a kind answers "what is this request for"
+//   - a permission answers "may this operator do that at all"
 //   - a grant answers "may this operator touch this specific device"
 //
-// Collapsing them into one check is how single-tenant tools grow into
-// single-operator tools: every new check then needs a new role, and the operator
-// list stops being a policy and becomes a list of exceptions.
+// Collapsing permission and grant into one check is how single-tenant tools grow into
+// single-operator tools: every new check then needs a new role, and the operator list
+// stops being a policy and becomes a list of exceptions.
+//
+// A kind is a name, never a guess. KindForService turns the service name an operator's
+// adb binary sends into one, and a service nobody has classified is refused rather than
+// allowed by default: a new feature cannot ship without someone deciding who may use it.
 package acl
 
 import (
@@ -23,24 +28,47 @@ import (
 type Permission string
 
 const (
-	// PermShell allows an interactive shell on a device.
+	// PermShell allows an interactive shell on a device, and the services that are a
+	// shell in another spelling: `adb shell input`, `adb shell screenrecord`,
+	// `adb root`. It is also what a raw ADB transport requires, because one such
+	// connection carries everything below.
 	PermShell Permission = "shell"
-	// PermExec allows one-shot commands.
+	// PermExec allows `adb exec-out`, the non-interactive command service.
 	PermExec Permission = "exec"
-	// PermFiles allows push and pull.
+	// PermFiles allows push, pull and sideload.
 	PermFiles Permission = "files"
 	// PermInstall allows installing and uninstalling packages.
 	PermInstall Permission = "install"
-	// PermLogcat allows reading the device log.
-	PermLogcat Permission = "logcat"
-	// PermScreen allows viewing the screen and injecting input.
-	PermScreen Permission = "screen"
-	// PermForward allows adb port forwarding. This is the sensitive one: a forward
-	// can expose a device port to anyone who can reach the gateway, so it is a
-	// separate permission and is off by default.
+	// PermForward allows adb port forwarding. A forward binds a port on the gateway
+	// and reaches the device through it, so the holder decides that a port on the
+	// gateway machine answers for something on a phone across the internet.
 	PermForward Permission = "forward"
-	// PermReverse allows adb reverse forwarding, device to gateway.
+	// PermReverse allows adb reverse forwarding, the other direction: the device binds
+	// the port and the gateway connects to its own loopback when something reaches it.
 	PermReverse Permission = "reverse"
+)
+
+// Stream kinds, which are what a request carries and what a permission is checked
+// against. A kind is a property of the request; a permission is a property of the
+// role. KindToPermission is the only place the two meet.
+const (
+	// KindOperatorBridge is the raw ADB transport an operator's adb client switches
+	// onto before it names a service.
+	KindOperatorBridge = "operator-bridge"
+	// KindShell is an interactive shell, and the services that are a shell in another
+	// spelling.
+	KindShell = "shell"
+	// KindExec is `adb exec-out`.
+	KindExec = "exec"
+	// KindFiles is push, pull and sideload.
+	KindFiles = "files"
+	// KindInstall is package installation.
+	KindInstall = "install"
+	// KindForward is `adb forward` in every form, binding and removing.
+	KindForward = "forward"
+	// KindReverse is `adb reverse` in every form, binding and removing, and the
+	// callback a device opens when something reaches a port it holds.
+	KindReverse = "reverse"
 )
 
 // PermAll is the wildcard permission, granting every capability a role has
@@ -52,25 +80,132 @@ const PermAll Permission = "*"
 
 // KindToPermission maps a stream kind to the permission it requires, so the
 // check cannot be forgotten at a call site.
+//
+// It is the whole vocabulary: a kind absent from here has no permission and is
+// refused by Authorize, and a permission absent from the declarations above cannot be
+// named in a policy file. Both directions are asserted in the tests, because a
+// permission that can be written down and never consulted is a policy that reads like
+// control and is not.
 var KindToPermission = map[string]Permission{
-	"shell":   PermShell,
-	"exec":    PermExec,
-	"logcat":  PermLogcat,
-	"files":   PermFiles,
-	"raw-adb": PermExec,
-	"adb":     PermExec,
-	// A raw ADB bridge for an operator necessarily includes shell, install, file
-	// transfer and port forwarding, because all of them are multiplexed over one
-	// TCP connection by ADB itself. Gating it on anything weaker than PermShell
-	// would hand shell to an operator whose role deliberately excluded it -- the
-	// classic mistake of treating a protocol as if it were separable.
-	//
-	// So the gate is PermShell, and the honest consequence is documented rather than
-	// papered over: holding "shell" on a device means holding adb on that device.
-	"operator-bridge": PermShell,
-	"screen":          PermScreen,
-	"forward":         PermForward,
-	"reverse":         PermReverse,
+	// A raw ADB bridge necessarily carries shell, install, file transfer and
+	// forwarding together, because ADB multiplexes them over one TCP connection by
+	// itself. Gating it on anything weaker than PermShell would hand shell to a role
+	// that deliberately excluded it -- the classic mistake of treating a protocol as
+	// if it were separable. So the gate is PermShell, and the consequence is
+	// documented rather than papered over: holding "shell" on a device means holding
+	// adb on that device, and every other kind below narrows a role that already
+	// holds it rather than widening one that does not.
+	KindOperatorBridge: PermShell,
+	KindShell:          PermShell,
+	KindExec:           PermExec,
+	KindFiles:          PermFiles,
+	KindInstall:        PermInstall,
+	KindForward:        PermForward,
+	KindReverse:        PermReverse,
+}
+
+// KindForService classifies a service request an operator's adb client sends on a
+// switched transport, and reports the kind whose permission governs it.
+//
+// The service name is the whole of what a client says about what it wants: everything
+// after the name is a command line or a socket specification, and the gateway relays
+// it without reading it. So the name is the only place a kind can be decided, and
+// deciding it here is what lets the decision reach Authorize on every request.
+//
+// Measured against a stock adb binary talking to a stock adb server, one line per
+// command, service name as it arrived on the wire:
+//
+//	adb shell whoami        shell,v2,TERM=xterm-256color,raw:whoami
+//	adb shell input tap     shell,v2,TERM=xterm-256color,raw:input tap 100 100
+//	adb shell screencap     shell,v2,TERM=xterm-256color,raw:screencap -p /sdcard/s.png
+//	adb logcat -d           shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat '-d'
+//	adb exec-out echo hi    exec:echo 'hi'
+//	adb push / adb pull     sync:
+//	adb sideload            sideload-host:2273746:65536
+//	adb install             abb_exec:settings\0get\0global\0enable_adb_incremental_install_default
+//	adb install (the rest)  abb_exec:package\0install-incremental\0-r\0ard-agent.apk:...
+//	adb root                root:
+//	adb unroot              unroot:
+//	adb forward             host:forward:tcp:9930;tcp:9931
+//	adb forward --no-rebind host:forward:norebind:tcp:9932;tcp:9933
+//	adb forward --remove    host:killforward:tcp:9930
+//	adb forward --remove-all host:killforward-all
+//	adb reverse             reverse:forward:tcp:9910;tcp:9911
+//	adb reverse --list      reverse:list-forward
+//	adb reverse --remove    reverse:killforward:tcp:9910
+//	adb reverse --remove-all reverse:killforward-all
+//
+// Two things that measurement settles and that a permission vocabulary has to respect.
+//
+// `adb logcat` arrives as a shell. It is the device's `logcat` binary with its
+// arguments, spelled as a shell command line, so a permission that separated reading
+// the log from opening a shell would be separated by nothing: the same bytes reach the
+// device through `adb shell logcat`. The same holds for the screen services, which are
+// `adb shell input` and `adb shell screenrecord`. So neither has a name of its own and
+// neither is a permission; a name is what a check could be made on, and there is none.
+//
+// `exec` is a name of its own: `adb exec-out` sends `exec:` and `adb shell` sends
+// `shell:...`, so the two are tellable apart on the wire and the split is real. It
+// narrows a role rather than widening it, because reaching either service needs a
+// switched transport and a switched transport is KindOperatorBridge.
+func KindForService(service string) (string, bool) {
+	// A service request is a name, a colon, and a payload that is never interpreted here:
+	// a command line, a socket specification, or a NUL-separated argument vector. Splitting
+	// at the first colon is what makes the name comparable, and it is also what keeps
+	// "reverseforward:tcp:1;tcp:2" from being read as a reverse and "shell,v2,TERM=xterm-
+	// 256color,raw:whoami" from being anything but a shell with a feature list on it.
+	name, rest, _ := strings.Cut(service, ":")
+	switch {
+	// The shell service carries its feature list in its name, ahead of the colon:
+	// "shell,v2,TERM=xterm-256color,raw:whoami". So the name is compared by its leading
+	// component, and the comma is what separates it from the rest rather than the colon.
+	case name == "shell" || strings.HasPrefix(name, "shell,"),
+		name == "root", name == "unroot", name == "remount":
+		// root and remount are here because what they do is decide what a shell can reach:
+		// a device that is already rooted answers every shell below with more authority.
+		return KindShell, true
+	case name == "exec":
+		return KindExec, true
+	case name == "sync", name == "sideload-host":
+		return KindFiles, true
+	case name == "abb_exec":
+		return KindInstall, true
+	case name == "reverse":
+		return subKind(rest, KindReverse, "forward", "killforward", "killforward-all", "list-forward")
+	case name == "host":
+		// The forwarding half of what adb asks about this server rather than about a device.
+		// A device is never asked about a port bound here, because the port is here.
+		return subKind(rest, KindForward,
+			"forward", "killforward", "killforward-all", "list-forward", "list-forward-all")
+	case name == "host-serial":
+		// The serial-qualified listing, which the stock server accepts as the per-device form
+		// of `adb forward --list`. Only that action is a request about a port; the others
+		// under this prefix name a device rather than ask anything of it.
+		//
+		// The action is what follows the LAST colon, because a serial may contain one -- an adb
+		// serial over TCP is host:port -- and splitting on the first would compare "9930" or
+		// "somehost" against the action instead.
+		i := strings.LastIndexByte(rest, ':')
+		if i >= 0 && rest[i+1:] == "list-forward" {
+			return KindForward, true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+// subKind classifies the remainder of a service whose name has sub-services, such as
+// "reverse:forward:tcp:9910;tcp:9911". Only the listed sub-names are answered: a fifth one
+// under a name that exists would be refused, and the reason it is worth refusing is the same
+// as for any other service, which is that nobody has decided who may use it.
+func subKind(rest, kind string, names ...string) (string, bool) {
+	sub, _, _ := strings.Cut(rest, ":")
+	for _, name := range names {
+		if sub == name {
+			return kind, true
+		}
+	}
+	return "", false
 }
 
 // role is one named set of permissions, and the set of operators who hold it.
@@ -123,10 +258,13 @@ func Load(path string) (*Policy, error) {
 		byRole:     make(map[string]role, len(f.Roles)),
 		byOperator: make(map[string]role),
 	}
-	known := map[Permission]bool{
-		PermAll:   true,
-		PermShell: true, PermExec: true, PermFiles: true, PermInstall: true,
-		PermLogcat: true, PermScreen: true, PermForward: true, PermReverse: true,
+	// Derived from the kind table rather than written out beside it. Two lists of the
+	// same permissions would be two places to forget one, and the failure is a policy
+	// that loads and then refuses something its author asked for, or worse accepts
+	// something they did not.
+	known := map[Permission]bool{PermAll: true}
+	for _, perm := range KindToPermission {
+		known[perm] = true
 	}
 	for _, r := range f.Roles {
 		if r.Name == "" {
@@ -167,7 +305,11 @@ type Decision struct {
 // operator must be the account name from the certificate, never a value supplied
 // by the client over the wire.
 func (p *Policy) Authorize(operator, device, kind string) Decision {
-	perm, ok := KindToPermission[kind]
+	// `required` and `held` are the two sides of the comparison, and the names matter:
+	// comparing the kind's own permission against a loop variable of the same name
+	// compares a value with itself, which is always true, and then every role holding
+	// any permission passes every check.
+	required, ok := KindToPermission[kind]
 	if !ok {
 		// An unmapped kind is refused rather than allowed by default. New kinds
 		// must be classified deliberately, or a feature could ship without anyone
@@ -179,11 +321,6 @@ func (p *Policy) Authorize(operator, device, kind string) Decision {
 		return Decision{Reason: fmt.Sprintf("operator %q has no role", operator)}
 	}
 	hasPerm := false
-	// The required permission is `required`. The loop variable used to be called `perm`
-	// as well, which shadowed it -- and `perm == perm` is always true, so every role
-	// holding any permission at all passed every permission check. The permission model
-	// was decorative: a logcat-only role reached shell, install and everything else.
-	required := perm
 	for _, held := range r.Permissions {
 		if held == PermAll || held == required {
 			hasPerm = true
@@ -224,9 +361,14 @@ func (p *Policy) Roles() []string {
 
 // CanSee reports whether an operator may touch a device at all, whatever the action.
 //
-// A read-only operator sees a device they legitimately hold logcat for. They cannot drive
-// anything, but they can see that their access exists -- and being able to see is what makes
-// a denial explicable instead of mysterious.
+// A read-only operator sees a device they legitimately hold a permission for. They cannot
+// drive anything, but they can see that their access exists -- and being able to see is what
+// makes a denial explicable instead of mysterious.
+//
+// It walks the kind table rather than the permission list, so a permission nobody can reach
+// through any kind does not make a device visible. That is deliberate: a role holding a
+// permission that governs no request has been granted something that cannot be used, and
+// showing the device would suggest otherwise.
 func (p *Policy) CanSee(operator, device string) bool {
 	for kind := range KindToPermission {
 		if p.Authorize(operator, device, kind).Allowed {

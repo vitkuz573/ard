@@ -33,6 +33,11 @@ type gateway struct {
 	logger  *log.Logger
 	// forwards owns the port forwards an operator's adb binds on this gateway.
 	forwards *forwards
+
+	// testAuditPath is the file the auditor was opened on, kept so a test can read back what
+	// was recorded. It is empty in production, where the audit log's location is the
+	// administrator's business rather than the gateway's.
+	testAuditPath string
 }
 
 // serveDevices accepts agent connections.

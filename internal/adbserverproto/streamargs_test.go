@@ -40,10 +40,15 @@ func echoServer(t *testing.T) net.Listener {
 	return ln
 }
 
-// dialFunc adapts a function to DeviceDialer.
-type dialFunc func(service string) (net.Conn, error)
+// dialFunc adapts a function to DeviceDialer. It takes the operator and the device as well
+// as the service because that is what the interface carries: a device-initiated stream
+// arrives on a connection whose bytes belong to the device, so the identity of the operator
+// whose reverse created it cannot be read off the connection.
+type dialFunc func(operator, device, service string) (net.Conn, error)
 
-func (f dialFunc) Dial(service string) (net.Conn, error) { return f(service) }
+func (f dialFunc) Dial(operator, device, service string) (net.Conn, error) {
+	return f(operator, device, service)
+}
 
 // ServiceRun is one switched-transport service with its client end and its device script.
 //
@@ -272,7 +277,7 @@ func TestADeviceOpenedStreamIsAnsweredOnItsOwnStreamAndAddressed(t *testing.T) {
 
 	dialed := make(chan string, 1)
 	s := forwardingServer(nil)
-	s.dialer = dialFunc(func(service string) (net.Conn, error) {
+	s.dialer = dialFunc(func(_, _, service string) (net.Conn, error) {
 		dialed <- service
 		return net.Dial("tcp", echo.Addr().String())
 	})
@@ -340,7 +345,7 @@ func TestADeviceOpenedStreamForAnUnreachablePortIsClosed(t *testing.T) {
 	const openID = 0x2e
 
 	s := forwardingServer(nil)
-	s.dialer = dialFunc(func(string) (net.Conn, error) {
+	s.dialer = dialFunc(func(string, string, string) (net.Conn, error) {
 		return nil, io.ErrUnexpectedEOF
 	})
 
@@ -378,7 +383,7 @@ func TestADeviceOpenedStreamDoesNotDisturbTheClientStream(t *testing.T) {
 	defer echo.Close()
 
 	s := forwardingServer(nil)
-	s.dialer = dialFunc(func(string) (net.Conn, error) { return net.Dial("tcp", echo.Addr().String()) })
+	s.dialer = dialFunc(func(_, _, _ string) (net.Conn, error) { return net.Dial("tcp", echo.Addr().String()) })
 
 	run := openService(t, s, "sync:", deviceID,
 		func(conn net.Conn, br *bufio.Reader, hostID uint32) {

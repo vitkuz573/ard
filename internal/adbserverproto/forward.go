@@ -47,6 +47,11 @@ type Forward struct {
 // devices, and because a forward outlives the connection that asked for it: adb closes that
 // connection as soon as the request is answered, so anything that lived on the connection
 // would be gone while the port was still bound.
+//
+// Every method takes the operator, and every method is called per request. A forward's
+// authorization decision has the same lifetime problem as the port: the binding outlives the
+// connection the decision was made on, so the name is recorded with the port and the port is
+// only ever used, listed or removed against the operator it belongs to.
 type Forwards interface {
 	// Bind listens on local and answers with the port it bound. The port matters because
 	// the client may have asked for tcp:0, and only the answer tells it which port it got.
@@ -58,10 +63,14 @@ type Forwards interface {
 	Bind(operator, serial, local, remote string, norebind bool) (int, error)
 	// Kill removes the forward of that local specification. A specification that is not
 	// there is not an error: removing something that is absent reaches the wanted state.
-	Kill(serial, local string)
+	Kill(operator, serial, local string) error
 	// List renders the forwards as the stock server renders them, one
-	// "serial local remote\n" line each.
-	List(serial string) string
+	// "serial local remote\n" line each, for the operator's own forwards only.
+	//
+	// The filtering is not cosmetic. Every forward on a server belongs to an operator, and a
+	// listing that showed all of them would hand one operator the device ids and ports of
+	// another operator's forwards.
+	List(operator, serial string) string
 }
 
 // DeviceDialer reaches a socket this server can see on its own machine, for a device that
@@ -71,8 +80,16 @@ type Forwards interface {
 // device asks for a port every time something reaches a port it is holding, so the answer has
 // to be a fresh connection each time.
 type DeviceDialer interface {
-	// Dial connects to the port the service names on this server's own machine.
-	Dial(service string) (net.Conn, error)
+	// Dial connects to the port the service names on this server's own machine, on behalf of
+	// the operator whose reverse put this device in a position to ask.
+	//
+	// The operator and the device travel with the ask rather than being read off the
+	// connection, because a device-initiated stream arrives on the transport the reverse was
+	// created on and that transport belongs to the adb server, not to the operator who
+	// opened it: its bytes go to the device. Carrying the identity is what lets the check
+	// be made at all, and it is made here because this is the moment a connection is actually
+	// made.
+	Dial(operator, device, service string) (net.Conn, error)
 }
 
 // SetTransportAdopter arranges for a device transport to outlive the request that opened it.
@@ -113,10 +130,14 @@ func (s *Server) serveHostForward(c net.Conn, service string) error {
 	case strings.HasPrefix(service, "killforward-all"):
 		// The serial is not in the request: `--remove-all` is per device, and the client
 		// has switched onto one by the time it sends this.
-		s.forwards.Kill(s.forwardSerial, "")
+		if err := s.forwards.Kill(s.operator, s.forwardSerial, ""); err != nil {
+			return writeFail(c, err.Error())
+		}
 		return writeOKAY(c)
 	case strings.HasPrefix(service, "killforward:"):
-		s.forwards.Kill(s.forwardSerial, strings.TrimPrefix(service, "killforward:"))
+		if err := s.forwards.Kill(s.operator, s.forwardSerial, strings.TrimPrefix(service, "killforward:")); err != nil {
+			return writeFail(c, err.Error())
+		}
 		return writeOKAY(c)
 	default:
 		return writeFail(c, "unknown host service '"+service+"'")

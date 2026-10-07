@@ -65,6 +65,29 @@ func (s *Server) serveHostService(c net.Conn, dev net.Conn, prefix []byte) (bool
 		return false, service, err
 	}
 
+	// The check happens after the acknowledgement and before anything is opened, and both
+	// of those positions are load-bearing.
+	//
+	// After, because the acknowledgement is the answer to having switched transports: a
+	// client that has not seen it treats the next four bytes as the answer to its own
+	// request, and a FAIL written in its place is read as a successful switch followed by
+	// a stream that delivers nothing.
+	//
+	// Before, because a refusal has to stop the request: an OPEN reaching the device is a
+	// command running on it, and the device is in no position to know that the operator who
+	// sent it is not entitled to send it. The device's own view is that the request came
+	// from its adb server, which is true.
+	//
+	// Per request and never cached, so a role changed mid-session takes effect on the next
+	// request rather than at the end of the connection.
+	if err := s.authorizeService(s.forwardSerial, service); err != nil {
+		s.debugf("adbserverproto: refusing %q on %q: %v", service, s.forwardSerial, err)
+		// The answer is a FAIL and then the transport is released, so a refused client
+		// reads the reason and is not left holding a connection to a device it may not
+		// drive. A closed stream is a refusal the client cannot mistake for a hang.
+		return false, service, writeFail(c, err.Error())
+	}
+
 	// Forwarding is answered here rather than by the device, because the port being
 	// forwarded is this server's: a device has no say in a port on the machine the adb
 	// binary talks to. Everything else on this connection is the device's to answer.
@@ -97,6 +120,11 @@ func (s *Server) serveHostService(c net.Conn, dev net.Conn, prefix []byte) (bool
 // Measured against a device that bound a port and then connected to it: with the transport
 // closed at the end of the request, the device could not open its callback stream and the
 // connection to the port it had bound was reset.
+//
+// The names are the ones adb sends, measured: `adb reverse` arrives as "reverse:forward:",
+// and the three ways to undo it arrive as "reverse:killforward:", "reverse:killforward-all"
+// and "reverse:list-forward". The last of those binds nothing and needs no transport of its
+// own; the first two close the listener, so keeping the transport serves nothing after them.
 func keepsTransport(service string) bool {
 	return strings.HasPrefix(service, "reverse:forward:")
 }
@@ -240,7 +268,12 @@ func (d *deviceStreams) closeAll() {
 // arrive on it is the device asking for a connection of its own. That is the whole life of a
 // reverse forward's callback half -- the device binds a port, and every connection to that port
 // becomes a stream opened here asking for a port on this server.
-func (s *Server) ServeDeviceStreams(conn net.Conn, serial string) {
+//
+// operator and device are the identity of the reverse that put this transport here. A device
+// that asks for a connection arrives on the transport the reverse was created on, whose bytes
+// belong to the device, so nothing on the connection itself says who is entitled to this
+// answer; it travels from the request that was authorized.
+func (s *Server) ServeDeviceStreams(conn net.Conn, operator, device string) {
 	br := bufio.NewReader(conn)
 	streams := newDeviceStreams()
 	defer streams.closeAll()
@@ -273,7 +306,7 @@ func (s *Server) ServeDeviceStreams(conn net.Conn, serial string) {
 		}
 		switch p.command {
 		case cmdOPEN:
-			s.serveDeviceOpen(conn, p, streams, write)
+			s.serveDeviceOpen(conn, operator, device, p, streams, write)
 		case cmdCLSE:
 			// The device closed the transport. Every callback on it is over, and nothing
 			// can be done about that from here: the device holds the listener and decides
@@ -291,16 +324,22 @@ func (s *Server) ServeDeviceStreams(conn net.Conn, serial string) {
 //
 // A dial that fails is answered with a close rather than an OKAY, so the device sees the refusal
 // as a closed stream and releases whatever was waiting on its port.
-func (s *Server) serveDeviceOpen(dev net.Conn, open packet, streams *deviceStreams, write func([]byte) error) {
+//
+// The permission is asked of the dialer rather than of the authorizer, and that placement is the
+// point. This is the half of a reverse that reaches into this machine: the request that bound
+// the port was authorized on the operator's behalf, and this is the connection it leads to. The
+// check is per connection because the device asks afresh every time something reaches the port
+// it holds, and a reverse outlives the connection the authorization was made on.
+func (s *Server) serveDeviceOpen(dev net.Conn, operator, device string, open packet, streams *deviceStreams, write func([]byte) error) {
 	service := serviceName(open.payload)
 	if s.dialer == nil {
 		s.debugf("adbserverproto: device asked for %q and this server has no ports to offer", service)
 		_ = write(encodePacket(cmdCLSE, hostLocalID, open.arg0, nil))
 		return
 	}
-	conn, err := s.dialer.Dial(service)
+	conn, err := s.dialer.Dial(operator, device, service)
 	if err != nil {
-		s.debugf("adbserverproto: device asked for %q: %v", service, err)
+		s.debugf("adbserverproto: device asked for %q on behalf of %q: %v", service, operator, err)
 		_ = write(encodePacket(cmdCLSE, hostLocalID, open.arg0, nil))
 		return
 	}
@@ -438,7 +477,7 @@ func (s *Server) pumpHostStream(c net.Conn, dev net.Conn, cbr *bufio.Reader, dbr
 				//
 				// Answering is a dial and a splice on a stream of its own, so the current
 				// service's relay carries on untouched while this one runs beside it.
-				s.serveDeviceOpen(dev, p, streams, write)
+				s.serveDeviceOpen(dev, s.operator, s.forwardSerial, p, streams, write)
 			case cmdCLSE:
 				// The device has closed the stream, and p.arg1 is where it puts the exit
 				// status for a service that reports one. It is not forwarded: the client is

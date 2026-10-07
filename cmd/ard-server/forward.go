@@ -54,6 +54,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vitkuz573/ard/internal/acl"
 	"github.com/vitkuz573/ard/internal/adbserverproto"
 	"github.com/vitkuz573/ard/internal/audit"
 	"github.com/vitkuz573/ard/internal/hs"
@@ -104,8 +105,13 @@ func newForwards(gw *gateway) *forwards {
 // prints after asking for tcp:0, and a 4-byte integer in the same place decodes to nothing
 // and the client prints an empty port.
 func (f *forwards) Bind(operator, serial, local, remote string, norebind bool) (int, error) {
-	if !f.gw.authz.CanSee(operator, serial) {
-		return 0, fmt.Errorf("operator %q may not forward for device %q", operator, serial)
+	// The permission is asked here as well as at the service request, and the duplicate is
+	// deliberate: this is the point where the port becomes reachable, and a decision made
+	// once per request upstream could be a decision about a different request by the time a
+	// connection arrives at the port. Both questions are cheap and this one is the one that
+	// decides whether a listener exists.
+	if d := f.gw.authz.Authorize(operator, serial, acl.KindForward); !d.Allowed {
+		return 0, fmt.Errorf("operator %q may not forward for device %q: %s", operator, serial, d.Reason)
 	}
 	if _, ok := f.gw.reg.Get(serial); !ok {
 		return 0, fmt.Errorf("device %q is not connected", serial)
@@ -179,35 +185,63 @@ func (f *forward) serve() {
 	}
 }
 
-// kill removes a forward by its local specification.
+// Kill removes a forward by its local specification.
 //
 // A specification that is not there is not an error: `--remove` on a port nothing holds is a
 // state the caller wanted and already has, and reporting a failure for it teaches an operator
 // that the command means something it does not.
-func (f *forwards) Kill(serial, local string) {
+//
+// A specification that is there and bound by somebody else is an error, because the port is
+// still listening and still serving: answering OKAY would tell the operator their port is
+// gone while anything that can reach the gateway is still reaching a device through it.
+//
+// The operator is part of the lookup rather than a label on the result, so one operator cannot
+// release another's tunnel by naming a port number.
+func (f *forwards) Kill(operator, serial, local string) error {
 	key := forwardKey(local)
 	f.mu.Lock()
 	fwd, ok := f.byKey[key]
-	if ok && (serial == "" || fwd.serial == serial) {
-		delete(f.byKey, key)
+	if !ok {
+		// Nothing there is the state the caller asked for.
+		f.mu.Unlock()
+		return nil
 	}
+	// A per-device removal names a device by the switched transport it arrived on, so a
+	// mismatch is a request about a port this forward is not: leave it bound, because it is
+	// not the caller's to remove and it is still working.
+	if serial != "" && fwd.serial != serial {
+		f.mu.Unlock()
+		return fmt.Errorf("%s is forwarded for device %q, not %q", local, fwd.serial, serial)
+	}
+	if fwd.operator != operator {
+		f.mu.Unlock()
+		return fmt.Errorf("%s is forwarded for device %q on behalf of another operator", local, fwd.serial)
+	}
+	delete(f.byKey, key)
 	f.mu.Unlock()
-	if ok {
-		_ = fwd.ln.Close()
-		f.gw.logger.Printf("forward %s removed", local)
-	}
+	_ = fwd.ln.Close()
+	f.gw.logger.Printf("forward %s removed", local)
+	return nil
 }
 
-// list renders the forwards as the stock server renders them: one line per forward, as
-// "serial local remote\n".
+// List renders this operator's forwards as the stock server renders them: one line per
+// forward, as "serial local remote\n".
 //
 // The serial is there because it is what makes two forwards of one local port for different
 // devices tellable apart, which is why the format has three fields.
-func (f *forwards) List(serial string) string {
+//
+// Filtering by operator is the load-bearing part. Every forward on a gateway belongs to
+// whoever asked for it, so an unfiltered listing hands one operator the device identifiers and
+// ports of another operator's tunnels, and a device identifier is the one string that leads
+// straight to `adb -s`.
+func (f *forwards) List(operator, serial string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	lines := make([]string, 0, len(f.byKey))
 	for _, fwd := range f.byKey {
+		if fwd.operator != operator {
+			continue
+		}
 		if serial == "" || fwd.serial == serial {
 			lines = append(lines, fmt.Sprintf("%s %s %s\n", fwd.serial, fwd.local, fwd.remote))
 		}
@@ -329,7 +363,20 @@ func halfClose(c net.Conn) {
 // requesting side chose the name, so resolving it or honouring an address here would let a
 // device pick which host on the network a reverse forward reaches. Only tcp: with a numeric
 // port is answered, and always 127.0.0.1.
-func (f *forwards) Dial(service string) (net.Conn, error) {
+//
+// The permission is asked here, per connection, and not only on the reverse request that
+// created the port. A device asks for a connection every time something reaches the port it
+// holds, so those connections are the traffic a reverse forward exists to carry: a check made
+// once at creation would decide the first connection and leave the rest to a decision the
+// operator's role may since have withdrawn.
+func (f *forwards) Dial(operator, device, service string) (net.Conn, error) {
+	if d := f.gw.authz.Authorize(operator, device, acl.KindReverse); !d.Allowed {
+		f.gw.audit.Record(audit.Event{
+			Kind: "forward.device_open_refused", Actor: operator, Device: device,
+			Detail: fmt.Sprintf("%s: %s", service, d.Reason),
+		})
+		return nil, fmt.Errorf("operator %q may not reach %s on device %q: %s", operator, service, device, d.Reason)
+	}
 	addr, err := loopbackSpec(service)
 	if err != nil {
 		return nil, err

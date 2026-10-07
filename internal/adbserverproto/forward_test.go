@@ -19,6 +19,8 @@ type fakeForwards struct {
 	port int
 	// bindErr, when set, is what Bind fails with.
 	bindErr error
+	// killErr, when set, is what Kill fails with.
+	killErr error
 
 	binds    []string
 	norebind []bool
@@ -36,17 +38,18 @@ func (f *fakeForwards) Bind(operator, serial, local, remote string, norebind boo
 	return f.port, nil
 }
 
-func (f *fakeForwards) Kill(serial, local string) {
+func (f *fakeForwards) Kill(operator, serial, local string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.kills = append(f.kills, strings.Join([]string{serial, local}, "|"))
+	f.kills = append(f.kills, strings.Join([]string{operator, serial, local}, "|"))
+	return f.killErr
 }
 
-func (f *fakeForwards) List(string) string { return "" }
+func (f *fakeForwards) List(string, string) string { return "" }
 
-// listForwards reports a fixed one-forward listing and records which serial it was asked
-// about, which is the part that decides whether one device's forwards can be told from
-// another's.
+// listForwards reports a fixed one-forward listing and records the operator and serial it
+// was asked about, which are the parts that decide whether one operator's forwards can be told
+// from another's, and one device's from another's.
 type listForwards struct {
 	mu     sync.Mutex
 	listed []string
@@ -55,11 +58,11 @@ type listForwards struct {
 func (l *listForwards) Bind(string, string, string, string, bool) (int, error) {
 	return 0, fmt.Errorf("not used in this test")
 }
-func (l *listForwards) Kill(string, string) {}
-func (l *listForwards) List(serial string) string {
+func (l *listForwards) Kill(string, string, string) error { return nil }
+func (l *listForwards) List(operator, serial string) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.listed = append(l.listed, serial)
+	l.listed = append(l.listed, strings.Join([]string{operator, serial}, "|"))
 	return "AAA tcp:9930 tcp:9931\n"
 }
 
@@ -197,10 +200,13 @@ func TestForwardRemovalRepliesWithABareOKAY(t *testing.T) {
 		service string
 		kill    string
 	}{
-		{"host:killforward:tcp:9930", "AAA|tcp:9930"},
+		// The operator travels with the kill as well as the bind: a port outlives the
+		// connection that asked for it, so the set has to know whose it is before it lets
+		// anybody take it away.
+		{"host:killforward:tcp:9930", testOperator + "|AAA|tcp:9930"},
 		// --remove-all names no specification, and the client has switched onto one device
 		// by the time it arrives, so the serial is what bounds it.
-		{"host:killforward-all", "AAA|"},
+		{"host:killforward-all", testOperator + "|AAA|"},
 	} {
 		set := &fakeForwards{}
 		got := switched(t, forwardingServer(set), "AAA", tc.service)
@@ -259,8 +265,11 @@ func TestListForwardIsAPlainHostRequestWithAFramedListing(t *testing.T) {
 	if want := fmt.Sprintf("OKAY%04x%s", len(listing), listing); got != want {
 		t.Errorf("host:list-forward reply = %q (% x), want %q", got, got, want)
 	}
-	if len(set.listed) != 1 || set.listed[0] != "" {
-		t.Errorf("List called with %v, want one call naming no serial", set.listed)
+	// The operator travels with the listing: every forward on a server belongs to whoever
+	// asked for it, so a listing that named no operator would hand one operator the device
+	// ids and ports of another operator's tunnels.
+	if len(set.listed) != 1 || set.listed[0] != testOperator+"|" {
+		t.Errorf("List called with %v, want one call for %q naming no serial", set.listed, testOperator)
 	}
 }
 
@@ -272,7 +281,7 @@ func TestListForwardPerDeviceAsksForThatDeviceOnly(t *testing.T) {
 	if !strings.HasPrefix(got, "OKAY") {
 		t.Fatalf("reply = %q, want an OKAY", got)
 	}
-	if len(set.listed) != 1 || set.listed[0] != "BBB" {
+	if len(set.listed) != 1 || set.listed[0] != testOperator+"|BBB" {
 		t.Errorf("List called with %v, want one call for BBB", set.listed)
 	}
 }

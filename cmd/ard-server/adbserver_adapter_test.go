@@ -39,11 +39,11 @@ const testDeviceFeatures = "shell_v2,cmd,stat_v2,ls_v2,sendrecv_v2,"
 const policyYAML = `
 roles:
   - name: maintainer
-    permissions: ["shell", "exec", "files", "install", "logcat"]
+    permissions: ["shell", "exec", "files", "install", "forward", "reverse"]
     grants: ["` + deviceA + `", "` + deviceC + `"]
     members: ["alice"]
   - name: stranger
-    permissions: ["logcat"]
+    permissions: ["files"]
     grants: ["` + deviceB + `"]
     members: ["bob"]
 `

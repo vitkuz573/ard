@@ -70,6 +70,10 @@ type Server struct {
 	// without one refuses the forwarding services by name rather than leaving them
 	// unanswered, which a client reads as a hang.
 	forwards Forwards
+	// authorizer decides whether this client may open the service it just named. Nil
+	// allows everything, which is what a server with no policy of its own looks like; the
+	// gateway always sets one. See SetServiceAuthorizer.
+	authorizer ServiceAuthorizer
 	// dialer reaches a port on this server's own machine for a device that opened a stream
 	// asking for one. Nil when this server has no ports to offer; see SetDeviceDialer.
 	dialer DeviceDialer
@@ -110,6 +114,35 @@ func (s *Server) debugf(format string, args ...any) {
 	if s.logf != nil {
 		s.logf(format, args...)
 	}
+}
+
+// ServiceAuthorizer decides whether this client may open one named service on one device.
+//
+// It is asked once per service request and its answer is never cached, because the request
+// in hand is the thing being decided and an entitlement can change while a connection is
+// open. A connection is not an authorization: adb opens a fresh one per request, and the one
+// it opens for a forward is closed as soon as the port is bound.
+type ServiceAuthorizer interface {
+	// AuthorizeService reports whether this client may open service on device, or returns
+	// the reason. The reason is what adb prints, so it has to be the sentence rather than
+	// an identifier the operator would have to look up.
+	AuthorizeService(device, service string) error
+}
+
+// SetServiceAuthorizer says who decides what this client's requests may ask for.
+//
+// Optional, and allowing everything when unset is what keeps this package free of a
+// policy: who may open what is a decision for the gateway, which holds the policy, and a
+// package that guessed would be a package that could be wrong. A server without one is a
+// server for a single trusted client.
+func (s *Server) SetServiceAuthorizer(a ServiceAuthorizer) { s.authorizer = a }
+
+// authorizeService runs the check for one request, tolerating an absent authorizer.
+func (s *Server) authorizeService(device, service string) error {
+	if s.authorizer == nil {
+		return nil
+	}
+	return s.authorizer.AuthorizeService(device, service)
 }
 
 // Serve answers one request on c and returns.
@@ -213,7 +246,7 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 		if s.forwards == nil {
 			return false, writeFail(c, "port forwarding is not available on this server")
 		}
-		return false, s.replyValue(c, s.forwards.List(""))
+		return false, s.replyValue(c, s.forwards.List(s.operator, ""))
 
 	case strings.HasPrefix(req, "host-serial:"):
 		serial, action := splitSerialAction(req)
@@ -240,7 +273,7 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 			if s.forwards == nil {
 				return false, writeFail(c, "port forwarding is not available on this server")
 			}
-			return false, s.replyValue(c, s.forwards.List(serial))
+			return false, s.replyValue(c, s.forwards.List(s.operator, serial))
 
 		case action == "get-state":
 			// `adb get-state` asks the server what it thinks the device's state is, and does

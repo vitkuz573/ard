@@ -16,34 +16,182 @@ import (
 // deliberately excluded shell would reach a shell by asking for a bridge instead. That is
 // the exact mistake the table exists to prevent, so it is asserted rather than assumed.
 func TestOperatorBridgeRequiresShell(t *testing.T) {
-	perm, ok := KindToPermission["operator-bridge"]
+	perm, ok := KindToPermission[KindOperatorBridge]
 	if !ok {
-		t.Fatal("stream kind \"operator-bridge\" is unmapped, so every attach would be refused")
+		t.Fatalf("stream kind %q is unmapped, so every attach would be refused", KindOperatorBridge)
 	}
 	if perm != PermShell {
-		t.Fatalf("operator-bridge requires %q, want %q", perm, PermShell)
+		t.Fatalf("%s requires %q, want %q", KindOperatorBridge, perm, PermShell)
+	}
+}
+
+// The service names below are what a stock adb binary sends, captured by asking a real one to
+// run each command against a real adb server. The kind each maps to is the whole permission
+// model on the operator leg, so it is pinned by name rather than inferred: a misclassification
+// here hands one permission to another permission's commands, which no test on the check itself
+// would notice.
+func TestKindForServiceMatchesWhatAdbSends(t *testing.T) {
+	for _, tc := range []struct {
+		service string
+		kind    string
+	}{
+		// A shell, and the services that are a shell in another spelling. Measured, because
+		// the case decides whether a log permission could exist at all: `adb logcat` arrives
+		// as `adb shell logcat` with the arguments attached, and `adb shell screenrecord` as
+		// itself. Neither has a name to be told apart by.
+		{"shell,v2,TERM=xterm-256color,raw:whoami", KindShell},
+		{"shell,v2,TERM=xterm-256color:export ANDROID_LOG_TAGS=''; exec logcat '-d'", KindShell},
+		{"shell,v2,TERM=xterm-256color,raw:screencap -p /sdcard/s.png", KindShell},
+		{"shell:ls /sdcard", KindShell},
+		{"root:", KindShell},
+		{"unroot:", KindShell},
+		{"remount:", KindShell},
+		// exec-out is a name of its own, and the split is real on the wire.
+		{"exec:echo 'hi'", KindExec},
+		// File transfer, both the sync service and the sideload one.
+		{"sync:", KindFiles},
+		{"sideload-host:2273746:65536", KindFiles},
+		// Package install. The device is asked twice: once to read a setting, once to install.
+		{"abb_exec:settings\\x00get\\x00global\\x00enable_adb_incremental_install_default", KindInstall},
+		{"abb_exec:package\\x00install\\x00-r\\x00-S\\x002273746", KindInstall},
+		// Every form of `adb forward`, including --no-rebind, which puts its flag in front of
+		// the specification.
+		{"host:forward:tcp:9930;tcp:9931", KindForward},
+		{"host:forward:norebind:tcp:9932;tcp:9933", KindForward},
+		{"host:killforward:tcp:9930", KindForward},
+		{"host:killforward-all", KindForward},
+		{"host:list-forward", KindForward},
+		{"host:list-forward-all", KindForward},
+		{"host-serial:ABC123:list-forward", KindForward},
+		// Every form of `adb reverse`, all of which arrive on the switched transport rather
+		// than as a host request.
+		{"reverse:forward:tcp:9910;tcp:9911", KindReverse},
+		{"reverse:killforward:tcp:9910", KindReverse},
+		{"reverse:killforward-all", KindReverse},
+		{"reverse:list-forward", KindReverse},
+	} {
+		kind, ok := KindForService(tc.service)
+		if !ok {
+			t.Errorf("%q was not classified, so it would be refused whatever the role holds", tc.service)
+			continue
+		}
+		if kind != tc.kind {
+			t.Errorf("%q classified as %q, want %q", tc.service, kind, tc.kind)
+		}
+	}
+}
+
+// A service nobody has classified is refused, and the reason says so. adb can send any name at
+// all on a switched transport, so this is the check that stops a feature reaching a device
+// without anyone having decided who may use it.
+func TestKindForServiceRefusesWhatItDoesNotKnow(t *testing.T) {
+	for _, service := range []string{
+		"",
+		"host:version",
+		"host:transport:ABC123",
+		"host:devices",
+		"host-serial:ABC123:get-state",
+		"jdwp",
+		"track-devices:",
+		// A near miss is worse than a miss: it is a name that looks classified.
+		"reverse:invented:later",
+		"host:forwardish:tcp:1;tcp:2",
+		"reverseforward:tcp:1;tcp:2",
+	} {
+		if kind, ok := KindForService(service); ok {
+			t.Errorf("%q was classified as %q; a service with no permission would be served", service, kind)
+		}
+	}
+}
+
+// Every kind the classifier can produce must have a permission, and every permission must be
+// reachable from some kind. Either gap is a permission that cannot be granted on the operator
+// leg or a kind that is refused for everybody, and both are the same class of bug: the policy
+// vocabulary and the requests it governs have drifted apart.
+func TestTheKindTableAndThePermissionsAgreeBothWays(t *testing.T) {
+	// One real service name per kind, so the walk is over requests rather than over
+	// synthesised strings. A probe built by concatenating a kind name would pass while the
+	// classifier read a different spelling, which is the whole risk here.
+	reachedBy := map[string]string{}
+	for _, service := range []string{
+		"shell,v2,TERM=xterm-256color,raw:whoami",
+		"exec:echo 'hi'",
+		"sync:",
+		"abb_exec:package\\x00install\\x00-r\\x00-S\\x002273746",
+		"host:forward:tcp:9930;tcp:9931",
+		"reverse:forward:tcp:9910;tcp:9911",
+	} {
+		kind, ok := KindForService(service)
+		if !ok {
+			t.Fatalf("%q was not classified", service)
+		}
+		if _, dup := reachedBy[kind]; dup {
+			t.Errorf("kind %q was reached by both %q and %q; one kind is one capability",
+				kind, reachedBy[kind], service)
+		}
+		reachedBy[kind] = service
+	}
+
+	// Every kind with a permission is decided somewhere: by a service name, or at the
+	// transport switch, which happens before a service is named and is the one kind that is
+	// not a service.
+	atSwitch := map[string]bool{KindOperatorBridge: true}
+	for kind := range KindToPermission {
+		if _, ok := reachedBy[kind]; !ok && !atSwitch[kind] {
+			t.Errorf("kind %q requires a permission but no request ever reaches it", kind)
+		}
+	}
+	// And every permission is required by some kind, so none is a name that can be written
+	// into a policy file and never consulted.
+	required := map[Permission]bool{}
+	for _, perm := range KindToPermission {
+		required[perm] = true
+	}
+	for _, perm := range []Permission{
+		PermShell, PermExec, PermFiles, PermInstall, PermForward, PermReverse,
+	} {
+		if !required[perm] {
+			t.Errorf("permission %q is declared but no kind requires it", perm)
+		}
+	}
+}
+
+// The permission a kind names has to be one a policy file may hold, or the role that holds it
+// cannot be loaded at all.
+func TestEveryKindRequiresAKnownPermission(t *testing.T) {
+	for kind, perm := range KindToPermission {
+		p := policyFrom(t, `
+roles:
+  - name: probe
+    permissions: ["`+string(perm)+`"]
+    grants: ["*"]
+    members: ["alice"]
+`)
+		if d := p.Authorize("alice", "device-a", kind); !d.Allowed {
+			t.Errorf("kind %q requires %q, which a role cannot hold: %s", kind, perm, d.Reason)
+		}
 	}
 }
 
 // A role that holds the device but not shell must be refused the bridge, while still
-// being allowed the read-only permissions it does hold.
+// being allowed the file transfers it does hold.
 func TestOperatorWithoutShellIsRefusedTheBridge(t *testing.T) {
 	p := policyFrom(t, `
 roles:
   - name: watcher
-    permissions: ["logcat"]
+    permissions: ["files"]
     grants:
       - "device-a"
     members: ["carol"]
 `)
 	const op = "carol"
 
-	if d := p.Authorize(op, "device-a", "logcat"); !d.Allowed {
-		t.Fatalf("logcat on a granted device was refused: %s", d.Reason)
+	if d := p.Authorize(op, "device-a", KindFiles); !d.Allowed {
+		t.Fatalf("files on a granted device was refused: %s", d.Reason)
 	}
-	d := p.Authorize(op, "device-a", "operator-bridge")
+	d := p.Authorize(op, "device-a", KindOperatorBridge)
 	if d.Allowed {
-		t.Fatal("a logcat-only operator was granted the raw ADB bridge, which includes shell")
+		t.Fatal("a files-only operator was granted the raw ADB bridge, which includes shell")
 	}
 	// The refusal has to say why, because this is the message an operator sees.
 	if !strings.Contains(d.Reason, "shell") {
@@ -64,11 +212,11 @@ roles:
 `)
 	const op = "alice"
 
-	if d := p.Authorize(op, "device-a", "operator-bridge"); !d.Allowed {
+	if d := p.Authorize(op, "device-a", KindOperatorBridge); !d.Allowed {
 		t.Fatalf("a maintainer with the grant was refused: %s", d.Reason)
 	}
 	// Right permission, wrong device.
-	if d := p.Authorize(op, "device-b", "operator-bridge"); d.Allowed {
+	if d := p.Authorize(op, "device-b", KindOperatorBridge); d.Allowed {
 		t.Fatal("the bridge was granted for a device outside the role's grants")
 	}
 }
@@ -82,7 +230,7 @@ roles:
     grants: ["*"]
     members: ["root-operator"]
 `)
-	if d := p.Authorize("root-operator", "anything", "operator-bridge"); !d.Allowed {
+	if d := p.Authorize("root-operator", "anything", KindOperatorBridge); !d.Allowed {
 		t.Fatalf("the wildcard role was refused: %s", d.Reason)
 	}
 }
@@ -133,7 +281,7 @@ roles:
 		t.Fatalf("a role with no members admitted %v", got)
 	}
 	for _, who := range []string{"maintainer", "alice", ""} {
-		if d := p.Authorize(who, "device-a", "operator-bridge"); d.Allowed {
+		if d := p.Authorize(who, "device-a", KindOperatorBridge); d.Allowed {
 			t.Errorf("operator %q was admitted by a policy that names nobody", who)
 		}
 	}
@@ -154,7 +302,7 @@ roles:
     grants: ["*"]
     members: ["dana"]
   - name: b
-    permissions: ["logcat"]
+    permissions: ["files"]
     grants: ["*"]
     members: ["dana"]
 `

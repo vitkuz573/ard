@@ -30,6 +30,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/vitkuz573/ard/internal/acl"
 	"github.com/vitkuz573/ard/internal/adbserverproto"
 	"github.com/vitkuz573/ard/internal/audit"
 	"github.com/vitkuz573/ard/internal/hs"
@@ -105,23 +106,23 @@ func (f operatorFilter) Serials() []string {
 
 // Open returns a connection carrying the raw ADB transport to one device.
 //
-// It reuses the registry call and the same authorization the old per-device bridge used, so a
-// client that forges a serial gains nothing: Allows has already answered, and the bridge
-// permission is checked again here rather than assumed from it.
+// It reuses the registry call and checks the bridge permission itself, so a client that
+// forges a serial gains nothing: Allows has already answered, and the permission behind the
+// transport is checked again here rather than assumed from it.
 func (f operatorFilter) Open(serial string) (net.Conn, error) {
 	if !f.Allows(serial) {
 		return nil, fmt.Errorf("operator %q may not attach to %q", f.op, serial)
 	}
-	if d := f.gw.authz.Authorize(f.op, serial, "operator-bridge"); !d.Allowed {
+	if d := f.gw.authz.Authorize(f.op, serial, acl.KindOperatorBridge); !d.Allowed {
 		return nil, fmt.Errorf("operator %q may not attach to %q: %s", f.op, serial, d.Reason)
 	}
 	streamID := newStreamID()
-	// The kind is "adb", not "operator-bridge". Those two are different things and the
-	// difference is not cosmetic: "operator-bridge" is the name the ACL file gives this
-	// permission check, while "adb" is the stream kind the agent dispatches on. Passing the
-	// permission name opened a stream of a kind nothing on the device handles, so the
-	// connection was accepted and then nothing was ever read from it -- the shell request
-	// produced no output and no error, which is the worst of both.
+	// The route kind is "adb", while the permission that was checked is
+	// acl.KindOperatorBridge. Those are two different questions and conflating them is
+	// not cosmetic: the agent dispatches on the route kind, and opening a stream under a
+	// name nothing on the device handles means the connection is accepted and then
+	// nothing is ever read from it -- the shell request produces no output and no error,
+	// which is the worst of both.
 	stream, err := f.gw.reg.Open(serial, streamID, hs.KindADB)
 	if err != nil {
 		return nil, err
@@ -146,6 +147,11 @@ func (g *gateway) serveAdbServer(conn net.Conn, operator, role string) {
 	srv := adbserverproto.New(filter, filter.Open, operator, func(format string, args ...any) {
 		g.logger.Printf("operator adb session (%s/%s): %s", operator, role, fmt.Sprintf(format, args...))
 	}, g.forwards)
+	// The service an operator's adb names after the transport switch is what carries the
+	// stream kind, and this is where the kind reaches the policy. It is asked per request
+	// rather than cached: a role's permissions can change while a session is open, and the
+	// request in hand is the thing being decided.
+	srv.SetServiceAuthorizer(g.authorizerFor(operator))
 	// A device that opened a stream for itself is asking for a port on this machine, and
 	// this gateway is the machine. The dial is bounded to the gateway's own loopback by the
 	// same rule the forward's other half uses, so a device cannot name a host elsewhere.
@@ -156,7 +162,9 @@ func (g *gateway) serveAdbServer(conn net.Conn, operator, role string) {
 	srv.SetTransportAdopter(func(serial, service string, conn net.Conn) bool {
 		go func() {
 			defer conn.Close()
-			srv.ServeDeviceStreams(conn, serial)
+			// The operator's name travels with the connection, because a reverse forward's
+			// callback half arrives here long after the client that asked for it is gone.
+			srv.ServeDeviceStreams(conn, operator, serial)
 		}()
 		g.logger.Printf("operator %s: %s keeps the device transport, so its callbacks are served here",
 			operator, service)
