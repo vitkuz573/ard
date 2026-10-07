@@ -256,15 +256,12 @@ func peerUID(conn net.Conn) (uid uint32, ok bool) {
 //
 // Only the peer's uid is checked, never the gateway's own.
 //
-// That distinction cost a deployment to get wrong. An earlier version also refused to
-// act unless the server itself was running as root, reasoning that a non-root server
-// could not be trusted to read peer credentials. That is simply false: SO_PEERCRED
-// reports the real uid of the other end regardless of what this process may do. The
-// gateway is supposed to run unprivileged, so that precondition guaranteed the feature
-// would be permanently unavailable in production -- while a test that started the
-// gateway with sudo passed, because there it accidentally held.
+// SO_PEERCRED reports the real uid of the other end regardless of what this
+// process may do, so a gateway running unprivileged reads it perfectly well. The
+// gateway is supposed to run unprivileged, and a check on its own uid would make the
+// feature permanently unavailable in production.
 //
-// The local end-to-end test now starts the gateway unprivileged for this reason.
+// The local end-to-end test starts the gateway unprivileged for this reason.
 func (g *gateway) requireRootControl(conn net.Conn, op string) bool {
 	remote := conn.RemoteAddr().String()
 	uid, ok := peerUID(conn)

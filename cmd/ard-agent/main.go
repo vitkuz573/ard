@@ -166,7 +166,7 @@ func run() error {
 	// but it is never trusted: after a reboot adbd has no socket at all, and when
 	// wireless debugging is the thing that opened it, the port is different every
 	// boot. An agent that remembered the address would work once and then fail
-	// silently forever, which is the failure mode this replaces.
+	// silently forever.
 	//
 	// -adbd may be empty, in which case discovery runs unconditionally.
 	locateCtx, cancelLocate := context.WithTimeout(context.Background(), 90*time.Second)
@@ -189,12 +189,10 @@ func run() error {
 	// unable to load one keeps that property from depending on filesystem
 	// permissions alone.
 	//
-	// The argument is the certificate file itself, not a directory. It used to be a
-	// directory that was then passed through filepath.Dir, which silently looked one
-	// level too high: on a device with the files in one directory the agent reported
-	// "no such file or directory" for a file that was right there. Flags whose
-	// meaning can be misread in one direction are worth fixing rather than
-	// documenting.
+	// The argument is the certificate file itself, not a directory: a directory
+	// passed through filepath.Dir looks one level too high and reports a missing file
+	// that is present. Flags whose meaning can be misread in one direction are worth
+	// fixing rather than documenting.
 	ca, err := tlsx.LoadVerifierFile(cfg.caPath)
 	if err != nil {
 		return fmt.Errorf("load server CA: %w", err)

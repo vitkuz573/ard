@@ -157,8 +157,8 @@ func TestUnknownAndEmptySerialsAreRefused(t *testing.T) {
 	}
 }
 
-// An operator with no role at all sees nothing and reaches nothing. The old policy admits
-// nobody by default and that property has to survive the change of mechanism.
+// An operator with no role at all sees nothing and reaches nothing: the policy admits
+// nobody by default, and that property has to hold.
 func TestOperatorWithNoRoleSeesNothing(t *testing.T) {
 	g := testGateway(t)
 	got := ask(t, g, "mallory", "host:devices")
