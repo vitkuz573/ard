@@ -62,11 +62,15 @@ Stated because a security tool that overstates itself is worse than none.
   permission specifically, and holding `shell` on a device means holding adb on
   that device. Roles control *which devices* and *what class of access*; they do
   not sandbox `shell` once granted.
-- **Permission checks that only look like they work.** An earlier version of the
-  ACL compared the required permission against a loop variable of the same name,
-  so `perm == perm` was always true and every role holding any permission passed
-  every check. Read-only roles reached shell. The mapping is now covered by tests
-  that assert a logcat-only role is refused the bridge.
+- **A permission model finer than one connection can carry.** The policy has eight
+  permissions and only one of them decides anything on the operator leg. A role that
+  holds `logcat` but not `shell` sees the device in `adb devices` and is refused a
+  transport with the reason on its own terminal; a role that holds `shell` gets shell,
+  install, file transfer and forwarding, because ADB multiplexes them over one TCP
+  connection. `forward` and `reverse` are named in the policy vocabulary and are not
+  consulted on their own: both requests arrive on a switched transport, whose gate is
+  `shell`. What the permissions buy is which *devices* a role may drive, not a finer
+  cut within one.
 - **A hostile network** during first contact. A device enrolling has no CA
   certificate, so it cannot verify the gateway at all: the connection that carries
   its certificate request is not authenticated. It reports the fingerprint of the

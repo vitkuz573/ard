@@ -24,9 +24,10 @@ over the one inbound connection the device made.
 `adb` itself decides what to do on the device, so an upstream ADB feature arrives
 without anyone writing it again — the gateway's job ends at switching `adb` onto a
 device and relaying the bytes. That is not quite "nothing is reimplemented": the
-gateway does answer adb's server protocol (`internal/adbserverproto`) and does the
-host side of the `CNXN`/`OPEN` exchange with the device. It does not implement any
-ADB service.
+gateway does answer adb's server protocol (`internal/adbserverproto`), does the host
+side of the `CNXN`/`OPEN` exchange with the device, and holds the ports that
+`adb forward` binds. It implements no ADB service — `shell`, `sync` and `install` are
+the device's own, and the gateway never looks inside them.
 
 A local helper on the operator's machine is unavoidable rather than incidental. `adb`
 speaks plaintext TCP to `host:port` and cannot do TLS at all, and the gateway accepts
@@ -55,6 +56,9 @@ It prints the local port it published, then point `adb` at that port:
 ```sh
 adb -P 15000 devices
 adb -P 15000 -s <device-uuid> shell
+adb -P 15000 -s <device-uuid> push file.txt /data/local/tmp/
+adb -P 15000 -s <device-uuid> pull /data/local/tmp/file.txt .
+adb -P 15000 -s <device-uuid> forward tcp:9930 tcp:9931
 ```
 
 `adb` asks the gateway which devices exist rather than being handed a list, so there is
@@ -64,6 +68,12 @@ when you try to drive it, with the reason on your own terminal. Roles, permissio
 per-device grants live in `deploy/operators.yaml`, and every attach is authorized on
 the gateway — the client is never trusted about what it may reach, and holds no device
 list of its own.
+
+A port bound by `adb forward` is bound on the **gateway's** loopback, not on yours,
+because the gateway is the machine the adb binary's server runs on. Reaching it means
+reaching the gateway host; nothing about it is published on a network interface.
+`adb reverse` is the mirror: the device binds the port, and what reaches it lands on
+the gateway's loopback.
 
 ## Deploy to a device
 
@@ -88,7 +98,9 @@ address to use it.
 ### Certificates
 
 The device generates its own key pair and asks for a certificate. No private key is ever
-copied to or from the phone, and nothing has to be pushed with `adb`.
+copied to or from the phone, and nothing has to be pushed to it to enrol it: the
+request goes out over the gateway connection and the certificate comes back the same
+way. Files, once a device is enrolled, go both ways with `adb push` and `adb pull`.
 
 On the phone: install the APK, fill in the gateway address, press **Enrol**. The app
 shows a code and waits.
@@ -126,8 +138,8 @@ resolution cannot break on a device with no network, which is the deployment thi
 exists to serve.
 
 The script asserts the APK contains what the app reads at runtime — the binary
-entry, its ELF magic and `e_machine`, and how it is compressed. It previously
-reported success for an APK containing no binary at all.
+entry, its ELF magic and `e_machine`, and how it is compressed. An APK with no binary in
+it fails on the phone and nowhere else, so the build is where that has to be caught.
 
 ## Documentation
 
@@ -144,15 +156,17 @@ scripts/e2e-enrol.sh          # certificate enrolment, device through gateway to
 scripts/e2e-operator.sh       # the operator path: stock adb, no SSH, roles enforced
 ```
 
-`e2e-enrol.sh` runs the gateway as root, because enrolment is deliberately restricted to
-uid 0 on the control socket. It asserts the part that unit tests cannot: that a
-certificate obtained this way actually opens a mutual-TLS session.
+`e2e-enrol.sh` needs passwordless sudo, because `ard-ca enrol` signs with the CA key and
+is restricted to uid 0 on the control socket. The gateway itself runs unprivileged, as
+in production, and the script asserts that it does. The part unit tests cannot cover is
+that a certificate obtained this way actually opens a mutual-TLS session.
 
 The mock in `test/mockadbd` speaks adbd's wire protocol and is tested against the
-actual `adb` binary. Several of its bugs were found only by that interop, and
-each presented as a silent hang rather than an error — see the commit history.
+actual `adb` binary. A mock that is merely plausible produces passing tests for
+behaviour real adbd does not have, and the failures that interop catches present as a
+silent hang rather than an error.
 
-It also has a virtual filesystem, a property store, a 26-command shell, and
+It also has a virtual filesystem, a property store, a 24-command shell, and
 deterministic fault injection — latency, dropped and corrupted writes, truncation
 mid-transfer, and a stall that hangs rather than errors. It stands on its own as a
 device simulator; see [its README](test/mockadbd/README.md) for what it does and
