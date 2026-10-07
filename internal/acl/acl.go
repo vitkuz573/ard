@@ -234,10 +234,11 @@ type file struct {
 
 // Policy is a loaded authorization policy.
 //
-// Two indexes, because two lookups are needed and conflating them is the bug this
-// replaced: byRole answers "what does this role look like", and byOperator answers "what
-// may this certificate's common name do". They were one map, which meant a role had to
-// be *named* after an operator to have any effect.
+// Two indexes, because two lookups are asked of it and one map can only answer one of them
+// honestly: byRole answers "what does this role look like", and byOperator answers "what may
+// this certificate's common name do". Sharing one map would make a role effective only when
+// it was named after an operator, which turns the policy file into a list of exceptions
+// rather than a statement about people.
 type Policy struct {
 	byRole     map[string]role
 	byOperator map[string]role

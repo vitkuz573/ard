@@ -283,9 +283,9 @@ func (s *Server) dispatch(c net.Conn, req string) (bool, error) {
 			//
 			// It is answered from the registry rather than by asking the device, because the
 			// registry is already the authority on liveness -- the same source the listing
-			// uses, so `adb get-state` and `adb devices` cannot disagree. This was missing and
-			// `adb get-state` failed with "unknown service" on every device, which reads as a
-			// broken gateway rather than as a missing command.
+			// uses, so `adb get-state` and `adb devices` cannot disagree. An unhandled request
+			// would be a FAIL naming an unknown service, which an operator reads as a broken
+			// gateway rather than as a command the gateway has no answer for.
 			if !s.allowed(serial) {
 				return false, writeFail(c, deviceNotFound(serial))
 			}

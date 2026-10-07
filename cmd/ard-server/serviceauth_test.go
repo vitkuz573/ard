@@ -171,8 +171,9 @@ func socketPair(t *testing.T) (client, server net.Conn) {
 //
 // The role here holds shell and files and no forward, which is the ordinary maintainer shape:
 // someone who drives devices and moves files for a living, with no reason to bind a port on the
-// machine that holds the CA keys. Before this check existed, `adb forward` from that role
-// worked, because the only thing ever asked was whether the role could hold the transport.
+// machine that holds the CA keys. The port would be bound on that machine and reachable by
+// anything that can reach it, which is the whole reason `forward` is asked for on its own
+// rather than inherited from the transport the request arrived on.
 func TestForwardIsRefusedWithoutTheForwardPermission(t *testing.T) {
 	g := serviceGateway(t)
 	got := askService(t, g, "erin", deviceA, "host:forward:tcp:9930;tcp:9931")
