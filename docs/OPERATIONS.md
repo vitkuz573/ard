@@ -45,6 +45,12 @@ Accepted: TCP 22 and the three gateway ports (7000 devices, 7100 operators, 7200
 enrolment). Nothing else. ICMP is accepted deliberately: without path MTU discovery
 the symptom is a hung TLS handshake rather than a routing error.
 
+Ports bound by an operator's `adb forward` need no rule here. The gateway binds them
+on `127.0.0.1`, so they are reachable from the host itself and never from a network
+interface, and `adb reverse` reaches the gateway's loopback for the same reason. Both
+directions are bounded to `tcp:` with a numeric port, so nothing can name a host
+elsewhere.
+
 `destroy table inet ard` replaces the table instead of `flush ruleset`, so
 reloading never deletes the table fail2ban uses for its active bans. `destroy`
 requires nft >= 1.0.9; Debian 13 ships 1.1.3.
@@ -55,12 +61,12 @@ actually `policy drop`, ordered `After=nftables.service` and
 indistinguishable from an open one — no log line, no alarm, every device and
 operator port reachable. This turns that into a visible failure.
 
-> Incident worth remembering: an earlier drop-in added `After=fail2ban.service`
-> to `nftables.service` while fail2ban's own unit already had
-> `After=nftables.service`. systemd dropped the `nftables` job to break the
-> ordering cycle, and the firewall silently did not come up after a reboot while
-> still reporting `enabled`. Ordering constraints must not be added in both
-> directions.
+Ordering constraints are one-directional. fail2ban's unit already declares
+`After=nftables.service`; adding `After=fail2ban.service` to the reverse creates a
+cycle, and systemd resolves a cycle by dropping a job — so the unit reports
+`enabled` while the ruleset is not loaded. Anything that must come up before the
+firewall belongs in `ard-firewall-verify.service`, which already has
+`After=nftables.service`.
 
 ## Other services
 
@@ -89,6 +95,7 @@ operator port reachable. This turns that into a visible failure.
   that command line. On the host, `systemctl restart ard-server`. On a development
   machine running the end-to-end scripts, `scripts/stop.sh <name>` — it matches
   process names exactly rather than command lines, and reports what survived.
+
 ## ARD gateway services
 
 Deployed with a single command: `scripts/deploy.sh`. It cross-compiles, uploads,
@@ -99,7 +106,7 @@ regenerated.
 
 | Service | Purpose |
 |---|---|
-| `ard-server` | accepts device and operator connections, holds device sessions, answers adb's server protocol |
+| `ard-server` | accepts device and operator connections, holds device sessions, answers adb's server protocol, holds the ports an operator's `adb forward` binds |
 | `ard-firewall-verify` | asserts at boot that the firewall is really enforcing |
 
 ### Enrolling a device
@@ -149,13 +156,20 @@ Posture to verify on every host after deploy:
     gateway can read a device private key         ->  no
     gateway can replace its own binaries          ->  no
 
-### Two deploy bugs that the verifier caught
+### What the deploy verifier checks, and why each one
 
-Worth remembering, because both produced a "successful" deploy of something broken:
+Two failure modes make a deploy report success over something broken, so both are
+asserted explicitly:
 
-- The firewall file shipped from the repository lacked the gateway ports, so a
-  deploy replaced a working ruleset with one that blocked them. The deploy now
-  checks that the ports are present *and* that no raw ADB port is exposed.
-- Verification used `grep -c` to assert the absence of something, which exits 1 on
-  zero matches. Under `set -e` with `pipefail` that aborted a correct deploy. A
-  check must never be able to fake its own verdict.
+- **The firewall ports.** The deploy installs the shipped `nftables.conf` over
+  whatever was there, so the ruleset that ends up loaded is the one in the
+  repository. The verifier asserts the gateway ports are present *and* that no raw
+  ADB port is exposed.
+- **A check cannot fake its own verdict.** Asserting the absence of something with
+  `grep -c` exits 1 on zero matches, and under `set -e` with `pipefail` that aborts
+  a correct deploy. Every absence check here is written so that zero is a pass.
+
+The verifier also asks the gateway how many operators its policy admits, rather than
+grepping the YAML: a policy whose roles name no `members` loads cleanly and refuses
+every operator, which reads as a deliberate lockdown rather than as the configuration
+mistake it is.

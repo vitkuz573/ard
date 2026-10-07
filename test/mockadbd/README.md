@@ -19,10 +19,12 @@ adb -s 127.0.0.1:5555 shell ls -l /system/bin
 | Area | |
 |---|---|
 | Transport | CNXN negotiation, AUTH with an RSA host key, OPEN/WRTE/OKAY/CLSE, device-initiated streams |
-| `shell` | 26 commands over a real in-memory filesystem and property store |
+| `shell` | 24 commands over a real in-memory filesystem and property store |
 | interactive shell | sessions: line at a time, state carried across lines, last command's status; `-t`/`-T` pipes, `-tt` a real pty |
 | `host:` | `version`, `devices`, `transport` |
 | `sync:` | the text-framed protocol, in both its spellings: `STAT`/`LIST`/`SEND`/`RECV` and `STA2`/`LIS2`/`SND2`/`RCV2`. A client picks between them from the feature list it was given for the device, so `-banner` selects the path |
+| `tcp:` | the device half of `adb forward`: connect to a port on this device's own loopback and splice |
+| `reverse:` | the device half of `adb reverse`: bind a port here, and open a stream back to the host for every connection that reaches it. `forward:`, `killforward:`, `killforward-all`, `list-forward` |
 | Filesystem | a seeded Android tree, read/write, `stat`, modes, mtimes, path confinement |
 | Properties | `getprop`/`setprop` with presence distinguished from emptiness, and the `ro.` prefix query |
 | Faults | latency, jitter, dropped writes, corrupted writes, truncation mid-stream, stalling |
@@ -94,14 +96,6 @@ Stated plainly, because a simulator that overstates itself is worse than a stub.
   ```sh
   MOCKADBD_TRACE=/tmp/t.log go test ./test/mockadbd/ -run TestInteropPushLands
   ```
-
-- **`adb reverse` and `adb forward` are not implemented.** The protocol is captured from a
-  real device below, along with the reason `reverse` needs transport work rather than a
-  case in the service switch.
-
-- **`adb reverse` and `adb forward` are not served.** The protocol is captured from a real
-  device below, along with the reason `reverse` needs transport work rather than a case in the
-  service switch.
 
 - **The shell is not `/system/bin/sh`.** It is a Go interpreter over the commands in the
   table above. Behaviour matches on exit statuses -- 0, 1 for a lookup failure, 2 for
@@ -189,16 +183,22 @@ wrongly.
 
 ## Port forwarding: what the protocol actually is
 
-Not implemented here. The notes below were captured from a real adbd rather than guessed,
-because guessing cost a debugging round for `sync` and there is no reason to repeat it.
+The two directions are not the same exchange, and only one of them is visible to this
+process. The notes below were captured from a real adbd rather than guessed, because
+guessing cost a debugging round for `sync` and there is no reason to repeat it.
 
-`adb forward` never mentions the device. Setting one up produces no packets to it at all:
-the adb server binds the host-side port itself, and the device is only involved later, when
-a connection arrives and the server asks it to connect out. So a mock that wants to exercise
-`forward` has to notice the host-side connection, which it cannot see -- it is entirely
-outside the transport.
+`adb forward` never mentions the device at setup time. The adb server binds the host-side
+port itself, and the device is only involved later, when a connection arrives and the
+server opens a stream asking it to connect out. The device's whole part is that one
+service:
 
-`adb reverse` does talk to the device, and in one exchange:
+    host -> device  OPEN  arg0=11 arg1=0  "tcp:9911\0"
+
+so `tcp:` here dials `127.0.0.1:9911` on this device and splices the stream onto the
+socket. Binding the host-side port is outside this transport entirely, which is why it
+lives in the adb server and not here.
+
+`adb reverse` is answered by the device, and in one exchange:
 
     adb reverse tcp:9911 tcp:9910
 
@@ -208,14 +208,16 @@ outside the transport.
 
 The reply is the daemon service acknowledgement: `OKAY`, then a four-hex-digit field, then
 the port. `0004` is the width of what follows and `9911` is the device port that was opened.
+The port is four ASCII digits behind the width, not a 4-byte integer, and the `OKAY` word
+is not optional: a client reads four bytes as a status before it reads the length, so a
+reply without the word is read as a status that is neither OKAY nor FAIL, and the bytes it
+reports are the port reinterpreted.
 
-The part that makes this more than a string match, and the reason it is worth writing down
-before implementing it: for every connection that reaches the device-side listener, the
-device has to open a *new* stream back to the host. That is a stream the device initiates,
-and this mock's transport has no path for it -- `handleOpen` only ever runs for a host-initiated
-OPEN. Supporting `reverse` properly therefore means adding device-initiated OPEN to the
-transport, not adding a case to the service switch, which is why it is listed as missing
-rather than half-built.
+What makes `reverse` more than a case in the service switch is what follows. Every
+connection that reaches the device-side listener has to become a *new* stream back to the
+host, opened by this device -- so the transport carries device-initiated OPENs, and each
+one is completed by the same read loop that carries everything else, because two readers on
+one socket is how a connection ends up with each of them holding half a packet.
 
 ## Seeing what adb itself is doing
 
