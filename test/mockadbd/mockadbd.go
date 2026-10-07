@@ -86,6 +86,12 @@ type Config struct {
 
 	// Banner is sent in CNXN. The real format is
 	// "device::ro.product.name=...;ro.product.model=...;features=...".
+	//
+	// The features field is load-bearing rather than decorative: a client chooses the
+	// spelling of every sync command from the list it is given for this device, so a
+	// banner without stat_v2, ls_v2 and sendrecv_v2 puts a client on the v1 sync path
+	// and one with them puts it on the v2 path. Both are answered from the same
+	// filesystem, and the reply widths differ along each.
 	Banner string
 
 	// TrustedHostKeyPath points at an adbkey.pub file. When set, the device

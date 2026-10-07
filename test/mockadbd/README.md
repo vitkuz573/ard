@@ -22,7 +22,7 @@ adb -s 127.0.0.1:5555 shell ls -l /system/bin
 | `shell` | 26 commands over a real in-memory filesystem and property store |
 | interactive shell | sessions: line at a time, state carried across lines, last command's status; `-t`/`-T` pipes, `-tt` a real pty |
 | `host:` | `version`, `devices`, `transport` |
-| `sync:` | the v1 binary protocol, complete; the v2 text protocol, partially |
+| `sync:` | the text-framed protocol, in both its spellings: `STAT`/`LIST`/`SEND`/`RECV` and `STA2`/`LIS2`/`SND2`/`RCV2`. A client picks between them from the feature list it was given for the device, so `-banner` selects the path |
 | Filesystem | a seeded Android tree, read/write, `stat`, modes, mtimes, path confinement |
 | Properties | `getprop`/`setprop` with presence distinguished from emptiness, and the `ro.` prefix query |
 | Faults | latency, jitter, dropped writes, corrupted writes, truncation mid-stream, stalling |
